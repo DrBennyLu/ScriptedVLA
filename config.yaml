@@ -1,0 +1,100 @@
+# VLA模型配置文件
+
+# 模型配置
+model:
+  # VLM配置（Qwen）
+  vlm:
+    model_name: "Qwen/Qwen-VL-Chat"  # 或使用更小的模型如 "Qwen/Qwen-VL"
+    image_size: 224
+    max_seq_length: 512
+    freeze_vlm: false  # 是否冻结VLM参数
+  
+  # 动作头配置（DiT）
+  action_head:
+    type: "dit"  # Diffusion Transformer
+    hidden_dim: 768  # 与VLM输出维度匹配
+    num_layers: 6
+    num_heads: 12
+    mlp_ratio: 4.0
+    action_dim: 7  # 动作维度（例如：x, y, z, roll, pitch, yaw, gripper）
+    patch_size: 16
+    num_patches: 196  # 14x14 patches for 224x224 image
+    
+  # 完整VLA模型
+  vla:
+    use_cross_attention: true
+    cross_attention_layers: 3
+
+# 训练配置
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"
+    betas: [0.9, 0.999]
+    eps: 1e-8
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"
+    warmup_ratio: 0.1
+    min_lr_ratio: 0.01
+  
+  # 保存配置
+  save_dir: "./checkpoints"
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 100
+  
+  # 混合精度训练
+  fp16: false
+  bf16: false
+
+# 数据配置
+data:
+  # 数据集类型: "custom", "libero", "act"
+  dataset_type: "custom"
+  
+  # 自定义数据集路径（当dataset_type="custom"时使用）
+  train_data_path: "./data/train"
+  val_data_path: "./data/val"
+  
+  # LIBERO数据集配置（当dataset_type="libero"时使用）
+  libero:
+    dataset_name: "libero_spatial"  # libero_spatial, libero_object, libero_goal, libero_100
+    dataset_path: "./data/libero"
+    task_names: null  # null表示使用所有任务，或指定任务列表
+    max_episode_length: 100
+  
+  # ACT数据集配置（当dataset_type="act"时使用）
+  act:
+    dataset_path: "./data/act"
+    chunk_size: 1  # 动作块大小
+  
+  # 通用数据加载配置
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  image_size: 224
+
+# 推理配置
+inference:
+  checkpoint_path: "./checkpoints/best_model.pt"
+  device: "cuda"  # 或 "cpu"
+  batch_size: 1
+  max_new_tokens: 50
+
+# 日志配置
+logging:
+  use_wandb: false
+  wandb_project: "vla-training"
+  use_tensorboard: true
+  log_dir: "./logs"
+

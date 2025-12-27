@@ -1,0 +1,34 @@
+[project]
+name = "scripted-vla"
+version = "0.1.0"
+description = "Vision-Language-Action model based on Qwen VLM and DiT action head"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "qwen-vl-utils>=0.0.1",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "einops>=0.7.0",
+    "accelerate>=0.24.0",
+    "tensorboard>=2.14.0",
+    "wandb>=0.15.0",
+    "datasets>=2.14.0",  # 用于加载HuggingFace数据集
+    "h5py>=3.8.0",  # 用于读取HDF5格式数据（ACT数据集）
+    "requests>=2.31.0",  # 用于下载数据集
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
