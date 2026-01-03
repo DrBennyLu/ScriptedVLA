@@ -12,15 +12,15 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 
-from src.model import VLAModel
-from src.data import (
+from ScriptedVLA.model import VLAModel
+from ScriptedVLA.data import (
     VLADataset,
     LIBERODataset,
     ACTDataset,
     create_libero_dataset_from_config,
     create_act_dataset_from_config
 )
-from src.utils import (
+from ScriptedVLA.utils import (
     load_config,
     get_model_config,
     get_training_config,
@@ -107,13 +107,26 @@ def train_epoch(
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(progress_bar):
-        # 移动数据到设备
-        images = batch["image"].to(device)
+        # 处理多相机图像
+        if "images" in batch:
+            # 多相机模式：将字典中的每个图像移到设备
+            images = {k: v.to(device) for k, v in batch["images"].items()}
+        elif "image" in batch:
+            # 单相机模式（向后兼容）
+            images = batch["image"].to(device)
+        else:
+            raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
+        
         texts = batch["text"]
         actions = batch["action"].to(device)
         
+        # 处理状态信息（如果存在）
+        states = None
+        if "state" in batch:
+            states = batch["state"].to(device)
+        
         # 前向传播
-        outputs = model(images, texts)
+        outputs = model(images, texts, states)
         pred_actions = outputs["actions"]
         
         # 计算损失
@@ -147,9 +160,18 @@ def train_epoch(
         
         # 日志记录（使用当前步数）
         if current_step % config.get("logging_steps", 100) == 0:
+            # 获取批次中的层次化信息（用于日志）
+            task_info = ""
+            if "task_name" in batch:
+                task_names = batch["task_name"]
+                if isinstance(task_names, list) and len(task_names) > 0:
+                    task_info = f", Task: {task_names[0]}"
+                elif isinstance(task_names, str):
+                    task_info = f", Task: {task_names}"
+            
             logger.info(
                 f"Step {current_step}: Loss = {loss.item() * config.get('gradient_accumulation_steps', 1):.4f}, "
-                f"LR = {optimizer.param_groups[0]['lr']:.2e}"
+                f"LR = {optimizer.param_groups[0]['lr']:.2e}{task_info}"
             )
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -162,21 +184,68 @@ def evaluate(model, dataloader, criterion, device, logger):
     total_loss = 0.0
     num_batches = 0
     
+    # 按任务和episode统计损失（如果可用）
+    task_losses = {}
+    episode_losses = {}
+    
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            images = batch["image"].to(device)
+            # 处理多相机图像
+            if "images" in batch:
+                images = {k: v.to(device) for k, v in batch["images"].items()}
+            elif "image" in batch:
+                images = batch["image"].to(device)
+            else:
+                raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
+            
             texts = batch["text"]
             actions = batch["action"].to(device)
             
-            outputs = model(images, texts)
+            # 处理状态信息（如果存在）
+            states = None
+            if "state" in batch:
+                states = batch["state"].to(device)
+            
+            outputs = model(images, texts, states)
             pred_actions = outputs["actions"]
             
             loss = criterion(pred_actions, actions)
             total_loss += loss.item()
             num_batches += 1
+            
+            # 统计任务和episode级别的损失
+            if "task_name" in batch:
+                task_names = batch["task_name"]
+                if isinstance(task_names, (list, tuple)):
+                    for i, task_name in enumerate(task_names):
+                        if task_name not in task_losses:
+                            task_losses[task_name] = []
+                        task_losses[task_name].append(loss.item())
+                elif isinstance(task_names, str):
+                    if task_names not in task_losses:
+                        task_losses[task_names] = []
+                    task_losses[task_names].append(loss.item())
+            
+            if "episode_id" in batch and "task_name" in batch:
+                episode_ids = batch["episode_id"]
+                task_names = batch["task_name"]
+                if isinstance(episode_ids, (list, tuple)) and isinstance(task_names, (list, tuple)):
+                    for i, (task_name, episode_id) in enumerate(zip(task_names, episode_ids)):
+                        key = (task_name, episode_id)
+                        if key not in episode_losses:
+                            episode_losses[key] = []
+                        episode_losses[key].append(loss.item())
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     logger.info(f"Validation Loss: {avg_loss:.4f}")
+    
+    # 打印任务级别的统计（如果有）
+    if task_losses:
+        logger.info("Task-level losses:")
+        for task_name, losses in sorted(task_losses.items()):
+            avg_task_loss = sum(losses) / len(losses) if losses else 0.0
+            logger.info(f"  {task_name}: {avg_task_loss:.4f} ({len(losses)} samples)")
+    
     return avg_loss
 
 
@@ -230,12 +299,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    # 获取相机和状态配置
+    camera_config = data_config.get("cameras", {})
+    camera_names = camera_config.get("names", ["global_img", "left_wrist_img"])
+    robot_state_config = data_config.get("robot_state", {})
+    use_state = robot_state_config.get("use_state", True)
+    state_dim = robot_state_config.get("state_dim", 7)
+    
     # 创建模型
     model = VLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
         use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3)
+        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
+        camera_names=camera_names,
+        use_state=use_state,
+        state_dim=state_dim
     )
     model = model.to(device)
     log_model_info(logger, model)
@@ -245,6 +324,7 @@ def main():
     image_size = data_config.get("image_size", model_config.get("vlm", {}).get("image_size", 224))
     
     logger.info(f"Using dataset type: {dataset_type}")
+    logger.info(f"Cameras: {camera_names}, Use state: {use_state}, State dim: {state_dim}")
     
     if dataset_type == "libero":
         # LIBERO数据集
@@ -278,12 +358,18 @@ def main():
     else:
         # 自定义数据集
         train_dataset = VLADataset(
-            data_path=data_config.get("train_data_path", "./data/train"),
-            image_size=image_size
+            data_path=data_config.get("train_data_path", "./dataset/train"),
+            image_size=image_size,
+            camera_names=camera_names,
+            use_state=use_state,
+            state_dim=state_dim
         )
         val_dataset = VLADataset(
-            data_path=data_config.get("val_data_path", "./data/val"),
-            image_size=image_size
+            data_path=data_config.get("val_data_path", "./dataset/val"),
+            image_size=image_size,
+            camera_names=camera_names,
+            use_state=use_state,
+            state_dim=state_dim
         )
     
     train_loader = DataLoader(
@@ -304,6 +390,23 @@ def main():
     )
     
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    
+    # 统计任务和episode信息（如果可用）
+    if len(train_dataset) > 0:
+        try:
+            sample = train_dataset[0]
+            if "task_name" in sample:
+                tasks = set()
+                episodes = set()
+                for s in train_dataset:
+                    if "task_name" in s:
+                        tasks.add(s["task_name"])
+                    if "episode_id" in s:
+                        episodes.add((s.get("task_name", "unknown"), s["episode_id"]))
+                logger.info(f"Train tasks: {len(tasks)}, Episodes: {len(episodes)}")
+        except Exception as e:
+            # 如果统计失败，忽略
+            pass
     
     # 创建优化器和调度器
     optimizer = create_optimizer(model, training_config)

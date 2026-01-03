@@ -20,24 +20,30 @@ ScriptedVLA/
 ├── train_public_datasets.py     # 训练脚本（公开数据集）
 ├── inference.py                 # 推理脚本
 ├── create_dummy_data.py         # 创建测试数据
+├── dataset_statistics.py       # 数据集统计和筛选工具
+├── download_model.py            # 模型下载脚本
+├── evaluate_vlm_capabilities.py # VLM能力测评脚本
 ├── README.md                    # 项目说明
 ├── QUICKSTART.md                # 快速开始指南
+├── EXAMPLES.md                  # 使用示例
 └── src/
-    ├── model/                   # 模型定义
-    │   ├── __init__.py
-    │   ├── vlm.py              # Qwen VLM模型
-    │   ├── action_head.py      # DiT动作头
-    │   └── vla.py              # 完整VLA模型
-    ├── data/                    # 数据处理
-    │   ├── __init__.py
-    │   ├── dataset.py          # 自定义数据集类
-    │   ├── download_datasets.py # 数据集下载工具
-    │   ├── libero_dataset.py   # LIBERO数据集适配器
-    │   └── act_dataset.py      # ACT数据集适配器
-    └── utils/                   # 工具函数
+    └── ScriptedVLA/            # Python包（符合uv标准结构）
         ├── __init__.py
-        ├── config.py           # 配置加载
-        └── logger.py           # 日志工具
+        ├── model/               # 模型定义
+        │   ├── __init__.py
+        │   ├── vlm.py          # Qwen VLM模型
+        │   ├── action_head.py  # DiT动作头
+        │   └── vla.py         # 完整VLA模型
+        ├── data/                # 数据处理
+        │   ├── __init__.py
+        │   ├── dataset.py      # 自定义数据集类
+        │   ├── download_datasets.py # 数据集下载工具
+        │   ├── libero_dataset.py   # LIBERO数据集适配器
+        │   └── act_dataset.py      # ACT数据集适配器
+        └── utils/               # 工具函数
+            ├── __init__.py
+            ├── config.py       # 配置加载
+            └── logger.py       # 日志工具
 ```
 
 ## 快速开始
@@ -65,7 +71,7 @@ uv pip install -e .
 **LIBERO数据集：**
 ```bash
 # 下载LIBERO数据集
-python -m src.data.download_datasets --dataset libero --name libero_spatial
+python -m ScriptedVLA.data.download_datasets --dataset libero --name libero_spatial
 
 # 或在训练时自动下载
 python train_public_datasets.py --dataset libero --dataset-name libero_spatial --download
@@ -74,7 +80,7 @@ python train_public_datasets.py --dataset libero --dataset-name libero_spatial -
 **ACT数据集：**
 ```bash
 # 下载ACT数据集
-python -m src.data.download_datasets --dataset act
+python -m ScriptedVLA.data.download_datasets --dataset act
 
 # 或在训练时自动下载
 python train_public_datasets.py --dataset act --download
@@ -101,13 +107,30 @@ data/
 ```json
 [
   {
-    "image_path": "images/image_001.jpg",
+    "image_paths": {
+      "global_img": "images/task_000_ep000_step000_global_img.jpg",
+      "left_wrist_img": "images/task_000_ep000_step000_left_wrist_img.jpg"
+    },
     "text": "Pick up the red block",
-    "action": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
+    "state": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+    "action": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+    "task_name": "task_000",
+    "episode_id": 0,
+    "step_id": 0
   },
   ...
 ]
 ```
+
+**数据层次结构说明：**
+- `task_name`: 任务名称（字符串），例如 "task_000", "pick_and_place" 等
+- `episode_id`: Episode编号（整数），每个任务下的episode从0开始
+- `step_id`: Step编号（整数），每个episode下的step从0开始
+
+这种层次化结构便于：
+- 按任务组织数据
+- 按episode进行训练和评估
+- 跟踪数据来源和上下文
 
 **方式2：每个样本一个目录**
 ```
@@ -165,7 +188,32 @@ python train.py --config config.yaml
 python train.py --config config.yaml --resume ./checkpoints/checkpoint_epoch_50.pt
 ```
 
-### 5. 推理
+### 5. 下载模型
+
+```bash
+# 下载Qwen2-VL-2B-Instruct模型
+python download_model.py --model Qwen/Qwen2-VL-2B-Instruct
+
+# 或下载其他模型
+python download_model.py --model Qwen/Qwen-VL-Chat
+```
+
+### 6. 评估VLM能力
+
+```bash
+# 运行完整的机器人能力测评
+python evaluate_vlm_capabilities.py --model Qwen/Qwen2-VL-2B-Instruct
+
+# 使用配置文件中的模型
+python evaluate_vlm_capabilities.py --config config.yaml
+```
+
+测评包括：
+- **物体识别能力**：识别图像中的物体、颜色、数量等
+- **空间感知能力**：理解物体的位置关系、距离、方向等
+- **因果推理能力**：根据图文进行动作-结果推理、场景理解、逻辑推理等
+
+### 7. 推理
 
 ```bash
 python inference.py \
@@ -211,13 +259,26 @@ python inference.py \
 
 ### 数据配置
 - `dataset_type`: 数据集类型，可选 "custom", "libero", "act"
-- `train_data_path`: 训练数据路径（自定义数据集）
-- `val_data_path`: 验证数据路径（自定义数据集）
+- `train_data_path`: 训练数据路径（自定义数据集），默认 `./dataset/train`
+- `val_data_path`: 验证数据路径（自定义数据集），默认 `./dataset/val`
+- `cameras.names`: 相机名称列表，例如 `["global_img", "left_wrist_img"]`
+- `cameras.num_cameras`: 相机数量
+- `robot_state.use_state`: 是否使用机器人状态信息
+- `robot_state.state_dim`: 状态维度，默认7
+- `action.action_dim`: 动作维度，默认7
 - `libero.dataset_name`: LIBERO数据集名称（libero_spatial, libero_object, libero_goal, libero_100）
 - `libero.dataset_path`: LIBERO数据集路径
 - `act.dataset_path`: ACT数据集路径
 - `act.chunk_size`: ACT动作块大小
 - `num_workers`: 数据加载线程数
+
+**数据层次结构：**
+数据集支持层次化标识：
+- `task_name`: 任务名称，用于区分不同任务
+- `episode_id`: Episode编号，每个任务可以有多个episode
+- `step_id`: Step编号，每个episode包含多个step
+
+训练和评估时会自动统计任务级别的性能指标。
 
 ## 公开数据集支持
 
@@ -233,7 +294,7 @@ LIBERO是一个用于长期机器人操作任务的基准数据集，包含多�
 **使用示例：**
 ```bash
 # 下载LIBERO数据集
-python -m src.data.download_datasets --dataset libero --name libero_spatial
+python -m ScriptedVLA.data.download_datasets --dataset libero --name libero_spatial
 
 # 在LIBERO上训练
 python train_public_datasets.py --dataset libero --dataset-name libero_spatial --download
@@ -246,7 +307,7 @@ ACT (Action Chunking Transformer) 是一个用于机器人操作的数据集，�
 **使用示例：**
 ```bash
 # 下载ACT数据集
-python -m src.data.download_datasets --dataset act
+python -m ScriptedVLA.data.download_datasets --dataset act
 
 # 在ACT上训练
 python train_public_datasets.py --dataset act --download
@@ -260,12 +321,34 @@ pip install libero
 # ACT数据集可能需要h5py（已包含在依赖中）
 ```
 
+## 项目结构说明
+
+本项目采用标准的Python包结构，符合uv和现代Python包管理工具的要求：
+
+- **包名**: `ScriptedVLA`（在 `src/ScriptedVLA/` 目录下）
+- **导入方式**: `from ScriptedVLA.model import ...`（安装后可直接导入）
+- **安装方式**: `uv pip install -e .`（以可编辑模式安装，代码修改立即生效）
+
+这种结构的优势：
+- ✅ 符合PEP 517/518标准
+- ✅ 支持uv、pip、poetry等现代包管理工具
+- ✅ 便于代码组织和模块化
+- ✅ 支持作为库被其他项目引用
+
 ## 开发说明
 
 ### 添加新功能
-1. 模型扩展：在 `src/model/` 中添加新模块
-2. 数据处理：在 `src/data/` 中添加数据增强或新数据集
-3. 工具函数：在 `src/utils/` 中添加辅助功能
+1. 模型扩展：在 `src/ScriptedVLA/model/` 中添加新模块
+2. 数据处理：在 `src/ScriptedVLA/data/` 中添加数据增强或新数据集
+3. 工具函数：在 `src/ScriptedVLA/utils/` 中添加辅助功能
+
+### 导入说明
+所有脚本文件使用以下导入方式：
+```python
+from ScriptedVLA.model import VLAModel
+from ScriptedVLA.data import VLADataset, LIBERODataset
+from ScriptedVLA.utils import load_config, setup_logger
+```
 
 ### 代码规范
 - 使用类型提示
@@ -294,6 +377,50 @@ A: 确保已安装 `libero` 包：`pip install libero`。如果仍有问题，�
 
 **Q: 如何切换不同的数据集？**
 A: 在 `config.yaml` 中设置 `data.dataset_type` 为 "libero" 或 "act"，或使用 `train_public_datasets.py` 的 `--dataset` 参数。
+
+**Q: 如何下载和测试Qwen2-VL-2B-Instruct模型？**
+A: 
+1. 下载模型：`python download_model.py --model Qwen/Qwen2-VL-2B-Instruct`
+2. 运行能力测评：`python evaluate_vlm_capabilities.py --model Qwen/Qwen2-VL-2B-Instruct`
+3. 测评结果会保存为JSON文件，包含物体识别、空间感知、因果推理等测试结果。
+
+**Q: VLM能力测评包含哪些测试？**
+A: 测评脚本包含三类测试：
+- **物体识别**：简单物体识别、颜色识别、数量统计
+- **空间感知**：位置关系、距离判断、方向判断
+- **因果推理**：动作-结果推理、场景理解、逻辑推理
+
+**Q: 数据集的层次结构有什么用？**
+A: 层次化结构（task_name, episode_id, step_id）支持：
+- 按任务组织和管理数据
+- 按episode进行训练和评估
+- 任务级别的性能分析（训练时会自动统计）
+- 数据来源追踪和调试
+- 支持更复杂的数据筛选和分析
+
+**Q: 如何创建层次化的测试数据？**
+A: 使用 `create_dummy_data.py` 的层次化参数：
+```bash
+python create_dummy_data.py \
+    --num_tasks 3 \
+    --episodes_per_task 5 \
+    --steps_per_episode 10 \
+    --cameras global_img left_wrist_img
+```
+这将创建3个任务，每个任务5个episode，每个episode 10个step。
+
+**Q: 如何查看数据集的统计信息？**
+A: 使用 `dataset_statistics.py` 脚本：
+```bash
+# 查看数据集统计
+python dataset_statistics.py --data_path ./dataset/train
+
+# 按任务筛选
+python dataset_statistics.py --data_path ./dataset/train --task task_000 task_001
+
+# 按episode筛选
+python dataset_statistics.py --data_path ./dataset/train --episode 0 1 2
+```
 
 ## 许可证
 

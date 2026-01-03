@@ -8,7 +8,7 @@
 
 ```bash
 # 方法1：使用下载脚本
-python -m src.data.download_datasets --dataset libero --name libero_spatial
+python -m ScriptedVLA.data.download_datasets --dataset libero --name libero_spatial
 
 # 方法2：在训练时自动下载
 python train_public_datasets.py --dataset libero --dataset-name libero_spatial --download
@@ -48,7 +48,7 @@ python train_public_datasets.py \
 ### 步骤1：下载数据集
 
 ```bash
-python -m src.data.download_datasets --dataset act
+python -m ScriptedVLA.data.download_datasets --dataset act
 ```
 
 ### 步骤2：配置模型
@@ -87,17 +87,38 @@ mkdir -p data/val/images
 ```json
 [
   {
-    "image_path": "images/image_001.jpg",
+    "image_paths": {
+      "global_img": "images/task_000_ep000_step000_global_img.jpg",
+      "left_wrist_img": "images/task_000_ep000_step000_left_wrist_img.jpg"
+    },
     "text": "Pick up the red block",
-    "action": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
+    "state": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+    "action": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+    "task_name": "task_000",
+    "episode_id": 0,
+    "step_id": 0
   },
   {
-    "image_path": "images/image_002.jpg",
+    "image_paths": {
+      "global_img": "images/task_000_ep000_step001_global_img.jpg",
+      "left_wrist_img": "images/task_000_ep000_step001_left_wrist_img.jpg"
+    },
     "text": "Place the block on the table",
-    "action": [0.2, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0]
+    "state": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    "action": [0.2, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0],
+    "task_name": "task_000",
+    "episode_id": 0,
+    "step_id": 1
   }
 ]
 ```
+
+**数据层次结构说明：**
+- `task_name`: 任务名称，用于区分不同的任务类型
+- `episode_id`: Episode编号，每个任务可以有多个episode
+- `step_id`: Step编号，每个episode包含多个step
+
+这种结构便于按任务、episode或step进行数据筛选和分析。
 
 ### 步骤2：配置模型
 
@@ -123,7 +144,23 @@ python train.py --config config.yaml
 ```bash
 # 创建100个训练样本和20个验证样本
 python create_dummy_data.py --num_samples 100 --val_samples 20
+
+# 使用层次化结构创建数据（推荐）
+python create_dummy_data.py \
+    --num_tasks 3 \
+    --episodes_per_task 5 \
+    --steps_per_episode 10 \
+    --cameras global_img left_wrist_img \
+    --use_state \
+    --state_dim 7 \
+    --action_dim 7
 ```
+
+这将创建：
+- 3个任务（task_000, task_001, task_002）
+- 每个任务5个episode
+- 每个episode 10个step
+- 总共 3 × 5 × 10 = 150 个样本
 
 然后使用自定义数据训练流程进行训练。
 
@@ -245,7 +282,7 @@ pip install git+https://github.com/PRIOR-LAB/LIBERO.git
 
 ### 自定义数据集适配器
 
-如果需要添加新的数据集支持，可以参考 `src/data/libero_dataset.py` 和 `src/data/act_dataset.py` 的实现。
+如果需要添加新的数据集支持，可以参考 `src/ScriptedVLA/data/libero_dataset.py` 和 `src/ScriptedVLA/data/act_dataset.py` 的实现。
 
 ### 自定义损失函数
 

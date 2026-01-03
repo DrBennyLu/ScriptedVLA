@@ -28,25 +28,37 @@ uv pip install -e .
 **LIBERO数据集：**
 ```bash
 # 下载LIBERO数据集
-python -m src.data.download_datasets --dataset libero --name libero_spatial
+python -m ScriptedVLA.data.download_datasets --dataset libero --name libero_spatial
 ```
 
 **ACT数据集：**
 ```bash
 # 下载ACT数据集
-python -m src.data.download_datasets --dataset act
+python -m ScriptedVLA.data.download_datasets --dataset act
 ```
 
 ### 方式B：创建测试数据
 
 ```bash
-# 创建虚拟数据集用于测试
+# 创建虚拟数据集用于测试（简单模式）
 python create_dummy_data.py --num_samples 100 --val_samples 20
+
+# 创建层次化数据集（推荐）
+python create_dummy_data.py \
+    --num_tasks 3 \
+    --episodes_per_task 5 \
+    --steps_per_episode 10 \
+    --cameras global_img left_wrist_img
 ```
 
 这将创建：
-- `./data/train/` - 训练数据
-- `./data/val/` - 验证数据
+- `./dataset/train/` - 训练数据（包含task_name, episode_id, step_id）
+- `./dataset/val/` - 验证数据
+
+数据层次结构：
+- 任务 (task_name): 例如 "task_000", "task_001"
+- Episode (episode_id): 每个任务下的episode编号
+- Step (step_id): 每个episode下的step编号
 
 ## 3. 配置模型
 
@@ -130,7 +142,7 @@ A:
 
 - 阅读 `README.md` 了解详细文档
 - 查看 `EXAMPLES.md` 了解更多使用示例
-- 查看 `src/` 目录了解代码结构
+- 查看 `src/ScriptedVLA/` 目录了解代码结构
 - 根据你的具体任务调整模型架构和训练参数
 
 ## 公开数据集说明

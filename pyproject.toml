@@ -17,7 +17,7 @@ dependencies = [
     "tensorboard>=2.14.0",
     "wandb>=0.15.0",
     "datasets>=2.14.0",  # 用于加载HuggingFace数据集
-    "h5py>=3.8.0",  # 用于读取HDF5格式数据（ACT数据集）
+    "h5py>=3.8.0",  # 用于读取HDF5格式数据(ACT数据集)
     "requests>=2.31.0",  # 用于下载数据集
 ]
 
@@ -31,4 +31,5 @@ dev-dependencies = [
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
-
+[tool.hatch.build.targets.wheel]
+packages = ["src/ScriptedVLA"]

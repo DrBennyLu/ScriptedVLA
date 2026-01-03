@@ -4,8 +4,8 @@
 model:
   # VLM配置（Qwen）
   vlm:
-    model_name: "Qwen/Qwen-VL-Chat"  # 或使用更小的模型如 "Qwen/Qwen-VL"
-    image_size: 224
+    model_name: "Qwen/Qwen2-VL-2B-Instruct"  # 推荐使用Qwen2-VL-2B-Instruct，或 "Qwen/Qwen-VL-Chat"
+    image_size: 448  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
     freeze_vlm: false  # 是否冻结VLM参数
   
@@ -63,8 +63,27 @@ data:
   dataset_type: "custom"
   
   # 自定义数据集路径（当dataset_type="custom"时使用）
-  train_data_path: "./data/train"
-  val_data_path: "./data/val"
+  train_data_path: "./dataset/train"
+  val_data_path: "./dataset/val"
+  
+  # 相机配置
+  cameras:
+    # 相机名称列表（至少需要2个）
+    names: ["global_img", "left_wrist_img"]
+    # 相机数量（自动从names推断，或手动指定）
+    num_cameras: 2
+  
+  # 机器人状态配置
+  robot_state:
+    # 状态维度（例如：关节位置、速度等）
+    state_dim: 7
+    # 是否使用状态信息
+    use_state: true
+  
+  # 动作配置
+  action:
+    # 动作维度
+    action_dim: 7
   
   # LIBERO数据集配置（当dataset_type="libero"时使用）
   libero:

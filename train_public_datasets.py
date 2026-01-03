@@ -12,13 +12,13 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 
-from src.model import VLAModel
-from src.data import (
+from ScriptedVLA.model import VLAModel
+from ScriptedVLA.data import (
     download_dataset,
     LIBERODataset,
     ACTDataset
 )
-from src.utils import (
+from ScriptedVLA.utils import (
     load_config,
     get_model_config,
     get_training_config,
@@ -104,11 +104,23 @@ def train_epoch(
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(progress_bar):
-        images = batch["image"].to(device)
+        # 处理多相机图像
+        if "images" in batch:
+            images = {k: v.to(device) for k, v in batch["images"].items()}
+        elif "image" in batch:
+            images = batch["image"].to(device)
+        else:
+            raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
+        
         texts = batch["text"]
         actions = batch["action"].to(device)
         
-        outputs = model(images, texts)
+        # 处理状态信息（如果存在）
+        states = None
+        if "state" in batch:
+            states = batch["state"].to(device)
+        
+        outputs = model(images, texts, states)
         pred_actions = outputs["actions"]
         
         loss = criterion(pred_actions, actions)
@@ -151,21 +163,68 @@ def evaluate(model, dataloader, criterion, device, logger):
     total_loss = 0.0
     num_batches = 0
     
+    # 按任务和episode统计损失（如果可用）
+    task_losses = {}
+    episode_losses = {}
+    
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            images = batch["image"].to(device)
+            # 处理多相机图像
+            if "images" in batch:
+                images = {k: v.to(device) for k, v in batch["images"].items()}
+            elif "image" in batch:
+                images = batch["image"].to(device)
+            else:
+                raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
+            
             texts = batch["text"]
             actions = batch["action"].to(device)
             
-            outputs = model(images, texts)
+            # 处理状态信息（如果存在）
+            states = None
+            if "state" in batch:
+                states = batch["state"].to(device)
+            
+            outputs = model(images, texts, states)
             pred_actions = outputs["actions"]
             
             loss = criterion(pred_actions, actions)
             total_loss += loss.item()
             num_batches += 1
+            
+            # 统计任务和episode级别的损失
+            if "task_name" in batch:
+                task_names = batch["task_name"]
+                if isinstance(task_names, (list, tuple)):
+                    for i, task_name in enumerate(task_names):
+                        if task_name not in task_losses:
+                            task_losses[task_name] = []
+                        task_losses[task_name].append(loss.item())
+                elif isinstance(task_names, str):
+                    if task_names not in task_losses:
+                        task_losses[task_names] = []
+                    task_losses[task_names].append(loss.item())
+            
+            if "episode_id" in batch and "task_name" in batch:
+                episode_ids = batch["episode_id"]
+                task_names = batch["task_name"]
+                if isinstance(episode_ids, (list, tuple)) and isinstance(task_names, (list, tuple)):
+                    for i, (task_name, episode_id) in enumerate(zip(task_names, episode_ids)):
+                        key = (task_name, episode_id)
+                        if key not in episode_losses:
+                            episode_losses[key] = []
+                        episode_losses[key].append(loss.item())
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     logger.info(f"Validation Loss: {avg_loss:.4f}")
+    
+    # 打印任务级别的统计（如果有）
+    if task_losses:
+        logger.info("Task-level losses:")
+        for task_name, losses in sorted(task_losses.items()):
+            avg_task_loss = sum(losses) / len(losses) if losses else 0.0
+            logger.info(f"  {task_name}: {avg_task_loss:.4f} ({len(losses)} samples)")
+    
     return avg_loss
 
 
@@ -247,15 +306,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    # 获取相机和状态配置
+    camera_config = data_config.get("cameras", {})
+    camera_names = camera_config.get("names", ["global_img", "left_wrist_img"])
+    robot_state_config = data_config.get("robot_state", {})
+    use_state = robot_state_config.get("use_state", True)
+    state_dim = robot_state_config.get("state_dim", 7)
+    
     # 创建模型
     model = VLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
         use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3)
+        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
+        camera_names=camera_names,
+        use_state=use_state,
+        state_dim=state_dim
     )
     model = model.to(device)
     log_model_info(logger, model)
+    
+    logger.info(f"Cameras: {camera_names}, Use state: {use_state}, State dim: {state_dim}")
     
     # 创建数据集
     image_size = data_config.get("image_size", model_config.get("vlm", {}).get("image_size", 224))

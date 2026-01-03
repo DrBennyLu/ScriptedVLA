@@ -8,11 +8,12 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 
-from src.model import VLAModel
-from src.utils import (
+from ScriptedVLA.model import VLAModel
+from ScriptedVLA.utils import (
     load_config,
     get_model_config,
-    get_inference_config
+    get_inference_config,
+    get_data_config
 )
 
 
@@ -78,6 +79,14 @@ def main():
     config = load_config(args.config)
     model_config = get_model_config(config)
     inference_config = get_inference_config(config)
+    data_config = get_data_config(config)
+    
+    # 获取相机和状态配置
+    camera_config = data_config.get("cameras", {})
+    camera_names = camera_config.get("names", ["global_img", "left_wrist_img"])
+    robot_state_config = data_config.get("robot_state", {})
+    use_state = robot_state_config.get("use_state", True)
+    state_dim = robot_state_config.get("state_dim", 7)
     
     # 设置设备
     device = torch.device(inference_config.get("device", "cuda") if torch.cuda.is_available() else "cpu")
@@ -89,7 +98,10 @@ def main():
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
         use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3)
+        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
+        camera_names=camera_names,
+        use_state=use_state,
+        state_dim=state_dim
     )
     
     # 加载检查点
@@ -103,21 +115,53 @@ def main():
     model = model.to(device)
     model.eval()
     
-    # 加载图像
+    # 加载图像（支持多相机）
     print(f"Loading image: {args.image}")
-    image = load_image(
-        args.image,
-        image_size=model_config.get("vlm", {}).get("image_size", 224)
-    )
-    image = image.to(device)
+    image_size = model_config.get("vlm", {}).get("image_size", 224)
+    
+    # 如果只有一个相机，使用单图像模式
+    if len(camera_names) == 1:
+        image = load_image(args.image, image_size=image_size)
+        image = image.to(device)
+        images_input = image
+    else:
+        # 多相机模式：尝试加载多个图像
+        # 如果只提供了一个图像路径，使用第一个相机名称
+        images_dict = {}
+        base_path = Path(args.image)
+        for cam_name in camera_names:
+            # 尝试多种可能的文件名
+            possible_paths = [
+                base_path.parent / f"{cam_name}_{base_path.name}",
+                base_path.parent / f"{base_path.stem}_{cam_name}{base_path.suffix}",
+                base_path  # 如果找不到，使用原始路径
+            ]
+            found = False
+            for img_path in possible_paths:
+                if img_path.exists():
+                    img_tensor = load_image(str(img_path), image_size=image_size)
+                    images_dict[cam_name] = img_tensor.to(device)
+                    found = True
+                    break
+            if not found:
+                print(f"Warning: Image for camera {cam_name} not found, using provided image")
+                img_tensor = load_image(args.image, image_size=image_size)
+                images_dict[cam_name] = img_tensor.to(device)
+        images_input = images_dict
+    
+    # 处理状态（如果使用）
+    states = None
+    if use_state:
+        # 如果没有提供状态，使用零向量
+        states = torch.zeros(1, state_dim, device=device)
     
     # 推理
     print("Running inference...")
     with torch.no_grad():
         if args.text:
-            outputs = model(image, texts=[args.text])
+            outputs = model(images_input, texts=[args.text], states=states)
         else:
-            outputs = model(image)
+            outputs = model(images_input, states=states)
         
         actions = outputs["actions"]
         actions = actions.cpu().numpy()[0]  # 移除batch维度
