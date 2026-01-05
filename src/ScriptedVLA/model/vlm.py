@@ -239,8 +239,8 @@ class QwenVLM(nn.Module):
                     texts_with_state.append(enhanced_text)
                 texts = texts_with_state
             
-            # 处理输入
-            # 将图像转换为PIL格式（如果需要）
+            # 处理输入：对于Qwen2-VL，应该使用build_qwenvl_inputs方法
+            # 将图像转换为PIL格式
             if images.max() <= 1.0:
                 images_uint8 = (images * 255).byte().permute(0, 2, 3, 1).cpu().numpy()
             else:
@@ -248,38 +248,75 @@ class QwenVLM(nn.Module):
             
             pil_images = [Image.fromarray(img) for img in images_uint8]
             
+            # 使用build_qwenvl_inputs方法构建输入（这是Qwen2-VL推荐的方式）
             try:
-                # 尝试使用processor处理
-                if hasattr(self.processor, 'image_processor'):
-                    inputs = self.processor(
-                        text=texts,
-                        images=pil_images,
-                        return_tensors="pt",
-                        padding=True
-                    )
-                else:
-                    # 使用tokenizer处理文本，图像单独处理
-                    text_inputs = self.processor(
-                        texts,
-                        return_tensors="pt",
-                        padding=True
-                    )
-                    # 图像需要单独处理
-                    inputs = {**text_inputs}
-                    inputs['pixel_values'] = images.to(device)
-            except Exception as e:
-                # 如果processor失败，手动构建输入
-                print(f"Warning: Processor failed, using manual input preparation: {e}")
-                text_inputs = self.processor(
-                    texts,
-                    return_tensors="pt",
-                    padding=True
+                inputs = self.build_qwenvl_inputs(
+                    images=pil_images,
+                    instructions=texts,
+                    states=states
                 )
-                inputs = {**text_inputs}
-                inputs['pixel_values'] = images.to(device)
-            
-            # 将输入移到模型设备
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            except Exception as e:
+                # 如果build_qwenvl_inputs失败，尝试直接使用processor
+                print(f"Warning: build_qwenvl_inputs failed, trying processor directly: {e}")
+                try:
+                    # 构建messages格式
+                    messages = []
+                    for img, text in zip(pil_images, texts):
+                        message = {
+                            "role": "user",
+                            "content": []
+                        }
+                        if img is not None:
+                            message["content"].append({"type": "image", "image": img})
+                        if text:
+                            message["content"].append({"type": "text", "text": text})
+                        messages.append(message)
+                    
+                    # 使用processor处理
+                    if hasattr(self.processor, 'apply_chat_template'):
+                        # 对每个message单独处理，确保batch维度正确
+                        texts = []
+                        for msg in messages:
+                            text = self.processor.apply_chat_template(
+                                [msg],  # 单个message作为列表
+                                tokenize=False,
+                                add_generation_prompt=False
+                            )
+                            texts.append(text)
+                        
+                        if HAS_QWEN_VL_UTILS:
+                            image_inputs, video_inputs = process_vision_info(messages)
+                        else:
+                            # 备用方法：直接从messages中提取图像
+                            image_inputs = []
+                            for msg in messages:
+                                for item in msg.get("content", []):
+                                    if item.get("type") == "image":
+                                        image_inputs.append(item["image"])
+                            video_inputs = []
+                        
+                        inputs = self.processor(
+                            text=texts,  # 使用列表而不是单个字符串
+                            images=image_inputs if image_inputs else None,
+                            videos=video_inputs if video_inputs else None,
+                            padding=True,
+                            return_tensors="pt"
+                        )
+                    else:
+                        # 回退到简单方式
+                        inputs = self.processor(
+                            text=texts,
+                            images=pil_images,
+                            return_tensors="pt",
+                            padding=True
+                        )
+                    
+                    # 将输入移到模型设备
+                    device = next(self.model.parameters()).device
+                    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                             for k, v in inputs.items()}
+                except Exception as e2:
+                    raise RuntimeError(f"Failed to prepare inputs: {e2}")
         
         # 获取模型输出
         with torch.set_grad_enabled(self.training):
@@ -291,13 +328,19 @@ class QwenVLM(nn.Module):
                     return_dict=True
                 )
             except Exception as e:
-                # 如果模型调用失败，尝试不同的输入格式
-                print(f"Warning: Model forward failed, trying alternative: {e}")
-                # 只使用图像特征
+                # 如果模型调用失败，打印详细错误信息
+                print(f"Warning: Model forward failed: {e}")
+                print(f"  Input keys: {list(inputs.keys())}")
+                if 'input_ids' in inputs:
+                    print(f"  input_ids shape: {inputs['input_ids'].shape}")
                 if 'pixel_values' in inputs:
-                    outputs = self.model.vision_model(pixel_values=inputs['pixel_values'])
-                else:
-                    raise e
+                    print(f"  pixel_values shape: {inputs['pixel_values'].shape}")
+                # Qwen2VLForConditionalGeneration没有vision_model属性，直接抛出错误
+                raise RuntimeError(
+                    f"Model forward failed. This might be due to incorrect input format. "
+                    f"Please ensure images and texts are properly processed using build_qwenvl_inputs. "
+                    f"Original error: {e}"
+                )
         
         # 提取hidden states
         if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
@@ -432,11 +475,15 @@ class QwenVLM(nn.Module):
         # 使用processor处理
         try:
             # 步骤1: 使用apply_chat_template处理文本
-            texts = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False
-            )
+            # 注意：apply_chat_template对每个message单独处理，返回列表
+            texts = []
+            for msg in messages:
+                text = self.processor.apply_chat_template(
+                    [msg],  # 单个message作为列表
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                texts.append(text)
             
             # 步骤2: 处理图像信息
             if HAS_QWEN_VL_UTILS:
