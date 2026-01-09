@@ -1,10 +1,11 @@
 # ScriptedVLA - 基于Qwen VLM和DiT的视觉-语言-动作模型
 
-一个清晰易懂的VLA（Vision-Language-Action）训练和推理项目，基于Qwen开源小VLM模型和Transformer的DiT（Diffusion Transformer）动作头。
+一个清晰易懂的VLA（Vision-Language-Action）训练和推理项目，基于Qwen开源小VLM模型和Transformer的DiT（Diffusion Transformer）动作头。不玩套路，不做过度封装，不做过度模块化设计，旨在提供一个清晰、易于理解的VLA模型实现。Script is all you need.  --- author: @Benny Lu (hitlxg@gmail.com)
+
 
 ## 项目特点
 
-- 🎯 **简单易懂**：代码结构清晰，注释详细，适合学习和研究
+- 🎯 **简单易懂**：代码结构清晰，注释详细，绝无过度封装，适合学习和研究
 - 🔧 **易于配置**：使用YAML配置文件，方便调整超参数
 - 🚀 **完整流程**：包含数据加载、模型训练、推理等完整功能
 - 📦 **现代化工具**：使用uv进行虚拟环境管理

@@ -27,12 +27,12 @@ def test_qwen_groot_initialization():
             "model_name": "Qwen/Qwen2-VL-2B-Instruct",
             "image_size": 224,
             "max_seq_length": 512,
-            "freeze_vlm": False,
+            "freeze_vlm": True,
             "cache_dir": "./cache/models"
         }
         
         action_head_config = {
-            "hidden_dim": 768,
+            "hidden_dim": 1536,
             "num_layers": 2,  # 使用较少的层数以加快测试
             "num_heads": 8,
             "mlp_ratio": 4.0,
@@ -81,7 +81,7 @@ def test_qwen_groot_forward_examples():
         }
         
         action_head_config = {
-            "hidden_dim": 768,
+            "hidden_dim": 1536,
             "num_layers": 2,
             "num_heads": 8,
             "action_dim": 7,

@@ -21,8 +21,6 @@ class VLAModel(nn.Module):
         self,
         vlm_config: Dict,
         action_head_config: Dict,
-        use_cross_attention: bool = True,
-        cross_attention_layers: int = 3,
         camera_names: Optional[list] = None,
         use_state: bool = True,
         state_dim: int = 7
@@ -38,10 +36,7 @@ class VLAModel(nn.Module):
             - num_heads: 注意力头数
             - mlp_ratio: MLP比例
             - action_dim: 动作维度
-            - patch_size: patch大小
-            - num_patches: patch数量
-            use_cross_attention: 是否使用交叉注意力
-            cross_attention_layers: 交叉注意力层数
+            - action_horizon: 动作序列长度
             camera_names: 相机名称列表
             use_state: 是否使用机器人状态
             state_dim: 状态维度
@@ -66,9 +61,9 @@ class VLAModel(nn.Module):
         # 获取VLM输出维度
         vlm_hidden_dim = self.vlm.get_hidden_dim()
         
-        # 多相机特征融合层（如果需要融合多个相机）
+        # 多相机特征融合层（如果需要融合多个相机的hidden_states）
         if self.num_cameras > 1:
-            # 使用线性层融合多个相机的特征
+            # 使用线性层融合多个相机的hidden_states
             self.camera_fusion = nn.Sequential(
                 nn.Linear(vlm_hidden_dim * self.num_cameras, vlm_hidden_dim),
                 nn.LayerNorm(vlm_hidden_dim),
@@ -83,7 +78,6 @@ class VLAModel(nn.Module):
         action_head_hidden_dim = action_head_config.get("hidden_dim", vlm_hidden_dim)
         
         self.action_head = FlowMatchingActionHead(
-            input_dim=vlm_hidden_dim,  # 用于交叉注意力的维度对齐
             hidden_dim=action_head_hidden_dim,
             num_layers=action_head_config.get("num_layers", 6),
             num_heads=action_head_config.get("num_heads", 12),
@@ -101,21 +95,10 @@ class VLAModel(nn.Module):
             noise_s=action_head_config.get("noise_s", 0.999),
             num_timestep_buckets=action_head_config.get("num_timestep_buckets", 1000),
             num_inference_timesteps=action_head_config.get("num_inference_timesteps", 50),
-            cross_attention_dim=vlm_hidden_dim  # VLM的hidden_size用于交叉注意力
+            cross_attention_dim=vlm_hidden_dim if action_head_hidden_dim != vlm_hidden_dim else None
         )
         
-        # 可选的交叉注意力层（用于更好的特征融合）
-        self.use_cross_attention = use_cross_attention
-        if use_cross_attention:
-            self.cross_attention_layers = nn.ModuleList([
-                nn.MultiheadAttention(
-                    vlm_hidden_dim,
-                    num_heads=action_head_config.get("num_heads", 12),
-                    batch_first=True
-                )
-                for _ in range(cross_attention_layers)
-            ])
-            self.cross_norm = nn.LayerNorm(vlm_hidden_dim)
+        # 注意：交叉注意力现在由动作头内部处理，不需要额外的交叉注意力层
     
     def forward(
         self,
@@ -143,66 +126,48 @@ class VLAModel(nn.Module):
             如果推理模式（actions为None）：
                 {"actions": predicted_actions} 或 {"actions": ..., "features": ...}
         """
-        # 处理多相机输入
+        # 处理多相机输入，获取VLM的hidden_states
         if isinstance(images, dict):
-            # 多相机模式
-            camera_features = []
+            # 多相机模式：获取每个相机的hidden_states
+            camera_hidden_states = []
             for cam_name in self.camera_names:
                 if cam_name in images:
                     cam_images = images[cam_name]  # [B, C, H, W]
-                    vlm_outputs = self.vlm(cam_images, texts, return_dict=True)
-                    cam_features = vlm_outputs["features"]  # [B, hidden_dim]
-                    camera_features.append(cam_features)
+                    vlm_outputs = self.vlm(cam_images, texts, states=states, return_dict=True, output_hidden_states=True)
+                    # 使用last_hidden_state（完整的序列特征）
+                    cam_hidden_states = vlm_outputs["last_hidden_state"]  # [B, seq_len, hidden_dim]
+                    camera_hidden_states.append(cam_hidden_states)
                 else:
                     raise ValueError(f"Missing camera: {cam_name}")
             
-            # 融合多相机特征
+            # 融合多相机hidden_states（如果需要）
             if self.num_cameras > 1:
-                # 拼接所有相机特征
-                concatenated = torch.cat(camera_features, dim=1)  # [B, num_cameras * hidden_dim]
-                vlm_features = self.camera_fusion(concatenated)  # [B, hidden_dim]
+                # 在序列维度上拼接，然后融合
+                # camera_hidden_states: List of [B, seq_len, hidden_dim]
+                # 拼接后: [B, num_cameras * seq_len, hidden_dim]
+                concatenated = torch.cat(camera_hidden_states, dim=1)  # [B, num_cameras * seq_len, hidden_dim]
+                # 对每个位置的特征进行融合
+                B, total_seq_len, hidden_dim = concatenated.shape
+                # 重塑为 [B * total_seq_len, num_cameras * hidden_dim]，融合，再重塑回来
+                reshaped = concatenated.view(B * total_seq_len, self.num_cameras * hidden_dim)
+                fused = self.camera_fusion(reshaped)  # [B * total_seq_len, hidden_dim]
+                vlm_hidden_states = fused.view(B, total_seq_len, hidden_dim)  # [B, total_seq_len, hidden_dim]
             else:
-                vlm_features = camera_features[0]
+                vlm_hidden_states = camera_hidden_states[0]
         else:
             # 单相机模式（向后兼容）
-            vlm_outputs = self.vlm(images, texts, return_dict=True)
-            vlm_features = vlm_outputs["features"]  # [B, hidden_dim]
+            vlm_outputs = self.vlm(images, texts, states=states, return_dict=True, output_hidden_states=True)
+            # 直接使用last_hidden_state（完整的序列特征）
+            vlm_hidden_states = vlm_outputs["last_hidden_state"]  # [B, seq_len, hidden_dim]
         
-        # 可选的交叉注意力增强
-        if self.use_cross_attention and self.training:
-            # 使用完整的序列特征进行交叉注意力
-            if isinstance(images, dict):
-                # 使用第一个相机的完整特征
-                first_cam = list(images.values())[0]
-                vlm_outputs_cross = self.vlm(first_cam, texts, return_dict=True)
-            else:
-                vlm_outputs_cross = self.vlm(images, texts, return_dict=True)
-            full_features = vlm_outputs_cross["full_features"]  # [B, seq_len, hidden_dim]
-            for cross_attn in self.cross_attention_layers:
-                enhanced_features, _ = cross_attn(
-                    vlm_features.unsqueeze(1),
-                    full_features,
-                    full_features
-                )
-                vlm_features = enhanced_features.squeeze(1)
-            vlm_features = self.cross_norm(vlm_features)
-        
-        # 融合状态信息（如果使用）
-        if self.use_state and states is not None:
-            # 投影状态到特征空间
-            state_features = self.state_projection(states)  # [B, hidden_dim]
-            # 拼接视觉特征和状态特征
-            combined_features = torch.cat([vlm_features, state_features], dim=1)  # [B, 2*hidden_dim]
-        else:
-            combined_features = vlm_features
-        
-        # Flow Matching动作预测
-        # 训练模式：如果提供了actions，计算Flow Matching损失
+        # 直接传递VLM的hidden_states给动作头
+        # 动作头内部会处理交叉注意力和状态信息
         if actions is not None and self.training:
+            # 训练模式：计算Flow Matching损失
             loss = self.action_head(
-                combined_features,
+                vlm_hidden_states,  # 直接传递hidden_states
                 actions=actions,
-                states=states,
+                states=states,  # 状态直接传递给动作头
                 encoder_attention_mask=None,
                 return_features=return_features
             )
@@ -210,7 +175,7 @@ class VLAModel(nn.Module):
                 loss, action_features = loss
                 return {
                     "loss": loss,
-                    "vlm_features": vlm_features,
+                    "vlm_hidden_states": vlm_hidden_states,
                     "action_features": action_features
                 }
             return {"loss": loss}
@@ -218,9 +183,9 @@ class VLAModel(nn.Module):
         # 推理模式：预测动作
         else:
             pred_actions = self.action_head(
-                combined_features,
+                vlm_hidden_states,  # 直接传递hidden_states
                 actions=None,
-                states=states,
+                states=states,  # 状态直接传递给动作头
                 encoder_attention_mask=None,
                 return_features=return_features
             )
@@ -228,7 +193,7 @@ class VLAModel(nn.Module):
                 pred_actions, action_features = pred_actions
                 return {
                     "actions": pred_actions,
-                    "vlm_features": vlm_features,
+                    "vlm_hidden_states": vlm_hidden_states,
                     "action_features": action_features
                 }
             return {"actions": pred_actions}

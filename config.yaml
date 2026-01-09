@@ -7,12 +7,12 @@ model:
     model_name: "Qwen/Qwen2-VL-2B-Instruct"  # 推荐使用Qwen2-VL-2B-Instruct，或 "Qwen/Qwen-VL-Chat"
     image_size: 448  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
-    freeze_vlm: false  # 是否冻结VLM参数
+    freeze_vlm: true  # 是否冻结VLM参数
   
   # 动作头配置（DiT）
   action_head:
     type: "dit"  # Diffusion Transformer
-    hidden_dim: 768  # 与VLM输出维度匹配
+    hidden_dim: 1536  # 与VLM输出维度匹配
     num_layers: 6
     num_heads: 12
     mlp_ratio: 4.0

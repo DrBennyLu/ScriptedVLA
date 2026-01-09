@@ -36,16 +36,23 @@ class SinusoidalPositionalEncoding(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [B, T] 或 [B, T, 1] 时间步索引
+            x: [B, T] 或 [B, T, 1] 时间步索引（整数）
         Returns:
             [B, T, d_model] 位置编码
         """
         if x.dim() == 2:
             # [B, T] -> [B, T, d_model]
-            return self.pe[:, :x.size(1), :]
+            # 注意：这里使用 x 中的值作为索引，而不是直接使用 x.size(1)
+            # 但为了简化，我们使用序列长度来索引位置编码
+            B, T = x.shape
+            # 扩展 batch 维度：[1, T, d_model] -> [B, T, d_model]
+            pe_output = self.pe[:, :T, :].expand(B, -1, -1)
+            return pe_output
         elif x.dim() == 3:
             # [B, T, 1] -> [B, T, d_model]
-            return self.pe[:, :x.size(1), :]
+            B, T, _ = x.shape
+            pe_output = self.pe[:, :T, :].expand(B, -1, -1)
+            return pe_output
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
 
@@ -96,6 +103,8 @@ class ActionEncoder(nn.Module):
         a_emb = self.layer1(actions)  # [B, T, hidden_size]
         
         # 时间步编码
+        # pos_encoding 期望输入是 [B, T]，返回 [B, T, hidden_size]
+        # timesteps 已经是 [B, T] 形状（从上面的扩展得到）
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)  # [B, T, hidden_size]
         
         # 拼接并处理
@@ -202,13 +211,12 @@ class FlowMatchingActionHead(nn.Module):
     
     def __init__(
         self,
-        input_dim: int,
         hidden_dim: int = 768,
         num_layers: int = 6,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         action_dim: int = 7,
-        action_horizon: int = 1,  # 动作序列长度
+        action_horizon: int = 10,  # 动作序列长度
         dropout: float = 0.1,
         use_cross_attention: bool = True,
         state_dim: Optional[int] = None,
@@ -219,13 +227,13 @@ class FlowMatchingActionHead(nn.Module):
         noise_beta_beta: float = 1.0,
         noise_s: float = 0.999,
         num_timestep_buckets: int = 1000,
-        num_inference_timesteps: int = 50
+        num_inference_timesteps: int = 50,
+        cross_attention_dim: Optional[int] = None
     ):
         """
         初始化Flow Matching动作头
         
         Args:
-            input_dim: 输入特征维度（VLM输出维度）
             hidden_dim: Transformer隐藏层维度
             num_layers: Transformer层数
             num_heads: 注意力头数
@@ -235,7 +243,10 @@ class FlowMatchingActionHead(nn.Module):
             dropout: Dropout比例
             use_cross_attention: 是否使用交叉注意力
             state_dim: 状态维度（如果使用状态）
-            num_target_vision_tokens: 目标视觉token数量
+            num_target_vision_tokens: 目标视觉token数量（future_tokens的数量）
+                - 作用：可学习的占位符token，通过交叉注意力从VLM特征中提取信息
+                - 如何确定：通常通过实验调优（16, 32, 64等），或参考VLM输出的视觉token数量
+                - 默认值：32（经验值，在大多数任务中表现良好）
             max_seq_len: 最大序列长度
             add_pos_embed: 是否添加位置编码
             noise_beta_alpha: Beta分布alpha参数
@@ -243,11 +254,15 @@ class FlowMatchingActionHead(nn.Module):
             noise_s: Flow matching噪声参数
             num_timestep_buckets: 时间步离散化桶数
             num_inference_timesteps: 推理时的去噪步数
+            cross_attention_dim: VLM hidden_states的维度（用于交叉注意力，如果与hidden_dim不同则需要投影）
         """
         super().__init__()
         
-        self.input_dim = input_dim
+        # 确保 training 属性被初始化（nn.Module 会自动设置，但显式初始化更安全）
+        self.training = True
+        
         self.hidden_dim = hidden_dim
+        self.cross_attention_dim = cross_attention_dim
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.use_cross_attention = use_cross_attention
@@ -272,6 +287,17 @@ class FlowMatchingActionHead(nn.Module):
         )
         
         # Future tokens（用于动作预测的占位符）
+        # 作用：
+        # 1. 提供可学习的占位符token，用于从VLM的视觉-语言特征中提取信息
+        # 2. 通过交叉注意力机制，让DiT块能够关注VLM的hidden_states
+        # 3. 这些token在训练过程中学习如何将视觉-语言信息转换为动作预测的上下文
+        # 4. 类似于Transformer中的特殊token（如[CLS]），但专门用于动作预测任务
+        # 
+        # num_target_vision_tokens: 占位符token的数量（超参数，通常设置为32）
+        # 这个值可以通过以下方式确定：
+        # - 实验调优：尝试不同的值（16, 32, 64等），选择性能最好的
+        # - 参考VLM输出：可以设置为VLM输出的视觉token数量
+        # - 计算资源：更多token需要更多计算，需要平衡性能和效率
         self.future_tokens = nn.Embedding(num_target_vision_tokens, hidden_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
         
@@ -294,6 +320,12 @@ class FlowMatchingActionHead(nn.Module):
         
         # 最终层归一化
         self.final_norm = nn.LayerNorm(hidden_dim)
+        
+        # VLM特征投影层（如果cross_attention_dim与hidden_dim不同）
+        if cross_attention_dim is not None and cross_attention_dim != hidden_dim:
+            self.vlm_projection = nn.Linear(cross_attention_dim, hidden_dim)
+        else:
+            self.vlm_projection = None
         
         # 动作解码器（预测速度场）
         self.action_decoder = MLP(
@@ -359,6 +391,13 @@ class FlowMatchingActionHead(nn.Module):
         else:
             vlm_features_seq = vlm_features
         
+        # 如果VLM特征维度与hidden_dim不同，进行投影
+        # 注意：确保数据类型匹配（VLM可能输出bfloat16，但投影层使用float32）
+        if self.vlm_projection is not None:
+            # 转换数据类型以确保匹配（投影层通常使用float32）
+            vlm_features_seq = vlm_features_seq.to(dtype=torch.float32)
+            vlm_features_seq = self.vlm_projection(vlm_features_seq)
+        
         # 训练模式：计算Flow Matching损失
         if actions is not None and self.training:
             # 采样噪声和时间步
@@ -378,6 +417,20 @@ class FlowMatchingActionHead(nn.Module):
             
             # 编码状态（如果使用）
             if self.state_encoder is not None and states is not None:
+                # 处理states维度：可能是[B, state_dim]或[B, 1, state_dim]或[B, T, state_dim]
+                if states.dim() == 3:
+                    # [B, 1, state_dim] 或 [B, T, state_dim] -> 取第一个时间步或压缩
+                    if states.shape[1] == 1:
+                        states = states.squeeze(1)  # [B, 1, state_dim] -> [B, state_dim]
+                    else:
+                        # 如果有多个时间步，取第一个
+                        states = states[:, 0, :]  # [B, T, state_dim] -> [B, state_dim]
+                elif states.dim() == 2:
+                    # [B, state_dim] 已经是正确格式
+                    pass
+                else:
+                    raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+                
                 state_features = self.state_encoder(states)  # [B, hidden_dim]
                 state_features = state_features.unsqueeze(1)  # [B, 1, hidden_dim]
             else:
@@ -390,19 +443,50 @@ class FlowMatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
             
             # 拼接状态、future tokens和动作特征
+            # future_tokens作用详解：
+            # 1. 可学习的占位符token，通过交叉注意力从VLM的hidden_states中提取视觉-语言信息
+            # 2. 在训练过程中，这些token学习如何将VLM特征转换为动作预测的上下文
+            # 3. 通过自注意力机制，future_tokens的信息会传播到action_features，影响动作编码
+            # 4. 类似于Transformer中的特殊token（如[CLS]），但专门用于动作预测任务
+            # 
+            # 序列结构：[state_token(可选)] + [future_tokens] + [action_features]
+            # 例如：num_target_vision_tokens=32, action_horizon=11, 有state时
+            # 序列长度 = 1(state) + 32(future_tokens) + 11(actions) = 44
+            # 
+            # future_tokens如何求得：
+            # - 初始化：使用nn.Embedding创建可学习的嵌入层，随机初始化（mean=0, std=0.02）
+            # - 训练：通过反向传播自动学习，优化目标是使动作预测损失最小
+            # - 推理：使用训练好的嵌入权重，从VLM特征中提取相关信息
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_target_vision_tokens, hidden_dim]
             
             if state_features is not None:
+                # 确保state_features是3维的：[B, 1, hidden_dim]
+                if state_features.dim() == 4:
+                    # 如果是4维，可能是[B, 1, 1, hidden_dim]，压缩掉多余的维度
+                    state_features = state_features.squeeze(2) if state_features.shape[2] == 1 else state_features.squeeze(1)
+                elif state_features.dim() == 2:
+                    # 如果是2维[B, hidden_dim]，添加序列维度
+                    state_features = state_features.unsqueeze(1)
+                elif state_features.dim() != 3:
+                    raise ValueError(f"state_features should be 2D or 3D, got shape {state_features.shape}")
+                
+                # 确保所有张量都是3维的：[B, seq_len, hidden_dim]
+                assert state_features.dim() == 3, f"state_features should be 3D [B, 1, hidden_dim], got {state_features.shape}"
+                assert future_tokens.dim() == 3, f"future_tokens should be 3D, got {future_tokens.shape}"
+                assert action_features.dim() == 3, f"action_features should be 3D, got {action_features.shape}"
+                
                 sa_embs = torch.cat([state_features, future_tokens, action_features], dim=1)  # [B, 1+num_tokens+action_horizon, hidden_dim]
             else:
                 sa_embs = torch.cat([future_tokens, action_features], dim=1)  # [B, num_tokens+action_horizon, hidden_dim]
             
             # 通过DiT块
+            # future_tokens作为query，通过交叉注意力关注VLM的hidden_states（key和value）
+            # 这样future_tokens可以从VLM特征中提取相关信息，然后通过自注意力影响action_features
             x = sa_embs
             for block in self.blocks:
                 x = block(
                     x,
-                    encoder_hidden_states=vlm_features_seq,
+                    encoder_hidden_states=vlm_features_seq,  # VLM特征作为交叉注意力的key和value
                     encoder_attention_mask=encoder_attention_mask
                 )
             
@@ -452,6 +536,13 @@ class FlowMatchingActionHead(nn.Module):
         else:
             vlm_features_seq = vlm_features
         
+        # 如果VLM特征维度与hidden_dim不同，进行投影
+        # 注意：确保数据类型匹配（VLM可能输出bfloat16，但投影层使用float32）
+        if self.vlm_projection is not None:
+            # 转换数据类型以确保匹配（投影层通常使用float32）
+            vlm_features_seq = vlm_features_seq.to(dtype=torch.float32)
+            vlm_features_seq = self.vlm_projection(vlm_features_seq)
+        
         # 初始化动作（从噪声开始）
         actions = torch.randn(
             size=(batch_size, self.action_horizon, self.action_dim),
@@ -461,6 +552,20 @@ class FlowMatchingActionHead(nn.Module):
         
         # 编码状态（如果使用）
         if self.state_encoder is not None and states is not None:
+            # 处理states维度：可能是[B, state_dim]或[B, 1, state_dim]或[B, T, state_dim]
+            if states.dim() == 3:
+                # [B, 1, state_dim] 或 [B, T, state_dim] -> 取第一个时间步或压缩
+                if states.shape[1] == 1:
+                    states = states.squeeze(1)  # [B, 1, state_dim] -> [B, state_dim]
+                else:
+                    # 如果有多个时间步，取第一个
+                    states = states[:, 0, :]  # [B, T, state_dim] -> [B, state_dim]
+            elif states.dim() == 2:
+                # [B, state_dim] 已经是正确格式
+                pass
+            else:
+                raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+            
             state_features = self.state_encoder(states)  # [B, hidden_dim]
             state_features = state_features.unsqueeze(1)  # [B, 1, hidden_dim]
         else:
@@ -492,19 +597,50 @@ class FlowMatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
             
             # 拼接状态、future tokens和动作特征
+            # future_tokens作用详解：
+            # 1. 可学习的占位符token，通过交叉注意力从VLM的hidden_states中提取视觉-语言信息
+            # 2. 在训练过程中，这些token学习如何将VLM特征转换为动作预测的上下文
+            # 3. 通过自注意力机制，future_tokens的信息会传播到action_features，影响动作编码
+            # 4. 类似于Transformer中的特殊token（如[CLS]），但专门用于动作预测任务
+            # 
+            # 序列结构：[state_token(可选)] + [future_tokens] + [action_features]
+            # 例如：num_target_vision_tokens=32, action_horizon=11, 有state时
+            # 序列长度 = 1(state) + 32(future_tokens) + 11(actions) = 44
+            # 
+            # future_tokens如何求得：
+            # - 初始化：使用nn.Embedding创建可学习的嵌入层，随机初始化（mean=0, std=0.02）
+            # - 训练：通过反向传播自动学习，优化目标是使动作预测损失最小
+            # - 推理：使用训练好的嵌入权重，从VLM特征中提取相关信息
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_target_vision_tokens, hidden_dim]
             
             if state_features is not None:
+                # 确保state_features是3维的：[B, 1, hidden_dim]
+                if state_features.dim() == 4:
+                    # 如果是4维，可能是[B, 1, 1, hidden_dim]，压缩掉多余的维度
+                    state_features = state_features.squeeze(2) if state_features.shape[2] == 1 else state_features.squeeze(1)
+                elif state_features.dim() == 2:
+                    # 如果是2维[B, hidden_dim]，添加序列维度
+                    state_features = state_features.unsqueeze(1)
+                elif state_features.dim() != 3:
+                    raise ValueError(f"state_features should be 2D or 3D, got shape {state_features.shape}")
+                
+                # 确保所有张量都是3维的：[B, seq_len, hidden_dim]
+                assert state_features.dim() == 3, f"state_features should be 3D [B, 1, hidden_dim], got {state_features.shape}"
+                assert future_tokens.dim() == 3, f"future_tokens should be 3D, got {future_tokens.shape}"
+                assert action_features.dim() == 3, f"action_features should be 3D, got {action_features.shape}"
+                
                 sa_embs = torch.cat([state_features, future_tokens, action_features], dim=1)  # [B, 1+num_tokens+action_horizon, hidden_dim]
             else:
                 sa_embs = torch.cat([future_tokens, action_features], dim=1)  # [B, num_tokens+action_horizon, hidden_dim]
             
             # 通过DiT块
+            # future_tokens作为query，通过交叉注意力关注VLM的hidden_states（key和value）
+            # 这样future_tokens可以从VLM特征中提取相关信息，然后通过自注意力影响action_features
             x = sa_embs
             for block in self.blocks:
                 x = block(
                     x,
-                    encoder_hidden_states=vlm_features_seq,
+                    encoder_hidden_states=vlm_features_seq,  # VLM特征作为交叉注意力的key和value
                     encoder_attention_mask=encoder_attention_mask
                 )
             

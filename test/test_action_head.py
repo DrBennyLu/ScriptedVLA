@@ -23,7 +23,6 @@ def test_action_head_initialization():
     
     try:
         action_head = FlowMatchingActionHead(
-            input_dim=768,
             hidden_dim=768,
             num_layers=2,  # 使用较少的层数以加快测试
             num_heads=8,
@@ -36,6 +35,15 @@ def test_action_head_initialization():
         print(f"  Hidden dim: {action_head.hidden_dim}")
         print(f"  Action dim: {action_head.action_dim}")
         print(f"  Action horizon: {action_head.action_horizon}")
+        
+        # 计算可训练参数总量
+        total_params = sum(p.numel() for p in action_head.parameters() if p.requires_grad)
+        trainable_params = sum(p.numel() for p in action_head.parameters() if p.requires_grad)
+        total_all_params = sum(p.numel() for p in action_head.parameters())
+        
+        print(f"  可训练参数总量: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
+        print(f"  总参数数量: {total_all_params:,} ({total_all_params / 1e6:.2f}M)")
+        
         return action_head
     except Exception as e:
         print(f"✗ 动作头初始化失败: {e}")
@@ -86,7 +94,6 @@ def test_action_head_forward_training():
     
     try:
         action_head = FlowMatchingActionHead(
-            input_dim=768,
             hidden_dim=768,
             num_layers=2,
             num_heads=8,
@@ -137,7 +144,6 @@ def test_action_head_forward_inference():
     
     try:
         action_head = FlowMatchingActionHead(
-            input_dim=768,
             hidden_dim=768,
             num_layers=2,
             num_heads=8,
@@ -185,7 +191,6 @@ def test_action_head_without_state():
     
     try:
         action_head = FlowMatchingActionHead(
-            input_dim=768,
             hidden_dim=768,
             num_layers=2,
             num_heads=8,
@@ -237,7 +242,6 @@ def test_action_head_cross_attention():
     
     try:
         action_head = FlowMatchingActionHead(
-            input_dim=768,
             hidden_dim=768,
             num_layers=2,
             num_heads=8,
@@ -274,6 +278,151 @@ def test_action_head_cross_attention():
         return False
 
 
+def test_vlm_features_dimension_alignment():
+    """测试VLM features和DiT query维度对齐"""
+    print("\n" + "=" * 60)
+    print("测试7: VLM features与DiT query维度对齐")
+    print("=" * 60)
+    
+    try:
+        hidden_dim = 768
+        action_head = FlowMatchingActionHead(
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_heads=8,
+            action_dim=7,
+            action_horizon=4,
+            use_cross_attention=True,
+            state_dim=7,
+            num_inference_timesteps=5
+        )
+        action_head.train()
+        
+        batch_size = 2
+        
+        # 测试1: VLM features是3D张量 [B, seq_len, hidden_dim]
+        print("\n  测试1: VLM features为3D张量 [B, seq_len, hidden_dim]")
+        seq_len_3d = 10
+        vlm_features_3d = torch.randn(batch_size, seq_len_3d, hidden_dim)
+        actions = torch.randn(batch_size, 4, 7)
+        states = torch.randn(batch_size, 7)
+        
+        # 检查维度
+        print(f"    VLM features shape: {vlm_features_3d.shape}")
+        print(f"    DiT hidden_dim: {hidden_dim}")
+        print(f"    VLM features最后一维: {vlm_features_3d.shape[-1]}")
+        assert vlm_features_3d.shape[-1] == hidden_dim, \
+            f"VLM features维度不匹配: {vlm_features_3d.shape[-1]} != {hidden_dim}"
+        
+        # 前向传播测试
+        loss_3d = action_head(
+            vlm_features_3d,
+            actions=actions,
+            states=states
+        )
+        print(f"    ✓ 3D features前向传播成功，loss: {loss_3d.item():.4f}")
+        
+        # 测试2: VLM features是2D张量 [B, hidden_dim]（会被unsqueeze为[B, 1, hidden_dim]）
+        print("\n  测试2: VLM features为2D张量 [B, hidden_dim]")
+        vlm_features_2d = torch.randn(batch_size, hidden_dim)
+        
+        print(f"    VLM features shape: {vlm_features_2d.shape}")
+        print(f"    DiT hidden_dim: {hidden_dim}")
+        print(f"    VLM features最后一维: {vlm_features_2d.shape[-1]}")
+        assert vlm_features_2d.shape[-1] == hidden_dim, \
+            f"VLM features维度不匹配: {vlm_features_2d.shape[-1]} != {hidden_dim}"
+        
+        # 前向传播测试
+        loss_2d = action_head(
+            vlm_features_2d,
+            actions=actions,
+            states=states
+        )
+        print(f"    ✓ 2D features前向传播成功，loss: {loss_2d.item():.4f}")
+        
+        # 测试3: 测试维度不匹配的情况（应该被vlm_projection处理）
+        print("\n  测试3: VLM features维度与hidden_dim不同（需要投影）")
+        different_dim = 512
+        action_head_proj = FlowMatchingActionHead(
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_heads=8,
+            action_dim=7,
+            action_horizon=4,
+            use_cross_attention=True,
+            state_dim=7,
+            num_inference_timesteps=5,
+            cross_attention_dim=different_dim  # VLM维度与hidden_dim不同
+        )
+        action_head_proj.train()
+        
+        vlm_features_diff = torch.randn(batch_size, 10, different_dim)
+        print(f"    VLM features shape: {vlm_features_diff.shape}")
+        print(f"    VLM features维度: {different_dim}")
+        print(f"    DiT hidden_dim: {hidden_dim}")
+        print(f"    动作头cross_attention_dim: {action_head_proj.cross_attention_dim}")
+        
+        # 检查是否有投影层
+        if action_head_proj.vlm_projection is not None:
+            print(f"    ✓ 检测到vlm_projection层: {action_head_proj.vlm_projection}")
+            # 测试投影
+            projected = action_head_proj.vlm_projection(vlm_features_diff)
+            print(f"    投影后shape: {projected.shape}")
+            assert projected.shape[-1] == hidden_dim, \
+                f"投影后维度不匹配: {projected.shape[-1]} != {hidden_dim}"
+            print(f"    ✓ 投影层维度对齐成功")
+        else:
+            print(f"    ⚠ 未检测到vlm_projection层（维度相同，不需要投影）")
+        
+        # 前向传播测试
+        loss_proj = action_head_proj(
+            vlm_features_diff,
+            actions=actions,
+            states=states
+        )
+        print(f"    ✓ 不同维度features前向传播成功，loss: {loss_proj.item():.4f}")
+        
+        # 测试4: 验证DiT块中的交叉注意力维度
+        print("\n  测试4: 验证DiT块交叉注意力维度")
+        # 获取第一个DiT块
+        dit_block = action_head.blocks[0]
+        if dit_block.use_cross_attention:
+            # 创建query和encoder_hidden_states
+            query_seq_len = 5  # action序列长度
+            query = torch.randn(batch_size, query_seq_len, hidden_dim)
+            encoder_hidden_states = torch.randn(batch_size, seq_len_3d, hidden_dim)
+            
+            print(f"    Query shape: {query.shape}")
+            print(f"    Encoder hidden states shape: {encoder_hidden_states.shape}")
+            print(f"    Query最后一维: {query.shape[-1]}")
+            print(f"    Encoder最后一维: {encoder_hidden_states.shape[-1]}")
+            
+            assert query.shape[-1] == encoder_hidden_states.shape[-1], \
+                f"Query和Encoder维度不匹配: {query.shape[-1]} != {encoder_hidden_states.shape[-1]}"
+            
+            # 测试交叉注意力
+            with torch.no_grad():
+                output = dit_block(
+                    query,
+                    encoder_hidden_states=encoder_hidden_states
+                )
+            print(f"    输出shape: {output.shape}")
+            assert output.shape == query.shape, \
+                f"输出shape不匹配: {output.shape} != {query.shape}"
+            print(f"    ✓ DiT块交叉注意力维度对齐成功")
+        else:
+            print(f"    ⚠ DiT块未启用交叉注意力")
+        
+        print("\n✓ VLM features与DiT query维度对齐测试成功")
+        return True
+        
+    except Exception as e:
+        print(f"✗ VLM features维度对齐测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def run_all_tests():
     """运行所有测试"""
     print("\n" + "=" * 60)
@@ -301,6 +450,9 @@ def run_all_tests():
         
         # 测试6: 交叉注意力
         results.append(("交叉注意力", test_action_head_cross_attention()))
+        
+        # 测试7: VLM features维度对齐
+        results.append(("VLM features维度对齐", test_vlm_features_dimension_alignment()))
     
     # 打印总结
     print("\n" + "=" * 60)
