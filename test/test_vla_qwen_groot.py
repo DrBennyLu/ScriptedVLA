@@ -68,74 +68,10 @@ def test_qwen_groot_initialization():
         return None
 
 
-def test_qwen_groot_forward_examples():
-    """测试QwenGR00T前向传播（使用examples格式）"""
-    print("\n" + "=" * 60)
-    print("测试2: QwenGR00T前向传播（examples格式，训练模式）")
-    print("=" * 60)
-    
-    try:
-        vlm_config = {
-            "model_name": "Qwen/Qwen2-VL-2B-Instruct",
-            "cache_dir": "./cache/models"
-        }
-        
-        action_head_config = {
-            "hidden_dim": 1536,
-            "num_layers": 2,
-            "num_heads": 8,
-            "action_dim": 7,
-            "action_horizon": 4,
-            "num_inference_timesteps": 5
-        }
-        
-        model = QwenGR00TVLAModel(
-            vlm_config=vlm_config,
-            action_head_config=action_head_config,
-            use_state=True,
-            state_dim=7,
-            future_action_window_size=3
-        )
-        model.train()
-        
-        # 创建examples格式的数据
-        batch_size = 2
-        examples = []
-        for i in range(batch_size):
-            example = {
-                "image": [Image.new('RGB', (224, 224), color='red')],
-                "lang": f"Pick up object {i}.",
-                "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float32),
-                "state": np.random.uniform(-1, 1, size=(1, 7)).astype(np.float32)
-            }
-            examples.append(example)
-        
-        # 前向传播
-        outputs = model(examples=examples)
-        
-        print("✓ 前向传播成功（examples格式，训练模式）")
-        print(f"  Examples数量: {len(examples)}")
-        print(f"  每个example的键: {list(examples[0].keys())}")
-        
-        # 检查输出
-        assert "action_loss" in outputs, "缺少action_loss字段"
-        print(f"  输出action_loss: {outputs['action_loss'].item():.4f}")
-        
-        assert isinstance(outputs["action_loss"], torch.Tensor), "action_loss应该是tensor"
-        assert outputs["action_loss"].dim() == 0, "action_loss应该是标量"
-        
-        return True
-    except Exception as e:
-        print(f"✗ 前向传播失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
 def test_qwen_groot_forward_images_texts():
-    """测试QwenGR00T前向传播（使用images和texts格式）"""
+    """测试QwenGR00T前向传播（统一输入格式）"""
     print("\n" + "=" * 60)
-    print("测试3: QwenGR00T前向传播（images/texts格式）")
+    print("测试2: QwenGR00T前向传播（统一输入格式，训练模式）")
     print("=" * 60)
     
     try:
@@ -162,7 +98,7 @@ def test_qwen_groot_forward_images_texts():
         )
         model.train()
         
-        # 使用images和texts格式
+        # 使用统一输入格式
         batch_images = [
             Image.new('RGB', (224, 224), color='red'),
             Image.new('RGB', (224, 224), color='blue')
@@ -172,16 +108,19 @@ def test_qwen_groot_forward_images_texts():
             np.random.uniform(-1, 1, size=(2, 16, 7)).astype(np.float32)
         )
         states = torch.tensor(
-            np.random.uniform(-1, 1, size=(2, 1, 7)).astype(np.float32)
+            np.random.uniform(-1, 1, size=(2, 7)).astype(np.float32)  # [B, state_dim]
         )
         
+        # 统一输入格式
+        inputs = {
+            "images": batch_images,
+            "instructions": instructions,
+            "actions": actions,
+            "states": states
+        }
+        
         # 前向传播
-        outputs = model(
-            images=batch_images,
-            texts=instructions,
-            actions=actions,
-            states=states
-        )
+        outputs = model(inputs=inputs)
         
         print("✓ 前向传播成功（images/texts格式）")
         print(f"  输入images数量: {len(batch_images)}")
@@ -203,7 +142,7 @@ def test_qwen_groot_forward_images_texts():
 def test_qwen_groot_predict_action():
     """测试QwenGR00T推理模式"""
     print("\n" + "=" * 60)
-    print("测试4: QwenGR00T推理模式（predict_action）")
+    print("测试3: QwenGR00T推理模式（predict_action）")
     print("=" * 60)
     
     try:
@@ -230,26 +169,26 @@ def test_qwen_groot_predict_action():
         )
         model.eval()
         
-        # 创建examples格式的数据
-        examples = [
-            {
-                "image": [Image.new('RGB', (224, 224), color='red')],
-                "lang": "Pick up the red object.",
-                "state": np.random.uniform(-1, 1, size=(1, 7)).astype(np.float32)
-            },
-            {
-                "image": [Image.new('RGB', (224, 224), color='blue')],
-                "lang": "Place the blue object.",
-                "state": np.random.uniform(-1, 1, size=(1, 7)).astype(np.float32)
-            }
-        ]
+        # 统一输入格式
+        images = [Image.new('RGB', (224, 224), color='green') for _ in range(2)]
+        instructions = ["Move forward.", "Turn left."]
+        states = torch.tensor(
+            np.random.uniform(-1, 1, size=(2, 7)).astype(np.float32)  # [B, state_dim]
+        )
+        
+        inputs = {
+            "images": images,
+            "instructions": instructions,
+            "states": states
+        }
         
         # 推理模式
         with torch.no_grad():
-            outputs = model.predict_action(examples=examples)
+            outputs = model.predict_action(inputs=inputs)
         
         print("✓ 推理模式成功")
-        print(f"  输入examples数量: {len(examples)}")
+        print(f"  输入images数量: {len(images)}")
+        print(f"  输入instructions数量: {len(instructions)}")
         
         # 检查输出
         assert "normalized_actions" in outputs, "缺少normalized_actions字段"
@@ -257,8 +196,8 @@ def test_qwen_groot_predict_action():
         print(f"  输出normalized_actions dtype: {outputs['normalized_actions'].dtype}")
         
         # 验证形状
-        assert outputs["normalized_actions"].shape[0] == len(examples), \
-            f"Batch size不匹配: {outputs['normalized_actions'].shape[0]} != {len(examples)}"
+        assert outputs["normalized_actions"].shape[0] == len(images), \
+            f"Batch size不匹配: {outputs['normalized_actions'].shape[0]} != {len(images)}"
         
         return True
     except Exception as e:
@@ -271,7 +210,7 @@ def test_qwen_groot_predict_action():
 def test_qwen_groot_without_state():
     """测试不使用状态的QwenGR00T模型"""
     print("\n" + "=" * 60)
-    print("测试5: QwenGR00T模型（不使用状态）")
+    print("测试4: QwenGR00T模型（不使用状态）")
     print("=" * 60)
     
     try:
@@ -298,17 +237,21 @@ def test_qwen_groot_without_state():
         )
         model.train()
         
-        # 创建examples格式的数据（不包含state）
-        examples = [
-            {
-                "image": [Image.new('RGB', (224, 224), color='red')],
-                "lang": "Pick up the red object.",
-                "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float32)
-            }
-        ]
+        # 统一输入格式（不包含state）
+        images = [Image.new('RGB', (224, 224), color='red')]
+        instructions = ["Pick up the red object."]
+        actions = torch.tensor(
+            np.random.uniform(-1, 1, size=(1, 16, 7)).astype(np.float32)
+        )
+        
+        inputs = {
+            "images": images,
+            "instructions": instructions,
+            "actions": actions
+        }
         
         # 前向传播
-        outputs = model(examples=examples)
+        outputs = model(inputs=inputs)
         
         print("✓ 不使用状态的训练模式成功")
         if "action_loss" in outputs:
@@ -325,7 +268,7 @@ def test_qwen_groot_without_state():
 def test_qwen_groot_repeated_diffusion_steps():
     """测试重复扩散步数"""
     print("\n" + "=" * 60)
-    print("测试6: QwenGR00T重复扩散步数")
+    print("测试5: QwenGR00T重复扩散步数")
     print("=" * 60)
     
     try:
@@ -352,18 +295,26 @@ def test_qwen_groot_repeated_diffusion_steps():
         )
         model.train()
         
-        examples = [
-            {
-                "image": [Image.new('RGB', (224, 224), color='red')],
-                "lang": "Pick up the red object.",
-                "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float32),
-                "state": np.random.uniform(-1, 1, size=(1, 7)).astype(np.float32)
-            }
-        ]
+        # 统一输入格式
+        images = [Image.new('RGB', (224, 224), color='red')]
+        instructions = ["Pick up the red object."]
+        actions = torch.tensor(
+            np.random.uniform(-1, 1, size=(1, 16, 7)).astype(np.float32)
+        )
+        states = torch.tensor(
+            np.random.uniform(-1, 1, size=(1, 7)).astype(np.float32)  # [B, state_dim]
+        )
+        
+        inputs = {
+            "images": images,
+            "instructions": instructions,
+            "actions": actions,
+            "states": states
+        }
         
         # 使用重复扩散步数
         repeated_steps = 2
-        outputs = model(examples=examples, repeated_diffusion_steps=repeated_steps)
+        outputs = model(inputs=inputs, repeated_diffusion_steps=repeated_steps)
         
         print("✓ 重复扩散步数测试成功")
         print(f"  重复步数: {repeated_steps}")
@@ -391,19 +342,16 @@ def run_all_tests():
     results.append(("初始化", model is not None))
     
     if model is not None:
-        # 测试2: examples格式前向传播
-        results.append(("前向传播（examples格式）", test_qwen_groot_forward_examples()))
+        # 测试2: 统一输入格式前向传播
+        results.append(("前向传播（统一输入格式）", test_qwen_groot_forward_images_texts()))
         
-        # 测试3: images/texts格式前向传播
-        results.append(("前向传播（images/texts格式）", test_qwen_groot_forward_images_texts()))
-        
-        # 测试4: 推理模式
+        # 测试3: 推理模式
         results.append(("推理模式", test_qwen_groot_predict_action()))
         
-        # 测试5: 不使用状态
+        # 测试4: 不使用状态
         results.append(("不使用状态", test_qwen_groot_without_state()))
         
-        # 测试6: 重复扩散步数
+        # 测试5: 重复扩散步数
         results.append(("重复扩散步数", test_qwen_groot_repeated_diffusion_steps()))
     
     # 打印总结

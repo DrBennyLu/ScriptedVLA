@@ -9,14 +9,19 @@ model:
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
   
-  # 动作头配置（DiT）
+  # 动作头配置（Flow Matching）
   action_head:
-    type: "dit"  # Diffusion Transformer
+    type: "flow_matching"  # Flow Matching动作头
     hidden_dim: 1536  # 与VLM输出维度匹配
     num_layers: 6
     num_heads: 12
     mlp_ratio: 4.0
     action_dim: 7  # 动作维度（例如：x, y, z, roll, pitch, yaw, gripper）
+    # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
+    # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
+    # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
+    action_horizon: 11  # 默认值，可以根据需要调整
+    num_inference_timesteps: 50  # Flow Matching推理步数
     patch_size: 16
     num_patches: 196  # 14x14 patches for 224x224 image
     
@@ -24,6 +29,10 @@ model:
   vla:
     use_cross_attention: true
     cross_attention_layers: 3
+    # future_action_window_size: 未来动作窗口大小
+    # 注意：action_horizon = future_action_window_size + 1
+    # 如果action_horizon=11，则future_action_window_size=10
+    future_action_window_size: 10  # 默认值，应该等于action_horizon - 1
 
 # 训练配置
 training:
@@ -59,7 +68,8 @@ training:
 
 # 数据配置
 data:
-  # 数据集类型: "custom", "libero", "act"
+  # 数据集类型: "custom", "libero", "act", "lerobot"
+  # "lerobot": 兼容HuggingFace上的开源LeRobot数据集（如lerobot/pusht等）
   dataset_type: "custom"
   
   # 自定义数据集路径（当dataset_type="custom"时使用）
@@ -97,6 +107,16 @@ data:
     dataset_path: "./data/act"
     chunk_size: 1  # 动作块大小
   
+  # LeRobot数据集配置（当dataset_type="lerobot"时使用）
+  # 兼容HuggingFace上的开源机器人学习数据集
+  lerobot:
+    dataset_path: "lerobot/pusht"  # 可以是HF数据集名称（如"lerobot/pusht"）或本地路径
+    camera_names: ["wrist"]  # LeRobot数据集中的相机名称
+    use_state: true
+    state_dim: null  # null表示从数据中自动推断
+    action_horizon: null  # null表示从模型配置中获取
+    pad_action_chunk: true
+  
   # 通用数据加载配置
   num_workers: 4
   pin_memory: true
@@ -116,4 +136,88 @@ logging:
   wandb_project: "vla-training"
   use_tensorboard: true
   log_dir: "./logs"
+
+# 测试配置（用于test_training.py）
+test:
+  # 测试数据集配置
+  dataset:
+    # 每个数据集创建的episode数量
+    num_episodes: 15
+    # 每个episode的步数
+    steps_per_episode: 50
+    # 任务数量
+    num_tasks: 1
+    # 验证集episode数量（如果为null，则使用num_episodes // 2）
+    val_episodes: null
+  
+  # 测试模型配置（可以使用较小的配置以加快测试）
+  model:
+    # VLM配置
+    vlm:
+      model_name: "Qwen/Qwen2-VL-2B-Instruct"
+      cache_dir: "./cache/models"
+      image_size: 224
+    
+    # 动作头配置（测试时使用较小的配置）
+    action_head:
+      hidden_dim: 768
+      num_layers: 2  # 测试时使用较少的层数
+      num_heads: 8
+      action_dim: 7
+      action_horizon: 4
+      num_inference_timesteps: 5
+    
+    # VLA模型配置
+    vla:
+      use_state: true
+      state_dim: 7
+      future_action_window_size: 3
+  
+  # 测试训练配置
+  training:
+    # 训练轮数
+    num_epochs: 2
+    # 批次大小
+    batch_size: 2
+    # 学习率
+    learning_rate: 1e-4
+    # 权重衰减
+    weight_decay: 0.01
+    # 优化器配置
+    optimizer:
+      type: "adamw"
+      betas: [0.9, 0.999]
+      eps: 1e-8
+    # 学习率调度器配置
+    scheduler:
+      type: "cosine"
+      warmup_ratio: 0.1
+      min_lr_ratio: 0.01
+    # 梯度累积步数
+    gradient_accumulation_steps: 1
+    # 最大梯度范数
+    max_grad_norm: 1.0
+    # 日志记录步数
+    logging_steps: 10
+  
+  # 测试数据加载器配置
+  dataloader:
+    # 数据加载器工作进程数（测试时使用0避免问题）
+    num_workers: 0
+    # 是否使用pin_memory
+    pin_memory: false
+    # 是否打乱数据
+    shuffle: true
+  
+  # 数据集配置（用于VLADataset）
+  dataset:
+    # action_horizon（动作序列长度）：从配置中的model.action_head.action_horizon获取
+    # 如果未指定，则从test.model.action_head.action_horizon获取
+    # 如果仍未指定，则使用默认值4
+    action_horizon: null  # null表示从模型配置中获取
+    # 如果episode末尾不够action_horizon，是否使用最后一个动作填充
+    pad_action_chunk: true
+  
+  # 临时目录配置（如果为null，则自动创建临时目录）
+  temp_dir: ./test_temp
 

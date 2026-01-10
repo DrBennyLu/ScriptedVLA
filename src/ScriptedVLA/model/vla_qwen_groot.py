@@ -94,55 +94,86 @@ class QwenGR00TVLAModel(nn.Module):
             cross_attention_dim=vlm_hidden_size if action_head_hidden_dim != vlm_hidden_size else None
         )
     
+    def _normalize_states(self, states: Union[torch.Tensor, np.ndarray, List]) -> torch.Tensor:
+        """
+        统一处理states维度，确保为[B, state_dim]或[B, 1, state_dim]
+        
+        Args:
+            states: 机器人状态，可以是：
+                - torch.Tensor: [B, state_dim] 或 [B, 1, state_dim]
+                - np.ndarray: 同上
+                - List: 会被转换为tensor
+        
+        Returns:
+            torch.Tensor: [B, state_dim] 或 [B, 1, state_dim]
+        """
+        # 转换为tensor
+        if not isinstance(states, torch.Tensor):
+            states = torch.tensor(np.array(states), dtype=torch.float32)
+        
+        # 获取设备
+        device = next(self.qwen_vl_interface.model.parameters()).device
+        states = states.to(device)
+        
+        # 处理维度：确保为[B, state_dim]或[B, 1, state_dim]
+        if states.dim() == 1:
+            # [state_dim] -> [1, state_dim]
+            states = states.unsqueeze(0)
+        elif states.dim() == 3:
+            # [B, 1, state_dim] 或 [B, T, state_dim]
+            if states.shape[1] == 1:
+                # [B, 1, state_dim] -> 保持原样
+                pass
+            else:
+                # [B, T, state_dim] -> 取第一个时间步 [B, 1, state_dim]
+                states = states[:, 0:1, :]
+        elif states.dim() == 4:
+            # [B, 1, 1, state_dim] -> [B, 1, state_dim]
+            states = states.squeeze(2) if states.shape[2] == 1 else states.squeeze(1)
+        elif states.dim() != 2:
+            raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+        
+        return states
+    
     def forward(
         self,
-        examples: Optional[List[Dict]] = None,
-        images: Optional[Union[torch.Tensor, Dict[str, torch.Tensor], List]] = None,
-        texts: Optional[List[str]] = None,
-        actions: Optional[torch.Tensor] = None,
-        states: Optional[torch.Tensor] = None,
+        inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
-        前向传播（参考Qwen-GR00T架构）
+        前向传播（统一输入格式）
         
         Args:
-            examples: 示例列表（Qwen-GR00T格式），包含image、lang、action、state等字段
-            images: 图像（可选，如果examples提供则不需要）
-            texts: 文本指令列表（可选）
-            actions: 目标动作序列（可选）
-            states: 机器人状态（可选）
+            inputs: 统一输入字典，包含以下字段：
+                - images: 图像，可以是：
+                    - List[PIL.Image] 或 List[List[PIL.Image]]（多相机）
+                    - torch.Tensor [B, C, H, W]（单相机）
+                    - Dict[str, torch.Tensor] {camera_name: [B, C, H, W]}（多相机）
+                - instructions: List[str]，文本指令列表
+                - states: Optional[torch.Tensor]，机器人状态 [B, state_dim] 或 [B, 1, state_dim]
+                - actions: Optional[torch.Tensor]，目标动作序列 [B, action_horizon, action_dim]（训练时需要）
             
         Returns:
-            {"action_loss": loss_value} 如果训练模式
+            {"action_loss": loss_value} 如果训练模式（actions提供）
+            {"actions": predicted_actions} 如果推理模式（actions为None）
         """
-        # 处理examples格式（Qwen-GR00T架构）
-        if examples is not None:
-            batch_images = [example.get("image", []) for example in examples]  # [B, [PIL]]
-            instructions = [example.get("lang", "") for example in examples]  # [B, str]
-            
-            if "action" in examples[0]:
-                actions_list = [example["action"] for example in examples]  # [B, len, 7]
-                # 转换为tensor
-                actions = torch.tensor(
-                    np.array(actions_list),
-                    device=next(self.qwen_vl_interface.model.parameters()).device,
-                    dtype=torch.float32
-                )
-            
-            if "state" in examples[0] and self.use_state:
-                states_list = [example["state"] for example in examples]  # [B, 1, state_dim]
-                states = torch.tensor(
-                    np.array(states_list),
-                    device=next(self.qwen_vl_interface.model.parameters()).device,
-                    dtype=torch.float32
-                )
-        else:
-            # 使用传统格式
-            if images is None or texts is None:
-                raise ValueError("Either examples or (images, texts) must be provided")
-            batch_images = images
-            instructions = texts
+        # 提取输入字段
+        images = inputs.get("images")
+        instructions = inputs.get("instructions")
+        states = inputs.get("states")
+        actions = inputs.get("actions")
+        
+        # 验证必需字段
+        if images is None:
+            raise ValueError("inputs['images'] is required")
+        if instructions is None:
+            raise ValueError("inputs['instructions'] is required")
+        
+        batch_images = images
+        
+        # 统一处理states维度：确保为[B, state_dim]或[B, 1, state_dim]
+        if states is not None and self.use_state:
+            states = self._normalize_states(states)
         
         # Step 1: QwenVL输入格式（包含状态信息）
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
@@ -210,42 +241,41 @@ class QwenGR00TVLAModel(nn.Module):
     @torch.inference_mode()
     def predict_action(
         self,
-        examples: Optional[List[Dict]] = None,
-        images: Optional[Union[torch.Tensor, Dict[str, torch.Tensor], List]] = None,
-        texts: Optional[List[str]] = None,
-        states: Optional[torch.Tensor] = None,
+        inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],
         **kwargs
     ) -> Dict[str, np.ndarray]:
         """
-        预测动作（推理模式，参考Qwen-GR00T架构）
+        预测动作（推理模式，统一输入格式）
         
         Args:
-            examples: 示例列表（Qwen-GR00T格式）
-            images: 图像（可选）
-            texts: 文本指令列表（可选）
-            states: 机器人状态（可选）
+            inputs: 统一输入字典，包含以下字段：
+                - images: 图像，可以是：
+                    - List[PIL.Image] 或 List[List[PIL.Image]]（多相机）
+                    - torch.Tensor [B, C, H, W]（单相机）
+                    - Dict[str, torch.Tensor] {camera_name: [B, C, H, W]}（多相机）
+                - instructions: List[str]，文本指令列表
+                - states: Optional[torch.Tensor]，机器人状态 [B, state_dim] 或 [B, 1, state_dim]
             
         Returns:
             dict:
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
         """
-        if examples is not None:
-            if not isinstance(examples, list):
-                examples = [examples]
-            batch_images = [example.get("image", []) for example in examples]  # [B, [PIL]]
-            instructions = [example.get("lang", "") for example in examples]  # [B, str]
-            
-            if "state" in examples[0] and self.use_state:
-                states_list = [example["state"] for example in examples]  # [B, 1, state_dim]
-                states = torch.from_numpy(np.array(states_list)).to(
-                    next(self.qwen_vl_interface.model.parameters()).device,
-                    dtype=torch.float32
-                )
-        else:
-            if images is None or texts is None:
-                raise ValueError("Either examples or (images, texts) must be provided")
-            batch_images = images
-            instructions = texts
+        # 提取输入字段
+        images = inputs.get("images")
+        instructions = inputs.get("instructions")
+        states = inputs.get("states")
+        
+        # 验证必需字段
+        if images is None:
+            raise ValueError("inputs['images'] is required")
+        if instructions is None:
+            raise ValueError("inputs['instructions'] is required")
+        
+        batch_images = images
+        
+        # 统一处理states维度：确保为[B, state_dim]或[B, 1, state_dim]
+        if states is not None and self.use_state:
+            states = self._normalize_states(states)
         
         # Step 1: QwenVL输入格式（包含状态信息）
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(

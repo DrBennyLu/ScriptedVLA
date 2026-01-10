@@ -23,8 +23,8 @@ def test_action_head_initialization():
     
     try:
         action_head = FlowMatchingActionHead(
-            hidden_dim=768,
-            num_layers=2,  # 使用较少的层数以加快测试
+            hidden_dim=1536,
+            num_layers=6,  # 使用较少的层数以加快测试
             num_heads=8,
             action_dim=7,
             action_horizon=4,
@@ -278,10 +278,80 @@ def test_action_head_cross_attention():
         return False
 
 
+def test_states_dimension_normalization():
+    """测试states维度规范化"""
+    print("\n" + "=" * 60)
+    print("测试7: States维度规范化")
+    print("=" * 60)
+    
+    try:
+        action_head = FlowMatchingActionHead(
+            hidden_dim=768,
+            num_layers=2,
+            num_heads=8,
+            action_dim=7,
+            action_horizon=4,
+            state_dim=7,
+            num_inference_timesteps=5
+        )
+        action_head.train()
+        
+        batch_size = 2
+        seq_len = 10
+        vlm_features = torch.randn(batch_size, seq_len, 768)
+        actions = torch.randn(batch_size, 4, 7)
+        
+        # 测试1: [B, state_dim] 格式（标准格式）
+        print("\n  测试1: states为[B, state_dim]格式")
+        states_2d = torch.randn(batch_size, 7)
+        print(f"    输入states shape: {states_2d.shape}")
+        loss_2d = action_head(vlm_features, actions=actions, states=states_2d)
+        print(f"    ✓ [B, state_dim]格式测试成功，loss: {loss_2d.item():.4f}")
+        
+        # 测试2: [B, 1, state_dim] 格式
+        print("\n  测试2: states为[B, 1, state_dim]格式")
+        states_3d = torch.randn(batch_size, 1, 7)
+        print(f"    输入states shape: {states_3d.shape}")
+        loss_3d = action_head(vlm_features, actions=actions, states=states_3d)
+        print(f"    ✓ [B, 1, state_dim]格式测试成功，loss: {loss_3d.item():.4f}")
+        
+        # 测试3: [B, T, state_dim] 格式（多时间步，应该取第一个）
+        print("\n  测试3: states为[B, T, state_dim]格式（多时间步）")
+        states_multi = torch.randn(batch_size, 5, 7)
+        print(f"    输入states shape: {states_multi.shape}")
+        loss_multi = action_head(vlm_features, actions=actions, states=states_multi)
+        print(f"    ✓ [B, T, state_dim]格式测试成功，loss: {loss_multi.item():.4f}")
+        
+        # 测试4: 推理模式，测试不同维度
+        print("\n  测试4: 推理模式，测试不同states维度")
+        action_head.eval()
+        with torch.no_grad():
+            # [B, state_dim]
+            pred_2d = action_head.predict_action(vlm_features, states=states_2d)
+            print(f"    ✓ [B, state_dim]推理成功，输出shape: {pred_2d.shape}")
+            
+            # [B, 1, state_dim]
+            pred_3d = action_head.predict_action(vlm_features, states=states_3d)
+            print(f"    ✓ [B, 1, state_dim]推理成功，输出shape: {pred_3d.shape}")
+            
+            # 验证输出形状一致
+            assert pred_2d.shape == pred_3d.shape, \
+                f"不同states维度格式的输出形状应该一致: {pred_2d.shape} != {pred_3d.shape}"
+        
+        print("\n✓ States维度规范化测试成功")
+        return True
+        
+    except Exception as e:
+        print(f"✗ States维度规范化测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_vlm_features_dimension_alignment():
     """测试VLM features和DiT query维度对齐"""
     print("\n" + "=" * 60)
-    print("测试7: VLM features与DiT query维度对齐")
+    print("测试8: VLM features与DiT query维度对齐")
     print("=" * 60)
     
     try:
@@ -451,7 +521,10 @@ def run_all_tests():
         # 测试6: 交叉注意力
         results.append(("交叉注意力", test_action_head_cross_attention()))
         
-        # 测试7: VLM features维度对齐
+        # 测试7: States维度规范化
+        results.append(("States维度规范化", test_states_dimension_normalization()))
+        
+        # 测试8: VLM features维度对齐
         results.append(("VLM features维度对齐", test_vlm_features_dimension_alignment()))
     
     # 打印总结

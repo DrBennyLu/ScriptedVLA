@@ -36,11 +36,20 @@ def create_optimizer(model, config):
     opt_config = config.get("optimizer", {})
     opt_type = opt_config.get("type", "adamw")
     
+    # 确保学习率和权重衰减是数值类型
+    learning_rate = config.get("learning_rate", 1e-4)
+    if isinstance(learning_rate, str):
+        learning_rate = float(learning_rate)
+    
+    weight_decay = config.get("weight_decay", 0.01)
+    if isinstance(weight_decay, str):
+        weight_decay = float(weight_decay)
+    
     if opt_type.lower() == "adamw":
         return AdamW(
             model.parameters(),
-            lr=config.get("learning_rate", 1e-4),
-            weight_decay=config.get("weight_decay", 0.01),
+            lr=learning_rate,
+            weight_decay=weight_decay,
             betas=opt_config.get("betas", [0.9, 0.999]),
             eps=opt_config.get("eps", 1e-8)
         )
@@ -52,8 +61,19 @@ def create_scheduler(optimizer, config, num_training_steps):
     """创建学习率调度器"""
     sched_config = config.get("scheduler", {})
     sched_type = sched_config.get("type", "cosine")
+    
+    # 确保数值类型正确
     warmup_ratio = sched_config.get("warmup_ratio", 0.1)
+    if isinstance(warmup_ratio, str):
+        warmup_ratio = float(warmup_ratio)
+    
     min_lr_ratio = sched_config.get("min_lr_ratio", 0.01)
+    if isinstance(min_lr_ratio, str):
+        min_lr_ratio = float(min_lr_ratio)
+    
+    learning_rate = config.get("learning_rate", 1e-4)
+    if isinstance(learning_rate, str):
+        learning_rate = float(learning_rate)
     
     warmup_steps = int(num_training_steps * warmup_ratio)
     
@@ -68,7 +88,7 @@ def create_scheduler(optimizer, config, num_training_steps):
         cosine_scheduler = CosineAnnealingLR(
             optimizer,
             T_max=num_training_steps - warmup_steps,
-            eta_min=config.get("learning_rate", 1e-4) * min_lr_ratio
+            eta_min=learning_rate * min_lr_ratio
         )
         return SequentialLR(
             optimizer,
@@ -119,19 +139,43 @@ def train_epoch(
             raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
         
         texts = batch["text"]
-        actions = batch["action"].to(device)
+        actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim]（HDF5格式）或 [B, action_dim]（JSON格式）
+        
+        # 处理actions维度：检查是否是action chunk
+        # 如果数据源是JSON格式，可能返回单个动作 [B, action_dim]，需要扩展
+        if actions.dim() == 2:
+            # JSON格式：只有单个动作，需要扩展为action chunk
+            # 注意：这不如真正的action chunk准确，建议使用HDF5格式
+            # 从模型配置获取action_horizon（需要从model中获取）
+            if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
+                action_horizon = model.action_head.action_horizon
+            else:
+                # 如果无法从模型获取，使用默认值
+                action_horizon = 4
+            # [B, action_dim] -> [B, action_horizon, action_dim]
+            actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
+        elif actions.dim() == 3:
+            # HDF5格式：已经是action chunk [B, action_horizon, action_dim]
+            pass
+        else:
+            raise ValueError(f"Unexpected action shape: {actions.shape}, expected [B, action_dim] or [B, action_horizon, action_dim]")
         
         # 处理状态信息（如果存在）
         states = None
         if "state" in batch:
             states = batch["state"].to(device)
         
-        # 前向传播
-        outputs = model(images, texts, states)
-        pred_actions = outputs["actions"]
+        # 前向传播（训练模式，提供actions以计算损失）
+        outputs = model(images, texts, states, actions=actions)
         
-        # 计算损失
-        loss = criterion(pred_actions, actions)
+        # 获取损失（VLAModel在训练模式下直接返回loss）
+        if "loss" in outputs:
+            loss = outputs["loss"]
+        elif "action_loss" in outputs:
+            loss = outputs["action_loss"]
+        else:
+            # 如果没有损失，说明是推理模式，不应该发生
+            raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
         
         # 梯度累积
         loss = loss / config.get("gradient_accumulation_steps", 1)
@@ -200,17 +244,40 @@ def evaluate(model, dataloader, criterion, device, logger):
                 raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
             
             texts = batch["text"]
-            actions = batch["action"].to(device)
+            actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim]（HDF5格式）或 [B, action_dim]（JSON格式）
+            
+            # 处理actions维度：检查是否是action chunk
+            if actions.dim() == 2:
+                # JSON格式：只有单个动作，需要扩展为action chunk
+                if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
+                    action_horizon = model.action_head.action_horizon
+                else:
+                    action_horizon = 4
+                actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
+            elif actions.dim() == 3:
+                # HDF5格式：已经是action chunk
+                pass
+            else:
+                raise ValueError(f"Unexpected action shape: {actions.shape}")
             
             # 处理状态信息（如果存在）
             states = None
             if "state" in batch:
                 states = batch["state"].to(device)
             
-            outputs = model(images, texts, states)
-            pred_actions = outputs["actions"]
+            # 前向传播（评估模式，但提供actions以计算损失）
+            # 注意：模型需要处于训练模式才能计算损失（VLAModel的forward方法只在self.training=True时计算损失）
+            # 使用torch.no_grad()禁用梯度，这样既不会更新参数，又能计算损失
+            model.train()  # 设置为训练模式以计算损失
+            outputs = model(images, texts, states, actions=actions)
             
-            loss = criterion(pred_actions, actions)
+            # 获取损失（VLAModel在训练模式下直接返回loss）
+            if "loss" in outputs:
+                loss = outputs["loss"]
+            elif "action_loss" in outputs:
+                loss = outputs["action_loss"]
+            else:
+                raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
             total_loss += loss.item()
             num_batches += 1
             
@@ -327,6 +394,10 @@ def main():
     logger.info(f"Using dataset type: {dataset_type}")
     logger.info(f"Cameras: {camera_names}, Use state: {use_state}, State dim: {state_dim}")
     
+    # 从模型配置获取action_horizon（用于数据集初始化）
+    action_head_config = model_config.get("action_head", {})
+    action_horizon = action_head_config.get("action_horizon", 4)
+    
     if dataset_type == "libero":
         # LIBERO数据集
         libero_config = data_config.get("libero", {})
@@ -356,6 +427,32 @@ def main():
         train_dataset, val_dataset = torch.utils.data.random_split(
             train_dataset, [train_size, val_size]
         )
+    elif dataset_type == "lerobot":
+        # LeRobot数据集（兼容HF开源数据集）
+        if not HAS_LEROBOT:
+            raise ImportError(
+                "LeRobot library not installed. "
+                "Install with: pip install lerobot datasets"
+            )
+        
+        lerobot_config = data_config.get("lerobot", {})
+        lerobot_action_horizon = lerobot_config.get("action_horizon") or action_horizon
+        
+        train_dataset = LeRobotDatasetAdapter(
+            dataset_path=lerobot_config.get("dataset_path", "lerobot/pusht"),
+            image_size=image_size,
+            camera_names=lerobot_config.get("camera_names", camera_names),
+            use_state=lerobot_config.get("use_state", use_state),
+            state_dim=lerobot_config.get("state_dim", state_dim),
+            action_horizon=lerobot_action_horizon,
+            pad_action_chunk=lerobot_config.get("pad_action_chunk", True)
+        )
+        # LeRobot数据集也按比例分割
+        val_size = int(len(train_dataset) * 0.1)
+        train_size = len(train_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
     else:
         # 自定义数据集
         train_dataset = VLADataset(
@@ -363,14 +460,18 @@ def main():
             image_size=image_size,
             camera_names=camera_names,
             use_state=use_state,
-            state_dim=state_dim
+            state_dim=state_dim,
+            action_horizon=action_horizon,
+            pad_action_chunk=True  # 如果episode末尾不够action_horizon，使用最后一个动作填充
         )
         val_dataset = VLADataset(
             data_path=data_config.get("val_data_path", "./dataset/val"),
             image_size=image_size,
             camera_names=camera_names,
             use_state=use_state,
-            state_dim=state_dim
+            state_dim=state_dim,
+            action_horizon=action_horizon,
+            pad_action_chunk=True
         )
     
     train_loader = DataLoader(

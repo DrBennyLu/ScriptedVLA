@@ -352,6 +352,40 @@ class FlowMatchingActionHead(nn.Module):
                 nn.init.constant_(module.bias, 0)
                 nn.init.constant_(module.weight, 1.0)
     
+    def _normalize_states(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        统一处理states维度，确保为[B, state_dim]
+        
+        Args:
+            states: 机器人状态，可以是：
+                - [B, state_dim]: 标准格式
+                - [B, 1, state_dim]: 带时间步维度
+                - [state_dim]: 单样本，会自动扩展为[1, state_dim]
+                - [B, T, state_dim]: 多时间步，会取第一个时间步
+        
+        Returns:
+            torch.Tensor: [B, state_dim]
+        """
+        if states.dim() == 1:
+            # [state_dim] -> [1, state_dim]
+            states = states.unsqueeze(0)
+        elif states.dim() == 3:
+            # [B, 1, state_dim] 或 [B, T, state_dim]
+            if states.shape[1] == 1:
+                states = states.squeeze(1)  # [B, 1, state_dim] -> [B, state_dim]
+            else:
+                # [B, T, state_dim] -> 取第一个时间步 [B, state_dim]
+                states = states[:, 0, :]
+        elif states.dim() == 4:
+            # [B, 1, 1, state_dim] -> 压缩多余维度
+            states = states.squeeze(2) if states.shape[2] == 1 else states.squeeze(1)
+            if states.dim() == 3:
+                states = states.squeeze(1) if states.shape[1] == 1 else states[:, 0, :]
+        elif states.dim() != 2:
+            raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+        
+        return states
+    
     def sample_time(self, batch_size, device, dtype):
         """采样时间步"""
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -417,19 +451,8 @@ class FlowMatchingActionHead(nn.Module):
             
             # 编码状态（如果使用）
             if self.state_encoder is not None and states is not None:
-                # 处理states维度：可能是[B, state_dim]或[B, 1, state_dim]或[B, T, state_dim]
-                if states.dim() == 3:
-                    # [B, 1, state_dim] 或 [B, T, state_dim] -> 取第一个时间步或压缩
-                    if states.shape[1] == 1:
-                        states = states.squeeze(1)  # [B, 1, state_dim] -> [B, state_dim]
-                    else:
-                        # 如果有多个时间步，取第一个
-                        states = states[:, 0, :]  # [B, T, state_dim] -> [B, state_dim]
-                elif states.dim() == 2:
-                    # [B, state_dim] 已经是正确格式
-                    pass
-                else:
-                    raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+                # 统一处理states维度：确保为[B, state_dim]
+                states = self._normalize_states(states)
                 
                 state_features = self.state_encoder(states)  # [B, hidden_dim]
                 state_features = state_features.unsqueeze(1)  # [B, 1, hidden_dim]
@@ -459,22 +482,12 @@ class FlowMatchingActionHead(nn.Module):
             # - 推理：使用训练好的嵌入权重，从VLM特征中提取相关信息
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_target_vision_tokens, hidden_dim]
             
+            # 拼接状态、future tokens和动作特征
+            # 注意：state_features 已经在458行通过 unsqueeze(1) 处理为 [B, 1, hidden_dim] 格式
+            # 这里不需要再次规范化，只需要防御性断言确保维度正确
             if state_features is not None:
-                # 确保state_features是3维的：[B, 1, hidden_dim]
-                if state_features.dim() == 4:
-                    # 如果是4维，可能是[B, 1, 1, hidden_dim]，压缩掉多余的维度
-                    state_features = state_features.squeeze(2) if state_features.shape[2] == 1 else state_features.squeeze(1)
-                elif state_features.dim() == 2:
-                    # 如果是2维[B, hidden_dim]，添加序列维度
-                    state_features = state_features.unsqueeze(1)
-                elif state_features.dim() != 3:
-                    raise ValueError(f"state_features should be 2D or 3D, got shape {state_features.shape}")
-                
-                # 确保所有张量都是3维的：[B, seq_len, hidden_dim]
                 assert state_features.dim() == 3, f"state_features should be 3D [B, 1, hidden_dim], got {state_features.shape}"
-                assert future_tokens.dim() == 3, f"future_tokens should be 3D, got {future_tokens.shape}"
-                assert action_features.dim() == 3, f"action_features should be 3D, got {action_features.shape}"
-                
+                assert state_features.shape[1] == 1, f"state_features should have seq_len=1, got {state_features.shape[1]}"
                 sa_embs = torch.cat([state_features, future_tokens, action_features], dim=1)  # [B, 1+num_tokens+action_horizon, hidden_dim]
             else:
                 sa_embs = torch.cat([future_tokens, action_features], dim=1)  # [B, num_tokens+action_horizon, hidden_dim]
@@ -552,19 +565,8 @@ class FlowMatchingActionHead(nn.Module):
         
         # 编码状态（如果使用）
         if self.state_encoder is not None and states is not None:
-            # 处理states维度：可能是[B, state_dim]或[B, 1, state_dim]或[B, T, state_dim]
-            if states.dim() == 3:
-                # [B, 1, state_dim] 或 [B, T, state_dim] -> 取第一个时间步或压缩
-                if states.shape[1] == 1:
-                    states = states.squeeze(1)  # [B, 1, state_dim] -> [B, state_dim]
-                else:
-                    # 如果有多个时间步，取第一个
-                    states = states[:, 0, :]  # [B, T, state_dim] -> [B, state_dim]
-            elif states.dim() == 2:
-                # [B, state_dim] 已经是正确格式
-                pass
-            else:
-                raise ValueError(f"Unexpected states shape: {states.shape}, expected [B, state_dim] or [B, 1, state_dim]")
+            # 统一处理states维度：确保为[B, state_dim]
+            states = self._normalize_states(states)
             
             state_features = self.state_encoder(states)  # [B, hidden_dim]
             state_features = state_features.unsqueeze(1)  # [B, 1, hidden_dim]
@@ -613,22 +615,12 @@ class FlowMatchingActionHead(nn.Module):
             # - 推理：使用训练好的嵌入权重，从VLM特征中提取相关信息
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_target_vision_tokens, hidden_dim]
             
+            # 拼接状态、future tokens和动作特征
+            # 注意：state_features 已经在572行通过 unsqueeze(1) 处理为 [B, 1, hidden_dim] 格式
+            # 这里不需要再次规范化，只需要防御性断言确保维度正确
             if state_features is not None:
-                # 确保state_features是3维的：[B, 1, hidden_dim]
-                if state_features.dim() == 4:
-                    # 如果是4维，可能是[B, 1, 1, hidden_dim]，压缩掉多余的维度
-                    state_features = state_features.squeeze(2) if state_features.shape[2] == 1 else state_features.squeeze(1)
-                elif state_features.dim() == 2:
-                    # 如果是2维[B, hidden_dim]，添加序列维度
-                    state_features = state_features.unsqueeze(1)
-                elif state_features.dim() != 3:
-                    raise ValueError(f"state_features should be 2D or 3D, got shape {state_features.shape}")
-                
-                # 确保所有张量都是3维的：[B, seq_len, hidden_dim]
                 assert state_features.dim() == 3, f"state_features should be 3D [B, 1, hidden_dim], got {state_features.shape}"
-                assert future_tokens.dim() == 3, f"future_tokens should be 3D, got {future_tokens.shape}"
-                assert action_features.dim() == 3, f"action_features should be 3D, got {action_features.shape}"
-                
+                assert state_features.shape[1] == 1, f"state_features should have seq_len=1, got {state_features.shape[1]}"
                 sa_embs = torch.cat([state_features, future_tokens, action_features], dim=1)  # [B, 1+num_tokens+action_horizon, hidden_dim]
             else:
                 sa_embs = torch.cat([future_tokens, action_features], dim=1)  # [B, num_tokens+action_horizon, hidden_dim]
@@ -656,6 +648,3 @@ class FlowMatchingActionHead(nn.Module):
         
         return actions
 
-
-# 向后兼容：保留DiTActionHead作为FlowMatchingActionHead的别名
-DiTActionHead = FlowMatchingActionHead

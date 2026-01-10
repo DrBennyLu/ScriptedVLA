@@ -8,7 +8,7 @@ import torch.nn as nn
 from typing import Optional, Dict, Tuple, Union
 
 from .vlm import QwenVLM
-from .action_head import FlowMatchingActionHead, DiTActionHead
+from .action_head import FlowMatchingActionHead
 
 
 class VLAModel(nn.Module):
