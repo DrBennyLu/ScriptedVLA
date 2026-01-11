@@ -1,6 +1,6 @@
-# ScriptedVLA - 基于Qwen VLM和DiT的视觉-语言-动作模型
+# ScriptedVLA - 基于Qwen VLM和Flow Matching的视觉-语言-动作模型
 
-一个清晰易懂的VLA（Vision-Language-Action）训练和推理项目，基于Qwen开源小VLM模型和Transformer的DiT（Diffusion Transformer）动作头。不玩套路，不做过度封装，不做过度模块化设计，旨在提供一个清晰、易于理解的VLA模型实现。Script is all you need.  --- author: @Benny Lu (hitlxg@gmail.com)
+一个清晰易懂的VLA（Vision-Language-Action）训练和推理项目，基于Qwen开源小VLM模型和Flow Matching动作头。不玩套路，不做过度封装，不做过度模块化设计，旨在提供一个清晰、易于理解的VLA模型实现。Script is all you need.  --- author: @Benny Lu (hitlxg@gmail.com)
 
 
 ## 项目特点
@@ -10,6 +10,9 @@
 - 🚀 **完整流程**：包含数据加载、模型训练、推理等完整功能
 - 📦 **现代化工具**：使用uv进行虚拟环境管理
 - 🧩 **模块化设计**：各组件独立，易于扩展和修改
+- 🤖 **LeRobot支持**：原生支持LeRobot数据集格式（v2.1和v3.0），兼容HuggingFace开源数据集
+- 🔄 **统一接口**：统一的字典格式输入，自动处理状态维度，简化使用流程
+- 🧪 **完整测试**：包含完整的测试套件，确保代码质量
 
 ## 项目结构
 
@@ -17,16 +20,29 @@
 ScriptedVLA/
 ├── config.yaml                  # 配置文件
 ├── pyproject.toml               # 项目依赖配置（uv）
-├── train.py                     # 训练脚本（自定义数据）
+├── train.py                     # 训练脚本（支持LeRobot、自定义数据等）
 ├── train_public_datasets.py     # 训练脚本（公开数据集）
 ├── inference.py                 # 推理脚本
 ├── create_dummy_data.py         # 创建测试数据
-├── dataset_statistics.py       # 数据集统计和筛选工具
+├── dataset_statistics.py        # 数据集统计和筛选工具
 ├── download_model.py            # 模型下载脚本
-├── evaluate_vlm_capabilities.py # VLM能力测评脚本
+├── analyze_state_dimensions.py  # 状态维度分析工具
 ├── README.md                    # 项目说明
 ├── QUICKSTART.md                # 快速开始指南
 ├── EXAMPLES.md                  # 使用示例
+├── CHANGELOG.md                 # 更新日志
+├── LEROBOT_VERSION_SOLUTION.md  # LeRobot版本解决方案
+├── UNIFIED_INPUT_FORMAT.md      # 统一输入格式说明
+├── STATE_DIMENSION_ANALYSIS.md  # 状态维度分析文档
+├── VLM_EVALUATION.md            # VLM能力测评指南
+├── test/                        # 测试目录
+│   ├── test_vla_qwen_groot.py   # VLA模型测试
+│   ├── test_vlm.py              # VLM模型测试
+│   ├── test_action_head.py      # 动作头测试
+│   ├── test_lerobot_training.py # LeRobot训练测试
+│   ├── test_lerobot_dataset_loader.py # LeRobot数据加载测试
+│   ├── test_training.py         # 训练流程测试
+│   └── evaluate_vlm_capabilities.py # VLM能力测评脚本
 └── src/
     └── ScriptedVLA/            # Python包（符合uv标准结构）
         ├── __init__.py
@@ -40,7 +56,8 @@ ScriptedVLA/
         │   ├── dataset.py      # 自定义数据集类
         │   ├── download_datasets.py # 数据集下载工具
         │   ├── libero_dataset.py   # LIBERO数据集适配器
-        │   └── act_dataset.py      # ACT数据集适配器
+        │   ├── act_dataset.py      # ACT数据集适配器
+        │   └── lerobot_dataset_adapter.py # LeRobot数据集适配器
         └── utils/               # 工具函数
             ├── __init__.py
             ├── config.py       # 配置加载
@@ -170,6 +187,18 @@ training:
 
 ### 4. 训练模型
 
+**使用LeRobot数据集训练（推荐，默认方式）：**
+```bash
+# 使用LeRobot数据集训练（默认使用./dataset/libero_object）
+python train.py --config config.yaml
+
+# 指定LeRobot数据集路径
+python train.py --config config.yaml --dataset_path ./dataset/libero_object
+
+# 设置最大训练步数和保存间隔
+python train.py --config config.yaml --max_steps 20000 --save_steps 5000
+```
+
 **使用公开数据集训练：**
 ```bash
 # 在LIBERO数据集上训练
@@ -181,7 +210,8 @@ python train_public_datasets.py --dataset act --download
 
 **使用自定义数据训练：**
 ```bash
-python train.py --config config.yaml
+# 使用--no_lerobot参数禁用LeRobot数据集，使用原有训练逻辑
+python train.py --config config.yaml --no_lerobot
 ```
 
 **从检查点恢复训练：**
@@ -231,10 +261,11 @@ python inference.py \
 - 处理图像和文本输入，输出融合特征
 - 支持冻结VLM参数以加快训练
 
-### 动作头（DiT）
-- 基于Diffusion Transformer架构
-- 从VLM特征预测机器人动作
+### 动作头（Flow Matching）
+- 基于Flow Matching架构
+- 从VLM特征预测机器人动作序列（action horizon）
 - 包含多层Transformer和位置编码
+- 支持动作块预测（action chunking）
 
 ### 完整VLA模型
 - 结合VLM和动作头
@@ -259,7 +290,7 @@ python inference.py \
 - `scheduler`: 学习率调度器配置
 
 ### 数据配置
-- `dataset_type`: 数据集类型，可选 "custom", "libero", "act"
+- `dataset_type`: 数据集类型，可选 "custom", "libero", "act", "lerobot"
 - `train_data_path`: 训练数据路径（自定义数据集），默认 `./dataset/train`
 - `val_data_path`: 验证数据路径（自定义数据集），默认 `./dataset/val`
 - `cameras.names`: 相机名称列表，例如 `["global_img", "left_wrist_img"]`
@@ -267,10 +298,15 @@ python inference.py \
 - `robot_state.use_state`: 是否使用机器人状态信息
 - `robot_state.state_dim`: 状态维度，默认7
 - `action.action_dim`: 动作维度，默认7
+- `action_head.action_horizon`: 动作序列长度（action chunk大小），默认11
 - `libero.dataset_name`: LIBERO数据集名称（libero_spatial, libero_object, libero_goal, libero_100）
 - `libero.dataset_path`: LIBERO数据集路径
 - `act.dataset_path`: ACT数据集路径
 - `act.chunk_size`: ACT动作块大小
+- `lerobot.dataset_path`: LeRobot数据集路径（可以是HF数据集名称或本地路径）
+- `lerobot.camera_names`: LeRobot数据集中的相机名称列表
+- `lerobot.action_horizon`: LeRobot动作序列长度
+- `lerobot.pad_action_chunk`: 是否填充动作块
 - `num_workers`: 数据加载线程数
 
 **数据层次结构：**
@@ -283,44 +319,34 @@ python inference.py \
 
 ## 公开数据集支持
 
-### LIBERO数据集
+### LeRobot数据集（推荐）
 
-LIBERO是一个用于长期机器人操作任务的基准数据集，包含多个子数据集：
+LeRobot是HuggingFace上的开源机器人学习数据集格式，支持v2.1和v3.0版本。项目默认使用LeRobot数据集进行训练。
 
-- **libero_spatial**: 空间推理任务
-- **libero_object**: 物体操作任务
-- **libero_goal**: 目标条件任务
-- **libero_100**: 100个任务集合
-
-**使用示例：**
-```bash
-# 下载LIBERO数据集
-python -m ScriptedVLA.data.download_datasets --dataset libero --name libero_spatial
-
-# 在LIBERO上训练
-python train_public_datasets.py --dataset libero --dataset-name libero_spatial --download
-```
-
-### ACT数据集
-
-ACT (Action Chunking Transformer) 是一个用于机器人操作的数据集，支持动作块预测。
+**支持的LeRobot数据集：**
+- `lerobot/pusht`: PushT数据集
+- `k1000dai/libero-object-smolvla`: LIBERO Object数据集（LeRobot格式）
+- 其他HuggingFace上的LeRobot格式数据集
 
 **使用示例：**
 ```bash
-# 下载ACT数据集
-python -m ScriptedVLA.data.download_datasets --dataset act
+# 使用LeRobot数据集训练（默认方式）
+python train.py --config config.yaml --dataset_path ./dataset/libero_object
 
-# 在ACT上训练
-python train_public_datasets.py --dataset act --download
+# 从HuggingFace加载数据集
+# 在config.yaml中设置：
+# data:
+#   dataset_type: "lerobot"
+#   lerobot:
+#     dataset_path: "lerobot/pusht"
 ```
 
-**注意：** 首次使用这些数据集时，可能需要安装额外的依赖：
-```bash
-# LIBERO需要
-pip install libero
+**LeRobot数据集特点：**
+- 支持Parquet格式存储（v3.0）和HDF5格式（v2.1）
+- 自动版本检测和兼容性处理
+- 支持action chunking（动作序列预测）
+- 包含任务描述和元数据
 
-# ACT数据集可能需要h5py（已包含在依赖中）
-```
 
 ## 项目结构说明
 
@@ -373,11 +399,31 @@ A: 在 `train.py` 中修改 `criterion` 的定义。
 **Q: 如何使用公开数据集？**
 A: 使用 `train_public_datasets.py` 脚本，并指定 `--dataset` 参数。首次使用需要添加 `--download` 标志。
 
-**Q: LIBERO数据集下载失败怎么办？**
-A: 确保已安装 `libero` 包：`pip install libero`。如果仍有问题，请检查网络连接或参考LIBERO官方文档。
 
 **Q: 如何切换不同的数据集？**
-A: 在 `config.yaml` 中设置 `data.dataset_type` 为 "libero" 或 "act"，或使用 `train_public_datasets.py` 的 `--dataset` 参数。
+A: 在 `config.yaml` 中设置 `data.dataset_type` 为 "lerobot", "libero" 或 "act"。默认情况下，`train.py` 会使用LeRobot数据集，可以使用 `--no_lerobot` 参数禁用。
+
+**Q: 如何使用LeRobot数据集？**
+A: 
+1. 安装依赖：`pip install lerobot datasets`
+2. 准备数据集（本地路径或HuggingFace数据集名称）
+3. 运行训练：`python train.py --config config.yaml --dataset_path ./dataset/libero_object`
+4. 或在config.yaml中配置：设置 `data.dataset_type: "lerobot"` 和 `data.lerobot.dataset_path`
+
+**Q: LeRobot数据集版本兼容性如何？**
+A: 项目自动支持LeRobot v2.1格式。
+详见 `LEROBOT_VERSION_SOLUTION.md`。
+
+**Q: 模型的输入格式是什么？**
+A: 项目使用统一的字典格式输入，移除了`examples`参数。详见 `UNIFIED_INPUT_FORMAT.md`：
+```python
+inputs = {
+    "images": List[PIL.Image] or List[List[PIL.Image]],
+    "instructions": List[str],
+    "states": Optional[torch.Tensor],  # [B, state_dim]
+    "actions": Optional[torch.Tensor]  # [B, action_horizon, action_dim]
+}
+```
 
 **Q: 如何下载和测试Qwen2-VL-2B-Instruct模型？**
 A: 
@@ -423,6 +469,20 @@ python dataset_statistics.py --data_path ./dataset/train --task task_000 task_00
 python dataset_statistics.py --data_path ./dataset/train --episode 0 1 2
 ```
 
+**Q: 如何运行测试？**
+A: 项目包含完整的测试套件：
+```bash
+# 运行所有测试
+pytest test/
+
+# 运行特定测试
+pytest test/test_vla_qwen_groot.py
+pytest test/test_lerobot_training.py
+```
+
+**Q: 状态维度不匹配怎么办？**
+A: 项目已实现自动状态维度规范化。如果遇到维度问题，请参考 `STATE_DIMENSION_ANALYSIS.md` 了解详细说明和解决方案。
+
 ## 许可证
 
 本项目基于MIT许可证开源。
@@ -431,9 +491,20 @@ python dataset_statistics.py --data_path ./dataset/train --episode 0 1 2
 
 欢迎提交Issue和Pull Request！
 
+## 相关文档
+
+- [QUICKSTART.md](QUICKSTART.md) - 快速开始指南
+- [EXAMPLES.md](EXAMPLES.md) - 使用示例
+- [CHANGELOG.md](CHANGELOG.md) - 更新日志
+- [UNIFIED_INPUT_FORMAT.md](UNIFIED_INPUT_FORMAT.md) - 统一输入格式说明
+- [LEROBOT_VERSION_SOLUTION.md](LEROBOT_VERSION_SOLUTION.md) - LeRobot版本解决方案
+- [STATE_DIMENSION_ANALYSIS.md](STATE_DIMENSION_ANALYSIS.md) - 状态维度分析
+- [VLM_EVALUATION.md](VLM_EVALUATION.md) - VLM能力测评指南
+
 ## 致谢
 
 - [Qwen](https://github.com/QwenLM/Qwen-VL) - 视觉语言模型
 - [Transformers](https://github.com/huggingface/transformers) - 模型库
-- [DiT](https://github.com/facebookresearch/DiT) - Diffusion Transformer架构灵感
+- [LeRobot](https://github.com/huggingface/lerobot) - 机器人学习数据集格式
+- [Flow Matching](https://arxiv.org/abs/2210.02747) - Flow Matching架构灵感
 
