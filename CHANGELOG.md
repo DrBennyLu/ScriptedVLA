@@ -39,7 +39,7 @@
 安装项目后（`uv pip install -e .`），可以直接使用：
 
 ```python
-from ScriptedVLA.model import VLAModel
+from ScriptedVLA.model import QwenGR00TVLAModel
 from ScriptedVLA.data import VLADataset, LIBERODataset
 from ScriptedVLA.utils import load_config, setup_logger
 ```
@@ -54,7 +54,7 @@ from ScriptedVLA.utils import load_config, setup_logger
    from src.model import VLAModel
    
    # 新方式
-   from ScriptedVLA.model import VLAModel
+   from ScriptedVLA.model import QwenGR00TVLAModel
    ```
 
 2. 更新命令行工具调用：

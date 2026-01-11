@@ -33,8 +33,8 @@ ScriptedVLA/
         ├── model/               # 模型定义
         │   ├── __init__.py
         │   ├── vlm.py          # Qwen VLM模型
-        │   ├── action_head.py  # DiT动作头
-        │   └── vla.py         # 完整VLA模型
+        │   ├── action_head.py  # Flow Matching动作头
+        │   └── vla_qwen_groot.py  # Qwen-GR00T VLA模型
         ├── data/                # 数据处理
         │   ├── __init__.py
         │   ├── dataset.py      # 自定义数据集类
@@ -346,7 +346,7 @@ pip install libero
 ### 导入说明
 所有脚本文件使用以下导入方式：
 ```python
-from ScriptedVLA.model import VLAModel
+from ScriptedVLA.model import QwenGR00TVLAModel
 from ScriptedVLA.data import VLADataset, LIBERODataset
 from ScriptedVLA.utils import load_config, setup_logger
 ```

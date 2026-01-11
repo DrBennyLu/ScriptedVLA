@@ -13,7 +13,7 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 
-from ScriptedVLA.model import VLAModel
+from ScriptedVLA.model import QwenGR00TVLAModel
 from ScriptedVLA.data import (
     VLADataset,
     LIBERODataset,
@@ -166,9 +166,17 @@ def train_epoch(
             states = batch["state"].to(device)
         
         # 前向传播（训练模式，提供actions以计算损失）
-        outputs = model(images, texts, states, actions=actions)
+        # 使用统一输入格式
+        inputs = {
+            "images": images,
+            "instructions": texts,
+            "actions": actions
+        }
+        if states is not None:
+            inputs["states"] = states
+        outputs = model(inputs=inputs)
         
-        # 获取损失（VLAModel在训练模式下直接返回loss）
+            # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
         if "loss" in outputs:
             loss = outputs["loss"]
         elif "action_loss" in outputs:
@@ -266,12 +274,20 @@ def evaluate(model, dataloader, criterion, device, logger):
                 states = batch["state"].to(device)
             
             # 前向传播（评估模式，但提供actions以计算损失）
-            # 注意：模型需要处于训练模式才能计算损失（VLAModel的forward方法只在self.training=True时计算损失）
+            # 注意：模型需要处于训练模式才能计算损失（QwenGR00TVLAModel的forward方法只在self.training=True时计算损失）
             # 使用torch.no_grad()禁用梯度，这样既不会更新参数，又能计算损失
             model.train()  # 设置为训练模式以计算损失
-            outputs = model(images, texts, states, actions=actions)
+            # 使用统一输入格式
+            inputs = {
+                "images": images,
+                "instructions": texts,
+                "actions": actions
+            }
+            if states is not None:
+                inputs["states"] = states
+            outputs = model(inputs=inputs)
             
-            # 获取损失（VLAModel在训练模式下直接返回loss）
+            # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
             if "loss" in outputs:
                 loss = outputs["loss"]
             elif "action_loss" in outputs:
@@ -375,14 +391,15 @@ def main():
     state_dim = robot_state_config.get("state_dim", 7)
     
     # 创建模型
-    model = VLAModel(
+    vla_config = model_config.get("vla", {})
+    future_action_window_size = vla_config.get("future_action_window_size", 10)
+    model = QwenGR00TVLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
-        use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
         camera_names=camera_names,
         use_state=use_state,
-        state_dim=state_dim
+        state_dim=state_dim,
+        future_action_window_size=future_action_window_size
     )
     model = model.to(device)
     log_model_info(logger, model)

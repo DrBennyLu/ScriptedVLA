@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 
-from ScriptedVLA.model import VLAModel
+from ScriptedVLA.model import QwenGR00TVLAModel
 from ScriptedVLA.utils import (
     load_config,
     get_model_config,
@@ -94,14 +94,15 @@ def main():
     
     # 创建模型
     print("Loading model...")
-    model = VLAModel(
+    vla_config = model_config.get("vla", {})
+    future_action_window_size = vla_config.get("future_action_window_size", 10)
+    model = QwenGR00TVLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
-        use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
         camera_names=camera_names,
         use_state=use_state,
-        state_dim=state_dim
+        state_dim=state_dim,
+        future_action_window_size=future_action_window_size
     )
     
     # 加载检查点
@@ -157,14 +158,35 @@ def main():
     
     # 推理
     print("Running inference...")
+    # 使用统一输入格式
+    inputs = {
+        "images": images_input,
+        "instructions": [args.text] if args.text else [""],  # 至少需要一个指令
+        "states": states
+    }
+    
     with torch.no_grad():
-        if args.text:
-            outputs = model(images_input, texts=[args.text], states=states)
-        else:
-            outputs = model(images_input, states=states)
+        outputs = model.predict_action(inputs=inputs)
         
-        actions = outputs["actions"]
-        actions = actions.cpu().numpy()[0]  # 移除batch维度
+        # 获取预测的动作
+        if "normalized_actions" in outputs:
+            actions = outputs["normalized_actions"]  # [B, T, action_dim]
+        elif "actions" in outputs:
+            actions = outputs["actions"]  # [B, T, action_dim]
+        else:
+            raise ValueError("Model output does not contain actions")
+        
+        # 如果是numpy数组，直接使用；如果是tensor，转换为numpy
+        if isinstance(actions, torch.Tensor):
+            actions = actions.cpu().numpy()
+        
+        # 取第一个batch的第一个动作（或平均多个时间步）
+        if len(actions.shape) == 3:  # [B, T, action_dim]
+            actions = actions[0, 0, :]  # 取第一个batch的第一个时间步
+        elif len(actions.shape) == 2:  # [B, action_dim]
+            actions = actions[0, :]  # 取第一个batch
+        else:
+            actions = actions[0]  # 取第一个元素
     
     # 打印结果
     print("\n" + "="*50)

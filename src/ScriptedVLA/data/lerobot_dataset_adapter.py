@@ -80,7 +80,7 @@ class LeRobotDatasetAdapter(Dataset):
             dataset_name: HF数据集名称，例如 "lerobot/pusht"
         """
         try:
-            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset as LeRobotDatasetHF
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset as LeRobotDatasetHF
             from datasets import load_dataset
             
             print(f"Attempting to load LeRobot dataset from HuggingFace: {dataset_name}")

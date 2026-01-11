@@ -64,3 +64,6 @@ cache/
 
 # config
 !config.yaml
+
+# test
+test_temp/

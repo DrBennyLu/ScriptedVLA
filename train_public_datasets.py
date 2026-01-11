@@ -12,7 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 
-from ScriptedVLA.model import VLAModel
+from ScriptedVLA.model import QwenGR00TVLAModel
 from ScriptedVLA.data import (
     download_dataset,
     LIBERODataset,
@@ -80,7 +80,6 @@ def train_epoch(
     dataloader,
     optimizer,
     scheduler,
-    criterion,
     device,
     config,
     logger,
@@ -113,17 +112,48 @@ def train_epoch(
             raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
         
         texts = batch["text"]
-        actions = batch["action"].to(device)
+        actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim] 或 [B, action_dim]
+        
+        # 处理actions维度：检查是否是action chunk
+        if actions.dim() == 2:
+            # JSON格式：只有单个动作，需要扩展为action chunk
+            if hasattr(model, 'action_model') and hasattr(model.action_model, 'action_horizon'):
+                action_horizon = model.action_model.action_horizon
+            elif hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
+                action_horizon = model.action_head.action_horizon
+            else:
+                action_horizon = 4
+            actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
+        elif actions.dim() == 3:
+            # HDF5格式：已经是action chunk
+            pass
+        else:
+            raise ValueError(f"Unexpected action shape: {actions.shape}")
         
         # 处理状态信息（如果存在）
         states = None
         if "state" in batch:
             states = batch["state"].to(device)
         
-        outputs = model(images, texts, states)
-        pred_actions = outputs["actions"]
+        # 使用统一输入格式
+        inputs = {
+            "images": images,
+            "instructions": texts,
+            "actions": actions
+        }
+        if states is not None:
+            inputs["states"] = states
         
-        loss = criterion(pred_actions, actions)
+        outputs = model(inputs=inputs)
+        
+        # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
+        if "action_loss" in outputs:
+            loss = outputs["action_loss"]
+        elif "loss" in outputs:
+            loss = outputs["loss"]
+        else:
+            raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
+        
         loss = loss / config.get("gradient_accumulation_steps", 1)
         
         loss.backward()
@@ -157,9 +187,9 @@ def train_epoch(
     return avg_loss, current_step
 
 
-def evaluate(model, dataloader, criterion, device, logger):
+def evaluate(model, dataloader, device, logger):
     """评估模型"""
-    model.eval()
+    model.train()  # 设置为训练模式以计算损失
     total_loss = 0.0
     num_batches = 0
     
@@ -178,17 +208,48 @@ def evaluate(model, dataloader, criterion, device, logger):
                 raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
             
             texts = batch["text"]
-            actions = batch["action"].to(device)
+            actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim] 或 [B, action_dim]
+            
+            # 处理actions维度：检查是否是action chunk
+            if actions.dim() == 2:
+                # JSON格式：只有单个动作，需要扩展为action chunk
+                if hasattr(model, 'action_model') and hasattr(model.action_model, 'action_horizon'):
+                    action_horizon = model.action_model.action_horizon
+                elif hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
+                    action_horizon = model.action_head.action_horizon
+                else:
+                    action_horizon = 4
+                actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
+            elif actions.dim() == 3:
+                # HDF5格式：已经是action chunk
+                pass
+            else:
+                raise ValueError(f"Unexpected action shape: {actions.shape}")
             
             # 处理状态信息（如果存在）
             states = None
             if "state" in batch:
                 states = batch["state"].to(device)
             
-            outputs = model(images, texts, states)
-            pred_actions = outputs["actions"]
+            # 使用统一输入格式
+            inputs = {
+                "images": images,
+                "instructions": texts,
+                "actions": actions
+            }
+            if states is not None:
+                inputs["states"] = states
             
-            loss = criterion(pred_actions, actions)
+            outputs = model(inputs=inputs)
+            
+            # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
+            if "action_loss" in outputs:
+                loss = outputs["action_loss"]
+            elif "loss" in outputs:
+                loss = outputs["loss"]
+            else:
+                raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
+            
             total_loss += loss.item()
             num_batches += 1
             
@@ -314,14 +375,15 @@ def main():
     state_dim = robot_state_config.get("state_dim", 7)
     
     # 创建模型
-    model = VLAModel(
+    vla_config = model_config.get("vla", {})
+    future_action_window_size = vla_config.get("future_action_window_size", 10)
+    model = QwenGR00TVLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
-        use_cross_attention=model_config.get("vla", {}).get("use_cross_attention", True),
-        cross_attention_layers=model_config.get("vla", {}).get("cross_attention_layers", 3),
         camera_names=camera_names,
         use_state=use_state,
-        state_dim=state_dim
+        state_dim=state_dim,
+        future_action_window_size=future_action_window_size
     )
     model = model.to(device)
     log_model_info(logger, model)
@@ -388,9 +450,6 @@ def main():
     num_training_steps = len(train_loader) * training_config.get("num_epochs", 100)
     scheduler = create_scheduler(optimizer, training_config, num_training_steps)
     
-    # 损失函数
-    criterion = nn.MSELoss()
-    
     # 恢复训练（如果有）
     start_epoch = 0
     start_step = 0
@@ -428,13 +487,13 @@ def main():
         
         train_loss, global_step = train_epoch(
             model, train_loader, optimizer, scheduler,
-            criterion, device, training_config, logger, epoch+1, start_step=global_step
+            device, training_config, logger, epoch+1, start_step=global_step
         )
         logger.info(f"Train Loss: {train_loss:.4f}")
         
         # 验证（基于步数，而不是轮数）
         if (global_step - last_eval_step >= eval_steps or global_step % eval_steps == 0) or epoch == num_epochs - 1:
-            val_loss = evaluate(model, val_loader, criterion, device, logger)
+            val_loss = evaluate(model, val_loader, device, logger)
             last_eval_step = global_step
             
             if val_loss < best_val_loss:

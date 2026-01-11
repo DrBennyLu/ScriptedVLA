@@ -308,6 +308,4 @@ class QwenGR00TVLAModel(nn.Module):
         return {"normalized_actions": normalized_actions}
 
 
-# 向后兼容：VLAModel作为QwenGR00TVLAModel的别名
-VLAModel = QwenGR00TVLAModel
 
