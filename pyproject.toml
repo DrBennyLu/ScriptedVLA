@@ -19,6 +19,7 @@ dependencies = [
     "datasets>=2.14.0",  # 用于加载HuggingFace数据集
     "h5py>=3.8.0",  # 用于读取HDF5格式数据(ACT数据集)
     "requests>=2.31.0",  # 用于下载数据集
+    "lerobot==0.3.3",  # 用于加载LeRobot数据集（v2.1格式支持）
 ]
 
 [build-system]
