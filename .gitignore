@@ -67,3 +67,6 @@ cache/
 
 # test
 test_temp/
+
+# checkpoint
+checkpoints/
