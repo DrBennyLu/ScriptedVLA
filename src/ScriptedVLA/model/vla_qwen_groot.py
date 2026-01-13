@@ -114,7 +114,12 @@ class QwenGR00TVLAModel(nn.Module):
             noise_s=action_head_config.get("noise_s", 0.999),
             num_timestep_buckets=action_head_config.get("num_timestep_buckets", 1000),
             num_inference_timesteps=action_head_config.get("num_inference_timesteps", 50),
-            cross_attention_dim=vlm_hidden_size if action_head_hidden_dim != vlm_hidden_size else None
+            cross_attention_dim=vlm_hidden_size if action_head_hidden_dim != vlm_hidden_size else None,
+            # 新增参数：时间嵌入和归一化相关
+            norm_type=action_head_config.get("norm_type", "layer_norm"),  # 'layer_norm' or 'ada_norm'
+            norm_elementwise_affine=action_head_config.get("norm_elementwise_affine", False),
+            norm_eps=action_head_config.get("norm_eps", 1e-5),
+            compute_dtype=action_head_config.get("compute_dtype", torch.float32)
         )
     
     def _normalize_states(self, states: Union[torch.Tensor, np.ndarray, List]) -> torch.Tensor:

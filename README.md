@@ -49,7 +49,8 @@ ScriptedVLA/
         ├── model/               # 模型定义
         │   ├── __init__.py
         │   ├── vlm.py          # Qwen VLM模型
-        │   ├── action_head.py  # Flow Matching动作头
+        │   ├── action_head.py  # Flow Matching动作头（包含DiT Block、AdaLayerNorm、TimestepEncoder）
+
         │   └── vla_qwen_groot.py  # Qwen-GR00T VLA模型
         ├── data/                # 数据处理
         │   ├── __init__.py
@@ -177,6 +178,10 @@ model:
     hidden_dim: 768
     num_layers: 6
     action_dim: 7  # 动作维度
+    norm_type: "layer_norm"  # 归一化类型：'layer_norm' 或 'ada_norm'
+    norm_elementwise_affine: false  # 是否使用元素级仿射变换
+    norm_eps: 1e-5  # 归一化的epsilon值
+    compute_dtype: "float32"  # 计算数据类型
 
 training:
   batch_size: 8
@@ -264,8 +269,11 @@ python inference.py \
 ### 动作头（Flow Matching）
 - 基于Flow Matching架构
 - 从VLM特征预测机器人动作序列（action horizon）
-- 包含多层Transformer和位置编码
+- 包含多层Transformer（DiT Block）和位置编码
 - 支持动作块预测（action chunking）
+- **时间嵌入支持**：通过 `TimestepEncoder` 将时间步编码为嵌入向量
+- **自适应归一化**：支持 `AdaLayerNorm`，通过时间嵌入动态调整归一化参数
+- **灵活的归一化类型**：可选择 `layer_norm`（标准层归一化）或 `ada_norm`（自适应归一化）
 
 ### 完整VLA模型
 - 结合VLM和动作头
@@ -281,6 +289,10 @@ python inference.py \
 - `action_head.hidden_dim`: Transformer隐藏层维度
 - `action_head.num_layers`: Transformer层数
 - `action_head.action_dim`: 动作维度（如7维：x, y, z, roll, pitch, yaw, gripper）
+- `action_head.norm_type`: 归一化类型，可选 `"layer_norm"`（默认）或 `"ada_norm"`（自适应归一化，使用时间嵌入）
+- `action_head.norm_elementwise_affine`: 是否使用元素级仿射变换（默认 `false`）
+- `action_head.norm_eps`: 归一化的epsilon值（默认 `1e-5`）
+- `action_head.compute_dtype`: 计算数据类型（默认 `float32`）
 
 ### 训练配置
 - `batch_size`: 批次大小
@@ -389,6 +401,12 @@ A: 修改 `config.yaml` 中的 `action_head.action_dim` 参数。
 
 **Q: 如何冻结VLM参数？**
 A: 设置 `vlm.freeze_vlm: true` 在配置文件中。
+
+**Q: 什么是 AdaLayerNorm？如何使用？**
+A: `AdaLayerNorm` 是一种自适应层归一化，通过时间嵌入（temb）动态调整归一化参数。要使用它，在配置文件中设置 `action_head.norm_type: "ada_norm"`。这可以让模型根据时间步信息自适应调整归一化，可能提高Flow Matching的性能。
+
+**Q: 时间嵌入（temb）是什么？**
+A: 时间嵌入是将Flow Matching中的时间步编码为向量表示，通过 `TimestepEncoder` 实现。当使用 `ada_norm` 时，时间嵌入会被传递给 `DiTBlock` 的 `AdaLayerNorm`，用于调整归一化参数。
 
 **Q: 支持哪些图像格式？**
 A: 支持PIL/Pillow支持的所有格式（JPEG, PNG等）。

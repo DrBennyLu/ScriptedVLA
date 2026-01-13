@@ -32,11 +32,59 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
 from torch.distributions import Beta
+from diffusers.models.embeddings import (
+    SinusoidalPositionalEmbedding,
+    TimestepEmbedding,
+    Timesteps,
+)
 
 
 def swish(x):
     """Swish激活函数"""
     return x * torch.sigmoid(x)
+
+
+class TimestepEncoder(nn.Module):
+    """时间步编码器，将时间步编码为嵌入向量"""
+    
+    def __init__(self, embedding_dim, compute_dtype=torch.float32):
+        super().__init__()
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+    def forward(self, timesteps):
+        dtype = next(self.parameters()).dtype
+        timesteps_proj = self.time_proj(timesteps).to(dtype)
+        timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
+        return timesteps_emb
+
+
+class AdaLayerNorm(nn.Module):
+    """自适应层归一化，通过时间嵌入调整归一化参数"""
+    
+    def __init__(
+        self,
+        embedding_dim: int,
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        chunk_dim: int = 0,
+    ):
+        super().__init__()
+        self.chunk_dim = chunk_dim
+        output_dim = embedding_dim * 2
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, output_dim)
+        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        temb = self.linear(self.silu(temb))
+        scale, shift = temb.chunk(2, dim=1)
+        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        return x
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -141,7 +189,7 @@ class ActionEncoder(nn.Module):
 class DiTBlock(nn.Module):
     """
     DiT基础块（用于Flow Matching的Transformer）
-    支持交叉注意力机制
+    支持交叉注意力机制和时间嵌入
     """
     
     def __init__(
@@ -150,14 +198,33 @@ class DiTBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
-        use_cross_attention: bool = True
+        use_cross_attention: bool = True,
+        norm_type: str = "layer_norm",  # 'layer_norm' or 'ada_norm'
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        embedding_dim: Optional[int] = None,  # 用于 AdaLayerNorm 的时间嵌入维度
     ):
         super().__init__()
         
         self.use_cross_attention = use_cross_attention
+        self.norm_type = norm_type
         
-        # 自注意力
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        # 如果使用 AdaLayerNorm，需要 embedding_dim
+        if norm_type == "ada_norm":
+            if embedding_dim is None:
+                embedding_dim = hidden_dim
+            self.embedding_dim = embedding_dim
+        
+        # 自注意力归一化
+        if norm_type == "ada_norm":
+            self.norm1 = AdaLayerNorm(
+                embedding_dim=embedding_dim,
+                norm_elementwise_affine=norm_elementwise_affine,
+                norm_eps=norm_eps
+            )
+        else:
+            self.norm1 = nn.LayerNorm(hidden_dim, norm_eps, norm_elementwise_affine)
+        
         self.attn = nn.MultiheadAttention(
             hidden_dim,
             num_heads,
@@ -167,7 +234,7 @@ class DiTBlock(nn.Module):
         
         # 交叉注意力（如果使用）
         if use_cross_attention:
-            self.norm_cross = nn.LayerNorm(hidden_dim)
+            self.norm_cross = nn.LayerNorm(hidden_dim, norm_eps, norm_elementwise_affine)
             self.cross_attn = nn.MultiheadAttention(
                 hidden_dim,
                 num_heads,
@@ -176,7 +243,7 @@ class DiTBlock(nn.Module):
             )
         
         # MLP
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim, norm_eps, norm_elementwise_affine)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_hidden_dim),
@@ -191,7 +258,8 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None
+        attn_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -199,10 +267,14 @@ class DiTBlock(nn.Module):
             encoder_hidden_states: [B, encoder_seq_len, hidden_dim] VLM特征（用于交叉注意力）
             encoder_attention_mask: [B, encoder_seq_len] 编码器注意力掩码
             attn_mask: 自注意力掩码
+            temb: [B, embedding_dim] 时间嵌入（用于 AdaLayerNorm）
         """
         # 自注意力
         residual = x
-        x = self.norm1(x)
+        if self.norm_type == "ada_norm":
+            x = self.norm1(x, temb)
+        else:
+            x = self.norm1(x)
         x_attn, _ = self.attn(x, x, x, attn_mask=attn_mask)
         x = residual + x_attn
         
@@ -251,7 +323,11 @@ class FlowMatchingActionHead(nn.Module):
         noise_s: float = 0.999,
         num_timestep_buckets: int = 1000,
         num_inference_timesteps: int = 50,
-        cross_attention_dim: Optional[int] = None
+        cross_attention_dim: Optional[int] = None,
+        norm_type: str = "layer_norm",  # 'layer_norm' or 'ada_norm'
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        compute_dtype=torch.float32,
     ):
         """
         初始化Flow Matching动作头
@@ -278,6 +354,10 @@ class FlowMatchingActionHead(nn.Module):
             num_timestep_buckets: 时间步离散化桶数
             num_inference_timesteps: 推理时的去噪步数
             cross_attention_dim: VLM hidden_states的维度（用于交叉注意力，如果与hidden_dim不同则需要投影）
+            norm_type: 归一化类型，'layer_norm' 或 'ada_norm'
+            norm_elementwise_affine: 是否使用元素级仿射变换
+            norm_eps: 归一化的epsilon值
+            compute_dtype: 计算数据类型
         """
         super().__init__()
         
@@ -292,6 +372,16 @@ class FlowMatchingActionHead(nn.Module):
         self.add_pos_embed = add_pos_embed
         self.num_timestep_buckets = num_timestep_buckets
         self.num_inference_timesteps = num_inference_timesteps
+        self.norm_type = norm_type
+        
+        # 时间步编码器（用于 AdaLayerNorm）
+        if norm_type == "ada_norm":
+            self.timestep_encoder = TimestepEncoder(
+                embedding_dim=hidden_dim,
+                compute_dtype=compute_dtype
+            )
+        else:
+            self.timestep_encoder = None
         
         # 状态编码器（如果使用状态）
         if state_dim is not None and state_dim > 0:
@@ -329,14 +419,18 @@ class FlowMatchingActionHead(nn.Module):
             self.position_embedding = nn.Embedding(max_seq_len, hidden_dim)
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         
-        # DiT块（支持交叉注意力）
+        # DiT块（支持交叉注意力和时间嵌入）
         self.blocks = nn.ModuleList([
             DiTBlock(
                 hidden_dim,
                 num_heads,
                 mlp_ratio,
                 dropout,
-                use_cross_attention=use_cross_attention
+                use_cross_attention=use_cross_attention,
+                norm_type=norm_type,
+                norm_elementwise_affine=norm_elementwise_affine,
+                norm_eps=norm_eps,
+                embedding_dim=hidden_dim if norm_type == "ada_norm" else None,
             )
             for _ in range(num_layers)
         ])
@@ -468,6 +562,12 @@ class FlowMatchingActionHead(nn.Module):
             
             # 离散化时间步
             t_discretized = (t * self.num_timestep_buckets).long()
+            
+            # 生成时间嵌入（如果使用 AdaLayerNorm）
+            if self.timestep_encoder is not None:
+                temb = self.timestep_encoder(t_discretized)  # [B, hidden_dim]
+            else:
+                temb = None
             
             # 编码动作
             action_features = self.action_encoder(noisy_trajectory, t_discretized)  # [B, action_horizon, hidden_dim]
@@ -612,6 +712,12 @@ class FlowMatchingActionHead(nn.Module):
                 dtype=torch.long
             )
             
+            # 生成时间嵌入（如果使用 AdaLayerNorm）
+            if self.timestep_encoder is not None:
+                temb = self.timestep_encoder(timesteps_tensor)  # [B, hidden_dim]
+            else:
+                temb = None
+            
             # 编码动作
             action_features = self.action_encoder(actions, timesteps_tensor)  # [B, action_horizon, hidden_dim]
             
@@ -656,7 +762,8 @@ class FlowMatchingActionHead(nn.Module):
                 x = block(
                     x,
                     encoder_hidden_states=vlm_features_seq,  # VLM特征作为交叉注意力的key和value
-                    encoder_attention_mask=encoder_attention_mask
+                    encoder_attention_mask=encoder_attention_mask,
+                    temb=temb  # 时间嵌入（用于 AdaLayerNorm）
                 )
             
             # 最终归一化
