@@ -38,21 +38,14 @@ import json
 import numpy as np
 from PIL import Image
 
-from ScriptedVLA.model import QwenGR00TVLAModel
-from ScriptedVLA.data import (
-    VLADataset,
-    LIBERODataset,
-    ACTDataset,
-    create_libero_dataset_from_config,
-    create_act_dataset_from_config
-)
-from ScriptedVLA.utils import (
+from src.ScriptedVLA.model import QwenGR00TVLAModel
+from src.ScriptedVLA.utils import (
     load_config,
     get_model_config,
     get_training_config,
     get_data_config,
-    setup_logger,
-    log_model_info
+    create_normalizer_from_dataset,
+    Normalizer
 )
 
 try:
@@ -149,7 +142,7 @@ def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
     return default_state_dim
 
 
-def create_collate_fn(image_keys=None, state_key=None, tasks_dict=None, image_size=None, use_batch_task=True):
+def create_collate_fn(image_keys=None, state_key=None, tasks_dict=None, image_size=None, use_batch_task=True, normalizer=None):
     """创建collate函数，处理lerobot返回的batch格式"""
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
@@ -217,11 +210,17 @@ def create_collate_fn(image_keys=None, state_key=None, tasks_dict=None, image_si
                 images_list.append(camera_images)
         
         actions = batch_dict["action"]
+        # 归一化action
+        if normalizer is not None:
+            actions = normalizer.normalize_action(actions)
         
         states = None
         state_key_to_use = state_key if state_key and state_key in batch_dict else "observation.state"
         if state_key_to_use in batch_dict:
             states = batch_dict[state_key_to_use]
+            # 归一化state
+            if normalizer is not None:
+                states = normalizer.normalize_state(states)
         
         texts = []
         if use_batch_task and "task" in batch_dict:
@@ -609,7 +608,7 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
         device: 设备
         
     Returns:
-        (start_step, loss): 起始步数和损失值
+        (start_step, loss, normalizer): 起始步数、损失值和归一化器
     """
     print(f"  加载检查点: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -627,6 +626,12 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         print(f"  ✓ 调度器状态已加载")
     
+    # 加载归一化器（如果存在）
+    normalizer = None
+    if "normalizer" in checkpoint:
+        normalizer = Normalizer.from_dict(checkpoint["normalizer"])
+        print(f"  ✓ 归一化器状态已加载")
+    
     # 获取步数和损失
     start_step = checkpoint.get("global_step", 0)
     loss = checkpoint.get("loss", 0.0)
@@ -635,10 +640,10 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
     print(f"    起始步数: {start_step}")
     print(f"    检查点损失: {loss:.4f}")
     
-    return start_step, loss
+    return start_step, loss, normalizer
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_step=None):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_step=None, normalizer=None):
     """保存检查点"""
     checkpoint = {
         "epoch": epoch,
@@ -650,6 +655,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = global_step
+    if normalizer is not None:
+        checkpoint["normalizer"] = normalizer.to_dict()
     
     torch.save(checkpoint, save_path)
     print(f"Checkpoint saved to {save_path}")
@@ -679,21 +686,24 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"\n步骤1: 加载配置文件: {config_path}")
     config = load_config(config_path)
     
-    # 获取模型和训练配置（从config.training读取，而不是lerobot_test）
+    # 获取模型和训练配置
     model_config = get_model_config(config)
     training_config = get_training_config(config)
     data_config = get_data_config(config)
     default_state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
     
-    # 获取lerobot_test配置（仅用于数据集相关配置，不用于训练配置）
-    lerobot_test_config = config.get("lerobot_test", {})
-    dataset_config = lerobot_test_config.get("dataset", {})
-    dataloader_config = lerobot_test_config.get("dataloader", {})
-    task_description_config = lerobot_test_config.get("task_description", {})
+    # 获取数据集配置
+    dataset_config = config.get("dataset", {})
+    dataloader_config = dataset_config.get("dataloader", {})
+    task_description_config = dataset_config.get("task_description", {})
     
-    # 从lerobot_test.dataset配置中获取数据集相关参数
-    repo_id = dataset_config.get("repo_id", "k1000dai/libero-object-smolvla")
-    local_path = dataset_path  # 使用传入的路径
+    # 从dataset配置中获取数据集相关参数
+    # 优先级：命令行参数 > 配置文件 > 默认值
+    if dataset_path == "./dataset/libero_object":  # 如果使用的是默认值，从配置文件读取
+        local_path = dataset_config.get("local_path", "./dataset/libero_object")
+    else:
+        local_path = dataset_path  # 使用命令行传入的路径
+    
     action_horizon = dataset_config.get("action_horizon", 50)
     image_size = dataset_config.get("image_size", 224)
     
@@ -701,7 +711,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     use_batch_task = task_description_config.get("use_batch_task", True)
     use_tasks_jsonl = task_description_config.get("use_tasks_jsonl", True)
     
-    # 使用config.training中的配置（不从lerobot_test.training读取）
+    # 使用config.training中的配置
     merged_training_config = training_config.copy()
     
     # 从config.training中读取batch_size
@@ -710,9 +720,11 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     # 从配置文件中读取训练参数
     # 优先级：命令行参数 > 配置文件 > 默认值
     # 如果函数参数是默认值，说明用户没有通过命令行指定，则从配置文件读取
+    if max_steps == 20000:  # 如果使用的是默认值，从配置文件读取
+        max_steps = training_config.get("max_steps", 20000)
+    
     if save_steps == 5000:  # 如果使用的是默认值，从配置文件读取
         save_steps = merged_training_config.get("save_steps", 5000)
-    # 否则使用命令行参数传入的值（不改变save_steps）
     
     eval_steps = merged_training_config.get("eval_steps", 5000)
     logging_steps = merged_training_config.get("logging_steps", 100)
@@ -730,7 +742,21 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         raise ValueError(f"数据集路径不存在: {dataset_path_obj}")
     
     print(f"  数据集路径: {dataset_path_obj}")
-    dataset_info = load_dataset_info(dataset_path_obj)   #TODO:在此处增加数据集归一化
+    dataset_info = load_dataset_info(dataset_path_obj)
+    
+    # 创建归一化器
+    print(f"\n步骤2.5: 创建数据归一化器")
+    try:
+        normalizer = create_normalizer_from_dataset(dataset_path_obj)
+        print(f"  ✓ 归一化器创建成功")
+        if normalizer.action_min is not None:
+            print(f"  Action范围: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
+        if normalizer.state_min is not None:
+            print(f"  State范围: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
+    except Exception as e:
+        print(f"  ✗ 归一化器创建失败: {e}")
+        print(f"  警告: 将不使用归一化，训练可能不稳定")
+        normalizer = None
     
     # 从info.json获取信息
     fps = dataset_info.get("fps", 10)
@@ -792,7 +818,8 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         state_key=state_key,
         tasks_dict=tasks_dict,
         image_size=image_size,
-        use_batch_task=use_batch_task
+        use_batch_task=use_batch_task,
+        normalizer=normalizer
     )
     
     train_loader = DataLoader(
@@ -853,9 +880,32 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         print(f"  文件名中的步数: {latest_step_from_filename}")
         
         # 加载检查点（会返回检查点中保存的实际步数）
-        start_step, checkpoint_loss = load_checkpoint(
+        start_step, checkpoint_loss, loaded_normalizer = load_checkpoint(
             latest_checkpoint_path, model, optimizer, scheduler, device
         )
+        
+        # 如果检查点中有归一化器，使用它；否则使用新创建的
+        if loaded_normalizer is not None:
+            normalizer = loaded_normalizer
+            print(f"  使用检查点中的归一化器")
+            # 重新创建collate_fn以使用新的normalizer
+            custom_collate_fn = create_collate_fn(
+                image_keys=image_keys,
+                state_key=state_key,
+                tasks_dict=tasks_dict,
+                image_size=image_size,
+                use_batch_task=use_batch_task,
+                normalizer=normalizer
+            )
+            # 重新创建DataLoader以使用新的collate_fn
+            train_loader = DataLoader(
+                lerobot_dataset,
+                batch_size=batch_size,
+                shuffle=dataloader_config.get("shuffle", True),
+                num_workers=dataloader_config.get("num_workers", 0),
+                pin_memory=dataloader_config.get("pin_memory", False),
+                collate_fn=custom_collate_fn
+            )
         
         # 使用检查点中保存的实际步数，而不是文件名中的步数
         # 因为检查点中的步数更准确
@@ -963,7 +1013,8 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         if (step + 1) % save_steps == 0:
             checkpoint_path = save_dir / f"checkpoint_step_{step + 1}.pt"
             save_checkpoint(
-                model, optimizer, scheduler, 0, loss_value, checkpoint_path, global_step=step + 1
+                model, optimizer, scheduler, 0, loss_value, checkpoint_path, 
+                global_step=step + 1, normalizer=normalizer
             )
     
     # 8. 打印训练总结
@@ -1023,17 +1074,6 @@ def main():
         help="Path to config file"
     )
     parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from"
-    )
-    parser.add_argument(
-        "--no_lerobot",
-        action="store_true",
-        help="Don't use LeRobot dataset (use original training logic)"
-    )
-    parser.add_argument(
         "--dataset_path",
         type=str,
         default="./dataset/libero_object",
@@ -1053,261 +1093,20 @@ def main():
     )
     args = parser.parse_args()
     
-    # 默认使用lerobot数据集训练，除非用户指定--no_lerobot
-    if not args.no_lerobot:
-        # 使用LeRobot数据集训练
-        try:
-            model, losses = train_with_lerobot_dataset(
-                config_path=args.config,
-                dataset_path=args.dataset_path,
-                max_steps=args.max_steps,
-                save_steps=args.save_steps
-            )
-            print("\n✓ 训练成功完成")
-            return
-        except Exception as e:
-            print(f"\n✗ LeRobot训练失败: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
-    # 原有的训练逻辑（保留向后兼容）
-    
-    # 加载配置
-    config = load_config(args.config)
-    model_config = get_model_config(config)
-    training_config = get_training_config(config)
-    data_config = get_data_config(config)
-    
-    # 设置日志
-    logger = setup_logger(
-        log_dir=config.get("logging", {}).get("log_dir", "./logs")
-    )
-    logger.info("Starting VLA training...")
-    logger.info(f"Config: {config}")
-    
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    
-    # 获取相机和状态配置
-    camera_config = data_config.get("cameras", {})
-    camera_names = camera_config.get("names", ["global_img", "left_wrist_img"])
-    robot_state_config = data_config.get("robot_state", {})
-    use_state = robot_state_config.get("use_state", True)
-    state_dim = robot_state_config.get("state_dim", 7)
-    
-    # 创建模型
-    vla_config = model_config.get("vla", {})
-    future_action_window_size = vla_config.get("future_action_window_size", 10)
-    model = QwenGR00TVLAModel(
-        vlm_config=model_config.get("vlm", {}),
-        action_head_config=model_config.get("action_head", {}),
-        camera_names=camera_names,
-        use_state=use_state,
-        state_dim=state_dim,
-        future_action_window_size=future_action_window_size
-    )
-    model = model.to(device)
-    log_model_info(logger, model)
-    
-    # 创建数据集和数据加载器
-    dataset_type = data_config.get("dataset_type", "custom")
-    image_size = data_config.get("image_size", model_config.get("vlm", {}).get("image_size", 224))
-    
-    logger.info(f"Using dataset type: {dataset_type}")
-    logger.info(f"Cameras: {camera_names}, Use state: {use_state}, State dim: {state_dim}")
-    
-    # 从模型配置获取action_horizon（用于数据集初始化）
-    action_head_config = model_config.get("action_head", {})
-    action_horizon = action_head_config.get("action_horizon", 4)
-    
-    if dataset_type == "libero":
-        # LIBERO数据集
-        libero_config = data_config.get("libero", {})
-        train_dataset = LIBERODataset(
-            dataset_path=libero_config.get("dataset_path", "./data/libero"),
-            task_names=libero_config.get("task_names", None),
-            image_size=image_size,
-            max_episode_length=libero_config.get("max_episode_length", 100)
+    # 使用LeRobot数据集训练
+    try:
+        model, losses = train_with_lerobot_dataset(
+            config_path=args.config,
+            dataset_path=args.dataset_path,
+            max_steps=args.max_steps,
+            save_steps=args.save_steps
         )
-        # LIBERO通常不区分train/val，可以按比例分割
-        val_size = int(len(train_dataset) * 0.1)
-        train_size = len(train_dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [train_size, val_size]
-        )
-    elif dataset_type == "act":
-        # ACT数据集
-        act_config = data_config.get("act", {})
-        train_dataset = ACTDataset(
-            dataset_path=act_config.get("dataset_path", "./data/act"),
-            image_size=image_size,
-            chunk_size=act_config.get("chunk_size", 1)
-        )
-        # ACT数据集也按比例分割
-        val_size = int(len(train_dataset) * 0.1)
-        train_size = len(train_dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [train_size, val_size]
-        )
-    elif dataset_type == "lerobot":
-        # LeRobot数据集（兼容HF开源数据集）
-        if not HAS_LEROBOT:
-            raise ImportError(
-                "LeRobot library not installed. "
-                "Install with: pip install lerobot datasets"
-            )
-        
-        lerobot_config = data_config.get("lerobot", {})
-        lerobot_action_horizon = lerobot_config.get("action_horizon") or action_horizon
-        
-        train_dataset = LeRobotDatasetAdapter(
-            dataset_path=lerobot_config.get("dataset_path", "lerobot/pusht"),
-            image_size=image_size,
-            camera_names=lerobot_config.get("camera_names", camera_names),
-            use_state=lerobot_config.get("use_state", use_state),
-            state_dim=lerobot_config.get("state_dim", state_dim),
-            action_horizon=lerobot_action_horizon,
-            pad_action_chunk=lerobot_config.get("pad_action_chunk", True)
-        )
-        # LeRobot数据集也按比例分割
-        val_size = int(len(train_dataset) * 0.1)
-        train_size = len(train_dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [train_size, val_size]
-        )
-    else:
-        # 自定义数据集
-        train_dataset = VLADataset(
-            data_path=data_config.get("train_data_path", "./dataset/train"),
-            image_size=image_size,
-            camera_names=camera_names,
-            use_state=use_state,
-            state_dim=state_dim,
-            action_horizon=action_horizon,
-            pad_action_chunk=True  # 如果episode末尾不够action_horizon，使用最后一个动作填充
-        )
-        val_dataset = VLADataset(
-            data_path=data_config.get("val_data_path", "./dataset/val"),
-            image_size=image_size,
-            camera_names=camera_names,
-            use_state=use_state,
-            state_dim=state_dim,
-            action_horizon=action_horizon,
-            pad_action_chunk=True
-        )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=training_config.get("batch_size", 8),
-        shuffle=True,
-        num_workers=data_config.get("num_workers", 4),
-        pin_memory=data_config.get("pin_memory", True),
-        prefetch_factor=data_config.get("prefetch_factor", 2)
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=training_config.get("batch_size", 8),
-        shuffle=False,
-        num_workers=data_config.get("num_workers", 4),
-        pin_memory=data_config.get("pin_memory", True)
-    )
-    
-    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # 统计任务和episode信息（如果可用）
-    if len(train_dataset) > 0:
-        try:
-            sample = train_dataset[0]
-            if "task_name" in sample:
-                tasks = set()
-                episodes = set()
-                for s in train_dataset:
-                    if "task_name" in s:
-                        tasks.add(s["task_name"])
-                    if "episode_id" in s:
-                        episodes.add((s.get("task_name", "unknown"), s["episode_id"]))
-                logger.info(f"Train tasks: {len(tasks)}, Episodes: {len(episodes)}")
-        except Exception as e:
-            # 如果统计失败，忽略
-            pass
-    
-    # 创建优化器和调度器
-    optimizer = create_optimizer(model, training_config)
-    num_training_steps = len(train_loader) * training_config.get("num_epochs", 100)
-    scheduler = create_scheduler(optimizer, training_config, num_training_steps)
-    
-    # 损失函数
-    criterion = nn.MSELoss()
-    
-    # 恢复训练（如果有）
-    start_epoch = 0
-    start_step = 0
-    best_val_loss = float('inf')
-    if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if scheduler and "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        start_step = checkpoint.get("global_step", start_epoch * len(train_loader))
-        best_val_loss = checkpoint.get("loss", float('inf'))
-        logger.info(f"Resuming from epoch {start_epoch}, step {start_step}")
-    
-    # 创建保存目录
-    save_dir = Path(training_config.get("save_dir", "./checkpoints"))
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 训练循环
-    num_epochs = training_config.get("num_epochs", 100)
-    eval_steps = training_config.get("eval_steps", 500)
-    save_steps = training_config.get("save_steps", 1000)
-    
-    # 使用恢复的步数或计算起始步数
-    global_step = start_step
-    last_eval_step = start_step - eval_steps  # 确保第一次评估在正确时机
-    last_save_step = start_step - save_steps  # 确保第一次保存在正确时机
-    
-    for epoch in range(start_epoch, num_epochs):
-        logger.info(f"\n{'='*50}")
-        logger.info(f"Epoch {epoch+1}/{num_epochs}")
-        logger.info(f"{'='*50}")
-        
-        # 训练
-        train_loss, global_step = train_epoch(
-            model, train_loader, optimizer, scheduler,
-            criterion, device, training_config, logger, epoch+1, start_step=global_step
-        )
-        logger.info(f"Train Loss: {train_loss:.4f}")
-        
-        # 验证（基于步数，而不是轮数）
-        if (global_step - last_eval_step >= eval_steps or global_step % eval_steps == 0) or epoch == num_epochs - 1:
-            val_loss = evaluate(model, val_loader, criterion, device, logger)
-            last_eval_step = global_step
-            
-            # 保存最佳模型
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_path = save_dir / "best_model.pt"
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, val_loss, best_model_path, global_step=global_step
-                )
-                logger.info(f"New best model saved! Val Loss: {val_loss:.4f}")
-        
-        # 定期保存检查点（基于步数，而不是轮数）
-        if global_step - last_save_step >= save_steps or global_step % save_steps == 0:
-            checkpoint_path = save_dir / f"checkpoint_step_{global_step}.pt"
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, train_loss, checkpoint_path, global_step=global_step
-            )
-            last_save_step = global_step
-    
-    logger.info("Training completed!")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        print("\n✓ 训练成功完成")
+    except Exception as e:
+        print(f"\n✗ LeRobot训练失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

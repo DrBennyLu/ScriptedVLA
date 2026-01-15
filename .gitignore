@@ -48,6 +48,7 @@ dataset/
 *.h5
 *.hdf5
 *.jpg
+*.png
 
 # OS
 .DS_Store

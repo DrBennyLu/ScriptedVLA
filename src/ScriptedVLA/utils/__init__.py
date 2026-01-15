@@ -10,6 +10,11 @@ from .config import (
     get_inference_config
 )
 from .logger import setup_logger, log_model_info
+from .normalization import (
+    Normalizer,
+    create_normalizer_from_dataset,
+    compute_normalization_stats_from_episodes_stats
+)
 
 __all__ = [
     "load_config",
@@ -18,6 +23,9 @@ __all__ = [
     "get_data_config",
     "get_inference_config",
     "setup_logger",
-    "log_model_info"
+    "log_model_info",
+    "Normalizer",
+    "create_normalizer_from_dataset",
+    "compute_normalization_stats_from_episodes_stats"
 ]
 

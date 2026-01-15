@@ -8,6 +8,7 @@ model:
     image_size: 448  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
+    cache_dir: "./cache/models"  # VLM模型本地缓存路径，如果为null则从HuggingFace下载
   
   # 动作头配置（Flow Matching）
   action_head:
@@ -20,7 +21,7 @@ model:
     # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
     # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
     # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
-    action_horizon: 11  # 默认值，可以根据需要调整
+    action_horizon: 11  # 默认值，可以根据需要调整（实际值会从dataset配置中读取）
     num_inference_timesteps: 50  # Flow Matching推理步数
     patch_size: 16
     num_patches: 196  # 14x14 patches for 224x224 image
@@ -32,7 +33,7 @@ model:
     # future_action_window_size: 未来动作窗口大小
     # 注意：action_horizon = future_action_window_size + 1
     # 如果action_horizon=11，则future_action_window_size=10
-    future_action_window_size: 10  # 默认值，应该等于action_horizon - 1
+    future_action_window_size: 10  # 默认值，应该等于action_horizon - 1（实际值会从dataset配置中计算）
 
 # 训练配置
 training:
@@ -58,104 +59,29 @@ training:
   
   # 保存配置
   save_dir: "./checkpoints"
-  save_steps: 1000
-  eval_steps: 500
+  save_steps: 5000
+  eval_steps: 5000
   logging_steps: 100
+  
+  # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
+  max_steps: 20000
   
   # 混合精度训练
   fp16: false
   bf16: false
 
-# 数据配置
-data:
-  # 数据集类型: "custom", "libero", "act", "lerobot"
-  # "lerobot": 兼容HuggingFace上的开源LeRobot数据集（如lerobot/pusht等）
-  dataset_type: "custom"
+# 数据集配置（LeRobot格式）
+dataset:
+  # 本地数据集路径（可以直接指定，也可以通过命令行参数 --dataset_path 覆盖）
+  local_path: "./dataset/libero_object"
   
-  # 自定义数据集路径（当dataset_type="custom"时使用）
-  train_data_path: "./dataset/train"
-  val_data_path: "./dataset/val"
-  
-  # 相机配置
-  cameras:
-    # 相机名称列表（至少需要2个）
-    names: ["global_img", "left_wrist_img"]
-    # 相机数量（自动从names推断，或手动指定）
-    num_cameras: 2
-  
-  # 机器人状态配置
-  robot_state:
-    # 状态维度（例如：关节位置、速度等）
-    state_dim: 7
-    # 是否使用状态信息
-    use_state: true
-  
-  # 动作配置
-  action:
-    # 动作维度
-    action_dim: 7
-  
-  # LIBERO数据集配置（当dataset_type="libero"时使用）
-  libero:
-    dataset_name: "libero_spatial"  # libero_spatial, libero_object, libero_goal, libero_100
-    dataset_path: "./data/libero"
-    task_names: null  # null表示使用所有任务，或指定任务列表
-    max_episode_length: 100
-  
-  # ACT数据集配置（当dataset_type="act"时使用）
-  act:
-    dataset_path: "./data/act"
-    chunk_size: 1  # 动作块大小
-  
-  # LeRobot数据集配置（当dataset_type="lerobot"时使用）
-  # 兼容HuggingFace上的开源机器人学习数据集
-  lerobot:
-    dataset_path: "lerobot/pusht"  # 可以是HF数据集名称（如"lerobot/pusht"）或本地路径
-    camera_names: ["wrist"]  # LeRobot数据集中的相机名称
-    use_state: true
-    state_dim: null  # null表示从数据中自动推断
-    action_horizon: null  # null表示从模型配置中获取
-    pad_action_chunk: true
-
-# LeRobot训练测试配置（用于test_lerobot_training.py）
-lerobot_test:
-  # 数据集配置
-  dataset:
-    # repo_id: HuggingFace数据集名称或本地数据集名称
-    # 如果是本地路径，repo_id为目录名，root为父目录
-    repo_id: "k1000dai/libero-object-smolvla"  # HF数据集名称
-    # root: 本地数据集根目录（如果repo_id是本地路径，则使用此路径的父目录）
-    root: E:/ScriptedVLA/dataset/libero_object/  # null表示使用HF数据集，或本地路径如"./dataset"
-    # 本地数据集路径（如果使用本地路径，repo_id会被忽略）
-    local_path: "./dataset/libero_object/"  # 本地数据集路径（可选）
-    
-    # action_horizon: 动作序列长度（chunk大小），默认50
-    action_horizon: 50
-    # 图像尺寸
-    image_size: 224
-  
-  # 训练配置
-  training:
-    # 最大训练步数
-    max_steps: 100
-    # 批次大小
-    batch_size: 2
-    # 学习率（如果为null，从training配置中获取）
-    learning_rate: null
-    # 权重衰减（如果为null，从training配置中获取）
-    weight_decay: null
-    # 优化器配置（如果为null，从training配置中获取）
-    optimizer: null
-    # 学习率调度器配置（如果为null，从training配置中获取）
-    scheduler: null
-    # 梯度累积步数（如果为null，从training配置中获取）
-    gradient_accumulation_steps: null
-    # 最大梯度范数（如果为null，从training配置中获取）
-    max_grad_norm: null
+  # 数据集相关参数
+  action_horizon: 50  # 动作序列长度（chunk大小）
+  image_size: 224  # 图像尺寸
   
   # 数据加载器配置
   dataloader:
-    num_workers: 0  # 测试时使用0避免问题
+    num_workers: 0  # 数据加载器工作进程数（Windows上建议使用0）
     pin_memory: false
     shuffle: true
   
@@ -165,12 +91,16 @@ lerobot_test:
     use_batch_task: true
     # 方式2: 从tasks.jsonl文件查询（如果use_batch_task为false或batch中没有task字段）
     use_tasks_jsonl: true  # 作为备选方案
-  
-  # 通用数据加载配置
-  num_workers: 4
-  pin_memory: true
-  prefetch_factor: 2
-  image_size: 224
+
+# 数据配置（用于获取默认状态维度等）
+data:
+  # 机器人状态配置
+  robot_state:
+    # 状态维度（例如：关节位置、速度等）
+    # 如果数据集中包含状态信息，会从数据集中自动获取；否则使用此默认值
+    state_dim: 7
+    # 是否使用状态信息
+    use_state: true
 
 # 推理配置
 inference:
@@ -188,16 +118,6 @@ logging:
 
 # 测试配置（用于test_training.py）
 test:
-  # 测试数据集配置
-  dataset:
-    # 每个数据集创建的episode数量
-    num_episodes: 15
-    # 每个episode的步数
-    steps_per_episode: 50
-    # 任务数量
-    num_tasks: 1
-    # 验证集episode数量（如果为null，则使用num_episodes // 2）
-    val_episodes: null
   
   # 测试模型配置（可以使用较小的配置以加快测试）
   model:
@@ -258,8 +178,16 @@ test:
     # 是否打乱数据
     shuffle: true
   
-  # 数据集配置（用于VLADataset）
+  # 数据集配置（用于创建测试数据集和VLADataset）
   dataset:
+    # 每个数据集创建的episode数量
+    num_episodes: 15
+    # 每个episode的步数
+    steps_per_episode: 50
+    # 任务数量
+    num_tasks: 1
+    # 验证集episode数量（如果为null，则使用num_episodes // 2）
+    val_episodes: null
     # action_horizon（动作序列长度）：从配置中的model.action_head.action_horizon获取
     # 如果未指定，则从test.model.action_head.action_horizon获取
     # 如果仍未指定，则使用默认值4
@@ -270,3 +198,51 @@ test:
   # 临时目录配置（如果为null，则自动创建临时目录）
   temp_dir: ./test_temp
 
+# LeRobot训练测试配置（用于test_lerobot_training.py和test_inference.py）
+lerobot_test:
+  # 数据集配置
+  dataset:
+    # repo_id: HuggingFace数据集名称或本地数据集名称
+    # 如果是本地路径，repo_id为目录名，root为父目录
+    repo_id: "k1000dai/libero-object-smolvla"  # HF数据集名称
+    # root: 本地数据集根目录（如果repo_id是本地路径，则使用此路径的父目录）
+    root: null  # null表示使用HF数据集，或本地路径如"./dataset"
+    # 本地数据集路径（如果使用本地路径，repo_id会被忽略）
+    local_path: "./dataset/libero_object/"  # 本地数据集路径（可选）
+    
+    # action_horizon: 动作序列长度（chunk大小），默认50
+    action_horizon: 50
+    # 图像尺寸
+    image_size: 224
+  
+  # 训练配置
+  training:
+    # 最大训练步数
+    max_steps: 100
+    # 批次大小
+    batch_size: 2
+    # 学习率（如果为null，从training配置中获取）
+    learning_rate: null
+    # 权重衰减（如果为null，从training配置中获取）
+    weight_decay: null
+    # 优化器配置（如果为null，从training配置中获取）
+    optimizer: null
+    # 学习率调度器配置（如果为null，从training配置中获取）
+    scheduler: null
+    # 梯度累积步数（如果为null，从training配置中获取）
+    gradient_accumulation_steps: null
+    # 最大梯度范数（如果为null，从training配置中获取）
+    max_grad_norm: null
+  
+  # 数据加载器配置
+  dataloader:
+    num_workers: 0  # 测试时使用0避免问题
+    pin_memory: false
+    shuffle: true
+  
+  # 任务描述获取方式
+  task_description:
+    # 方式1: 直接从batch["task"]获取（推荐，如果数据集包含此字段）
+    use_batch_task: true
+    # 方式2: 从tasks.jsonl文件查询（如果use_batch_task为false或batch中没有task字段）
+    use_tasks_jsonl: true  # 作为备选方案

@@ -63,7 +63,8 @@ class QwenVLM(nn.Module):
         freeze: bool = False,
         cache_dir: str = None,
         use_state: bool = True,
-        state_dim: int = 7
+        state_dim: int = 7,
+        config: Optional[Dict] = None
     ):
         """
         初始化Qwen VLM模型
@@ -76,8 +77,19 @@ class QwenVLM(nn.Module):
             cache_dir: 模型缓存目录，如果指定则从缓存加载
             use_state: 是否使用机器人本体信息（关节角度等）
             state_dim: 机器人状态维度
+            config: 配置字典（可选），如果提供则优先使用配置字典中的值
         """
         super().__init__()
+        
+        # 如果提供了配置字典，优先使用配置字典中的值
+        if config is not None:
+            model_name = config.get("model_name", model_name)
+            image_size = config.get("image_size", image_size)
+            max_seq_length = config.get("max_seq_length", max_seq_length)
+            freeze = config.get("freeze_vlm", freeze)
+            cache_dir = config.get("cache_dir", cache_dir)
+            use_state = config.get("use_state", use_state)
+            state_dim = config.get("state_dim", state_dim)
         
         self.model_name = model_name
         self.image_size = image_size
@@ -193,6 +205,35 @@ class QwenVLM(nn.Module):
             # 默认值
             self.hidden_dim = 768
             print(f"Warning: Could not determine hidden_dim, using default: {self.hidden_dim}")
+    
+    @classmethod
+    def from_config(cls, config: Dict, use_state: bool = True, state_dim: int = 7):
+        """
+        从配置字典创建QwenVLM实例
+        
+        Args:
+            config: VLM配置字典，应包含以下键：
+                - model_name: HuggingFace模型名称
+                - image_size: 输入图像尺寸
+                - max_seq_length: 最大序列长度
+                - freeze_vlm: 是否冻结VLM参数
+                - cache_dir: 模型缓存目录（可选）
+            use_state: 是否使用机器人本体信息（关节角度等），如果配置中有use_state则优先使用配置中的值
+            state_dim: 机器人状态维度，如果配置中有state_dim则优先使用配置中的值
+            
+        Returns:
+            QwenVLM实例
+        """
+        # 从配置中读取值，如果配置中没有则使用默认值
+        return cls(
+            model_name=config.get("model_name", "Qwen/Qwen2-VL-2B-Instruct"),
+            image_size=config.get("image_size", 224),
+            max_seq_length=config.get("max_seq_length", 512),
+            freeze=config.get("freeze_vlm", False),
+            cache_dir=config.get("cache_dir", None),
+            use_state=config.get("use_state", use_state),
+            state_dim=config.get("state_dim", state_dim)
+        )
         
     def forward(
         self,

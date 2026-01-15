@@ -199,7 +199,7 @@ class DiTBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         use_cross_attention: bool = True,
-        norm_type: str = "layer_norm",  # 'layer_norm' or 'ada_norm'
+        norm_type: str = "ada_norm",  # 'layer_norm' or 'ada_norm'
         norm_elementwise_affine: bool = False,
         norm_eps: float = 1e-5,
         embedding_dim: Optional[int] = None,  # 用于 AdaLayerNorm 的时间嵌入维度
@@ -324,7 +324,7 @@ class FlowMatchingActionHead(nn.Module):
         num_timestep_buckets: int = 1000,
         num_inference_timesteps: int = 50,
         cross_attention_dim: Optional[int] = None,
-        norm_type: str = "layer_norm",  # 'layer_norm' or 'ada_norm'
+        norm_type: str = "ada_norm",  # 'layer_norm' or 'ada_norm'
         norm_elementwise_affine: bool = False,
         norm_eps: float = 1e-5,
         compute_dtype=torch.float32,
@@ -466,8 +466,10 @@ class FlowMatchingActionHead(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.LayerNorm):
-                nn.init.constant_(module.bias, 0)
-                nn.init.constant_(module.weight, 1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
     
     def _normalize_states(self, states: torch.Tensor) -> torch.Tensor:
         """

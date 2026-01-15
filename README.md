@@ -50,7 +50,6 @@ ScriptedVLA/
         │   ├── __init__.py
         │   ├── vlm.py          # Qwen VLM模型
         │   ├── action_head.py  # Flow Matching动作头（包含DiT Block、AdaLayerNorm、TimestepEncoder）
-
         │   └── vla_qwen_groot.py  # Qwen-GR00T VLA模型
         ├── data/                # 数据处理
         │   ├── __init__.py
@@ -511,12 +510,6 @@ A: 项目已实现自动状态维度规范化。如果遇到维度问题，请�
 
 ## 相关文档
 
-- [QUICKSTART.md](QUICKSTART.md) - 快速开始指南
-- [EXAMPLES.md](EXAMPLES.md) - 使用示例
-- [CHANGELOG.md](CHANGELOG.md) - 更新日志
-- [UNIFIED_INPUT_FORMAT.md](UNIFIED_INPUT_FORMAT.md) - 统一输入格式说明
-- [LEROBOT_VERSION_SOLUTION.md](LEROBOT_VERSION_SOLUTION.md) - LeRobot版本解决方案
-- [STATE_DIMENSION_ANALYSIS.md](STATE_DIMENSION_ANALYSIS.md) - 状态维度分析
 - [VLM_EVALUATION.md](VLM_EVALUATION.md) - VLM能力测评指南
 
 ## 致谢
