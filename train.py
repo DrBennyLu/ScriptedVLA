@@ -730,7 +730,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         raise ValueError(f"数据集路径不存在: {dataset_path_obj}")
     
     print(f"  数据集路径: {dataset_path_obj}")
-    dataset_info = load_dataset_info(dataset_path_obj)
+    dataset_info = load_dataset_info(dataset_path_obj)   #TODO:在此处增加数据集归一化
     
     # 从info.json获取信息
     fps = dataset_info.get("fps", 10)
