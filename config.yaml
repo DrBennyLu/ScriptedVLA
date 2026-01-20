@@ -59,12 +59,12 @@ training:
   
   # 保存配置
   save_dir: "./checkpoints"
-  save_steps: 5000
-  eval_steps: 5000
-  logging_steps: 100
+  save_steps: 50    #5000
+  eval_steps: 50    #5000
+  logging_steps: 10 #100
   
   # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
-  max_steps: 20000
+  max_steps: 100    #20000
   
   # 混合精度训练
   fp16: false
@@ -78,6 +78,19 @@ dataset:
   # 数据集相关参数
   action_horizon: 50  # 动作序列长度（chunk大小）
   image_size: 224  # 图像尺寸
+  
+  # 相机配置（从数据集中读取的图像键名）
+  # 单相机示例: ["observation.images.wrist_image"]
+  # 多相机示例: ["observation.images.wrist_image", "observation.images.base_image"]
+  image_keys:
+    - "observation.images.image"
+    - "observation.images.wrist_image"
+  
+  # 状态键名（从数据集中读取的状态键名）
+  state_key: "observation.state"
+  
+  # 动作维度（从配置中直接指定，不再从数据集自动获取）
+  action_dim: 7  # 例如：x, y, z, roll, pitch, yaw, gripper
   
   # 数据加载器配置
   dataloader:
@@ -96,9 +109,8 @@ dataset:
 data:
   # 机器人状态配置
   robot_state:
-    # 状态维度（例如：关节位置、速度等）
-    # 如果数据集中包含状态信息，会从数据集中自动获取；否则使用此默认值
-    state_dim: 7
+    # 状态维度（从配置中直接指定，不再从数据集自动获取）
+    state_dim: 8
     # 是否使用状态信息
     use_state: true
 

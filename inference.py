@@ -32,8 +32,8 @@ from PIL import Image
 import numpy as np
 from typing import Dict, Optional, Union, List
 
-from ScriptedVLA.model import QwenGR00TVLAModel
-from ScriptedVLA.utils import (
+from src.ScriptedVLA.model import QwenGR00TVLAModel
+from src.ScriptedVLA.utils import (
     load_config,
     get_model_config,
     get_inference_config,
@@ -121,7 +121,11 @@ def load_model_from_checkpoint(
     
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    
+    # 严格加载模型状态，如果配置不匹配直接报错
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    print(f"  ✓ Model state loaded successfully")
+    
     model = model.to(device)
     model.eval()
     
@@ -175,22 +179,28 @@ def prepare_images_input(
             return images_dict
     
     # 如果是dict且值已经是tensor
-    if isinstance(images, dict) and isinstance(list(images.values())[0], torch.Tensor):
-        images_dict = {}
-        for cam_name in camera_names:
-            if cam_name in images:
-                img_tensor = images[cam_name]
-                # 确保有batch维度
-                if img_tensor.dim() == 3:  # [C, H, W]
-                    img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
-                images_dict[cam_name] = img_tensor.to(device)
-            else:
-                # 如果某个相机没有提供，使用第一个可用的
-                first_tensor = list(images.values())[0]
-                if first_tensor.dim() == 3:  # [C, H, W]
-                    first_tensor = first_tensor.unsqueeze(0)  # [1, C, H, W]
-                images_dict[cam_name] = first_tensor.to(device)
-        return images_dict
+    if isinstance(images, dict) and len(images) > 0:
+        # 检查第一个值是否是tensor
+        first_value = list(images.values())[0]
+        if isinstance(first_value, torch.Tensor):
+            images_dict = {}
+            for cam_name in camera_names:
+                if cam_name in images:
+                    img_tensor = images[cam_name]
+                    # 确保有batch维度
+                    if img_tensor.dim() == 3:  # [C, H, W]
+                        img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
+                    images_dict[cam_name] = img_tensor.to(device)
+                else:
+                    # 如果某个相机没有提供，使用第一个可用的
+                    if len(images) > 0:
+                        first_tensor = list(images.values())[0]
+                        if first_tensor.dim() == 3:  # [C, H, W]
+                            first_tensor = first_tensor.unsqueeze(0)  # [1, C, H, W]
+                        images_dict[cam_name] = first_tensor.to(device)
+                    else:
+                        raise ValueError(f"Cannot find image for camera {cam_name} and no fallback available")
+            return images_dict
     
     # 如果是字符串路径（单相机）
     if isinstance(images, str):

@@ -47,6 +47,7 @@ from train import (
 )
 import h5py
 import json
+from tqdm import tqdm
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -609,9 +610,10 @@ def test_training_loop(config_path: str = "config.yaml"):
             
         finally:
             # 清理临时目录（如果使用自动创建的临时目录）
-            if temp_dir_config is None and temp_dir.exists():
-                shutil.rmtree(temp_dir)
-                print(f"\n已清理临时目录: {temp_dir}")
+            print(f"暂时不清理临时目录: {temp_dir}")
+            # if temp_dir_config is None and temp_dir.exists():
+            #     shutil.rmtree(temp_dir)
+            #     print(f"\n已清理临时目录: {temp_dir}")
     
     except Exception as e:
         print(f"\n✗ 训练流程测试失败: {e}")
@@ -725,7 +727,7 @@ def train_epoch_with_unified_input(
     return avg_loss, current_step
 
 
-def evaluate_with_unified_input(model, dataloader, criterion, device, logger, normalizer=None):
+def evaluate_with_unified_input(model, dataloader, criterion, device, logger, normalizer=None, max_eval_batches=10):
     """
     适配统一输入格式的评估函数
     基于train.py中的evaluate，使用create_collate_fn处理后的batch格式
@@ -734,14 +736,40 @@ def evaluate_with_unified_input(model, dataloader, criterion, device, logger, no
     注意：模型需要处于训练模式（model.train()）才能计算损失，
     因为QwenGR00TVLAModel的forward方法只在self.training=True且actions提供时才计算损失。
     我们使用torch.no_grad()来禁用梯度计算，这样既不会更新参数，又能计算损失。
+    
+    Args:
+        model: 模型
+        dataloader: 数据加载器
+        criterion: 损失函数（未使用，保持兼容性）
+        device: 设备
+        logger: 日志记录器
+        normalizer: 归一化器（未使用，保持兼容性）
+        max_eval_batches: 最大评估批次数量，用于限制评估时间（默认10）
     """
     # 设置为训练模式以计算损失，但使用no_grad禁用梯度
     model.train()
     total_loss = 0.0
     num_batches = 0
     
+    # 限制评估批次数量，避免评估时间过长
+    total_batches = len(dataloader)
+    eval_batches = min(max_eval_batches, total_batches)
+    
     with torch.no_grad():
-        for batch in dataloader:
+        # 使用 tqdm 显示进度条
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=eval_batches,
+            desc="评估中",
+            unit="batch",
+            leave=False
+        )
+        
+        for batch_idx, batch in pbar:
+            # 限制评估批次数量
+            if batch_idx >= eval_batches:
+                break
+            
             # create_collate_fn已经返回处理好的格式：
             # - images: List[PIL.Image] 或 List[List[PIL.Image]]（已转换）
             # - action: [B, action_horizon, action_dim]（已归一化）
@@ -791,9 +819,13 @@ def evaluate_with_unified_input(model, dataloader, criterion, device, logger, no
             
             total_loss += loss.item()
             num_batches += 1
+            
+            # 更新进度条显示当前损失
+            current_avg_loss = total_loss / num_batches
+            pbar.set_postfix({"loss": f"{current_avg_loss:.4f}"})
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    logger.info(f"Validation Loss: {avg_loss:.4f}")
+    logger.info(f"Validation Loss: {avg_loss:.4f} (评估了 {num_batches}/{total_batches} 个批次)")
     return avg_loss
 
 

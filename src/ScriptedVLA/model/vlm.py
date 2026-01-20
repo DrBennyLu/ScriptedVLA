@@ -469,12 +469,15 @@ class QwenVLM(nn.Module):
         batch_size = len(instructions)
         
         # 处理图像格式
-        if images and isinstance(images[0], list):
-            # 多相机模式：取第一个相机（或可以扩展为融合多个相机）
-            batch_images = [img_list[0] if img_list else None for img_list in images]
+        if images and len(images) > 0:
+            if isinstance(images[0], list):
+                # 多相机模式：取第一个相机（或可以扩展为融合多个相机）
+                batch_images = [img_list[0] if img_list else None for img_list in images]
+            else:
+                # 单相机模式
+                batch_images = images
         else:
-            # 单相机模式
-            batch_images = images
+            raise ValueError(f"Empty images list or None")
         
         # 处理机器人本体信息（如果提供）
         if self.use_state and states is not None:

@@ -299,7 +299,66 @@ class QwenGR00TVLAModel(nn.Module):
         if instructions is None:
             raise ValueError("inputs['instructions'] is required")
         
-        batch_images = images
+        # 转换图像格式：将tensor转换为PIL Image
+        # build_qwenvl_inputs期望List[PIL.Image]或List[List[PIL.Image]]
+        if isinstance(images, dict):
+            # 多相机模式：Dict[str, torch.Tensor] -> List[PIL.Image]
+            # 取第一个相机（或可以扩展为融合多个相机）
+            first_camera = list(images.keys())[0] if images else None
+            if first_camera:
+                img_tensor = images[first_camera]
+                # 确保有batch维度
+                if img_tensor.dim() == 3:  # [C, H, W]
+                    img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
+                elif img_tensor.dim() == 4:
+                    # 已经是 [B, C, H, W] 格式
+                    pass
+                else:
+                    raise ValueError(f"Unexpected image tensor shape: {img_tensor.shape}")
+                
+                # 转换为PIL Image
+                batch_size = img_tensor.shape[0]
+                batch_images = []
+                for i in range(batch_size):
+                    img = img_tensor[i]  # [C, H, W]
+                    # 转换为numpy数组 [H, W, C]
+                    img = img.clamp(0, 1) if img.max() <= 1.0 else img.clamp(0, 255)
+                    if img.max() <= 1.0:
+                        img_np = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                    else:
+                        img_np = img.byte().permute(1, 2, 0).cpu().numpy()
+                    pil_img = Image.fromarray(img_np)
+                    batch_images.append(pil_img)
+            else:
+                raise ValueError("Empty images dict")
+        elif isinstance(images, torch.Tensor):
+            # 单相机模式：torch.Tensor -> List[PIL.Image]
+            # 确保有batch维度
+            if images.dim() == 3:  # [C, H, W]
+                images = images.unsqueeze(0)  # [1, C, H, W]
+            elif images.dim() == 4:
+                # 已经是 [B, C, H, W] 格式
+                pass
+            else:
+                raise ValueError(f"Unexpected images tensor shape: {images.shape}")
+            
+            batch_size = images.shape[0]
+            batch_images = []
+            for i in range(batch_size):
+                img = images[i]  # [C, H, W]
+                # 转换为numpy数组 [H, W, C]
+                img = img.clamp(0, 1) if img.max() <= 1.0 else img.clamp(0, 255)
+                if img.max() <= 1.0:
+                    img_np = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                else:
+                    img_np = img.byte().permute(1, 2, 0).cpu().numpy()
+                pil_img = Image.fromarray(img_np)
+                batch_images.append(pil_img)
+        elif isinstance(images, list):
+            # 已经是PIL Image列表
+            batch_images = images
+        else:
+            raise ValueError(f"Unsupported images type: {type(images)}")
         
         # 统一处理states维度：确保为[B, state_dim]或[B, 1, state_dim]
         if states is not None and self.use_state:

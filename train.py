@@ -104,7 +104,12 @@ def load_tasks_from_jsonl(dataset_path: Path) -> dict:
 
 
 def get_image_keys_from_info(info: dict) -> list:
-    """从info.json的features.observation.images下获取图像键名"""
+    """
+    从info.json的features.observation.images下获取图像键名
+    
+    注意：此函数已弃用，推荐从config.yaml的dataset.image_keys配置中直接读取。
+    保留此函数仅用于向后兼容和测试目的。
+    """
     image_keys = []
     if "features" in info:
         features = info["features"]
@@ -116,7 +121,12 @@ def get_image_keys_from_info(info: dict) -> list:
 
 
 def get_state_key_from_info(info: dict) -> str:
-    """从info.json的features.observation.state下获取状态键名"""
+    """
+    从info.json的features.observation.state下获取状态键名
+    
+    注意：此函数已弃用，推荐从config.yaml的dataset.state_key配置中直接读取。
+    保留此函数仅用于向后兼容和测试目的。
+    """
     if "features" in info and "observation" in info["features"]:
         obs_features = info["features"]["observation"]
         if "state" in obs_features:
@@ -126,7 +136,12 @@ def get_state_key_from_info(info: dict) -> str:
 
 
 def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
-    """从info.json的features.observation.state下获取状态维度"""
+    """
+    从info.json的features.observation.state下获取状态维度
+    
+    注意：此函数已弃用，推荐从config.yaml的data.robot_state.state_dim配置中直接读取。
+    保留此函数仅用于向后兼容和测试目的。
+    """
     if "features" in info:
         features = info["features"]
         if "observation.state" in features:
@@ -142,110 +157,91 @@ def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
     return default_state_dim
 
 
-def create_collate_fn(image_keys=None, state_key=None, tasks_dict=None, image_size=None, use_batch_task=True, normalizer=None):
-    """创建collate函数，处理lerobot返回的batch格式"""
+def _tensor_to_pil_image(img_tensor, image_size=None):
+    """将tensor转换为PIL.Image"""
+    img_tensor = img_tensor.permute(1, 2, 0)
+    img_array = img_tensor.cpu().numpy()
+    
+    # 转换为uint8
+    if img_array.dtype != np.uint8:
+        if img_array.max() <= 1.0:
+            img_array = (img_array * 255).astype(np.uint8)
+        else:
+            img_array = img_array.astype(np.uint8)
+    
+    # 确保是RGB格式
+    if len(img_array.shape) == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    elif img_array.shape[2] == 1:
+        img_array = np.repeat(img_array, 3, axis=2)
+    
+    img_pil = Image.fromarray(img_array)
+    if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
+        img_pil = img_pil.resize((image_size, image_size))
+    return img_pil
+
+
+def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=True, normalizer=None):
+    """
+    创建collate函数，处理lerobot返回的batch格式
+    
+    Args:
+        image_keys: 图像键名列表（从config.yaml读取，例如：["observation.images.wrist_image"]）
+        state_key: 状态键名（从config.yaml读取，例如："observation.state"）
+        image_size: 图像尺寸（可选）
+        use_batch_task: 是否使用batch中的task字段
+        normalizer: 归一化器（可选）
+    """
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
         batch_dict = default_collate(batch_list)
         batch_size = len(batch_list)
         
-        if image_keys:
-            available_image_keys = [k for k in image_keys if k in batch_dict]
-            if not available_image_keys:
-                available_image_keys = [k for k in batch_dict.keys() if 'observation.images' in k.lower()]
-        else:
-            available_image_keys = [k for k in batch_dict.keys() if 'observation.images' in k.lower()]
+        # 验证图像键是否存在
+        missing_keys = [k for k in image_keys if k not in batch_dict]
+        if missing_keys:
+            raise ValueError(f"配置的图像键不存在于batch中: {missing_keys}, 可用键: {list(batch_dict.keys())}")
         
-        if not available_image_keys:
-            raise ValueError(f"无法找到图像数据，可用键: {list(batch_dict.keys())}")
-        
+        # 处理图像：统一处理，根据image_keys数量自动判断单相机/多相机
         images_list = []
-        if len(available_image_keys) == 1:
-            # 单相机：List[PIL.Image]
-            images_tensor = batch_dict[available_image_keys[0]]
-            for i in range(batch_size):
-                img_tensor = images_tensor[i]
-                img_tensor = img_tensor.permute(1, 2, 0)
-                img_array = img_tensor.cpu().numpy()
-                
-                if img_array.dtype != np.uint8:
-                    if img_array.max() <= 1.0:
-                        img_array = (img_array * 255).astype(np.uint8)
-                    else:
-                        img_array = img_array.astype(np.uint8)
-                
-                if len(img_array.shape) == 2:
-                    img_array = np.stack([img_array] * 3, axis=-1)
-                elif img_array.shape[2] == 1:
-                    img_array = np.repeat(img_array, 3, axis=2)
-                
-                img_pil = Image.fromarray(img_array)
-                if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
-                    img_pil = img_pil.resize((image_size, image_size))
-                images_list.append(img_pil)
-        else:
-            # 多相机：List[List[PIL.Image]]
-            for i in range(batch_size):
-                camera_images = []
-                for key in sorted(available_image_keys):
-                    img_tensor = batch_dict[key][i]
-                    img_tensor = img_tensor.permute(1, 2, 0)
-                    img_array = img_tensor.cpu().numpy()
-                    
-                    if img_array.dtype != np.uint8:
-                        if img_array.max() <= 1.0:
-                            img_array = (img_array * 255).astype(np.uint8)
-                        else:
-                            img_array = img_array.astype(np.uint8)
-                    
-                    if len(img_array.shape) == 2:
-                        img_array = np.stack([img_array] * 3, axis=-1)
-                    elif img_array.shape[2] == 1:
-                        img_array = np.repeat(img_array, 3, axis=2)
-                    
-                    img_pil = Image.fromarray(img_array)
-                    if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
-                        img_pil = img_pil.resize((image_size, image_size))
-                    camera_images.append(img_pil)
+        for i in range(batch_size):
+            if len(image_keys) == 1:
+                # 单相机：List[PIL.Image]
+                img_tensor = batch_dict[image_keys[0]][i]
+                images_list.append(_tensor_to_pil_image(img_tensor, image_size))
+            else:
+                # 多相机：List[List[PIL.Image]]
+                camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size) 
+                                for key in image_keys]
                 images_list.append(camera_images)
         
+        # 处理actions：归一化
         actions = batch_dict["action"]
-        # 归一化action
         if normalizer is not None:
             actions = normalizer.normalize_action(actions)
         
+        # 处理states：归一化（如果存在）
         states = None
-        state_key_to_use = state_key if state_key and state_key in batch_dict else "observation.state"
-        if state_key_to_use in batch_dict:
-            states = batch_dict[state_key_to_use]
-            # 归一化state
+        if state_key in batch_dict:
+            states = batch_dict[state_key]
             if normalizer is not None:
                 states = normalizer.normalize_state(states)
         
-        texts = []
+        # 处理文本任务描述
+        # lerobot数据集中的task字段直接返回字符串列表
         if use_batch_task and "task" in batch_dict:
             task_data = batch_dict["task"]
-            if isinstance(task_data, torch.Tensor):
-                if task_data.dtype == torch.int64:
-                    if tasks_dict:
-                        texts = [tasks_dict.get(int(task_data[i].item()), "") for i in range(batch_size)]
-                    else:
-                        texts = [""] * batch_size
-                else:
-                    texts = [str(task_data[i].item()) for i in range(batch_size)]
-            elif isinstance(task_data, list):
-                texts = [str(t) if isinstance(t, str) else (tasks_dict.get(int(t), "") if tasks_dict and isinstance(t, (int, np.integer)) else str(t)) for t in task_data]
-            else:
-                texts = [str(task_data)] * batch_size if not isinstance(task_data, (list, torch.Tensor)) else [""] * batch_size
+            # task字段是字符串列表，直接使用
+            texts = [str(t) for t in task_data] if isinstance(task_data, list) else [str(task_data)] * batch_size
         else:
             texts = [""] * batch_size
         
+        # 构建结果
         result = {
             "images": images_list,
             "text": texts,
             "action": actions,
         }
-        
         if states is not None:
             result["state"] = states
         
@@ -348,40 +344,20 @@ def train_epoch(
     num_batches = 0
     current_step = start_step
     
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    progress_bar = tqdm(
+        dataloader, 
+        desc=f"Epoch {epoch}",
+        unit="batch",
+        leave=True
+    )
     
     for batch_idx, batch in enumerate(progress_bar):
-        # 处理多相机图像
-        if "images" in batch:
-            # 多相机模式：将字典中的每个图像移到设备
-            images = {k: v.to(device) for k, v in batch["images"].items()}
-        elif "image" in batch:
-            # 单相机模式（向后兼容）
-            images = batch["image"].to(device)
-        else:
-            raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
-        
+        # create_collate_fn已经返回处理好的PIL.Image列表格式
+        # 单相机: List[PIL.Image]，多相机: List[List[PIL.Image]]
+        images = batch["images"]
         texts = batch["text"]
-        actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim]（HDF5格式）或 [B, action_dim]（JSON格式）
-        
-        # 处理actions维度：检查是否是action chunk
-        # 如果数据源是JSON格式，可能返回单个动作 [B, action_dim]，需要扩展
-        if actions.dim() == 2:
-            # JSON格式：只有单个动作，需要扩展为action chunk
-            # 注意：这不如真正的action chunk准确，建议使用HDF5格式
-            # 从模型配置获取action_horizon（需要从model中获取）
-            if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
-                action_horizon = model.action_head.action_horizon
-            else:
-                # 如果无法从模型获取，使用默认值
-                action_horizon = 4
-            # [B, action_dim] -> [B, action_horizon, action_dim]
-            actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
-        elif actions.dim() == 3:
-            # HDF5格式：已经是action chunk [B, action_horizon, action_dim]
-            pass
-        else:
-            raise ValueError(f"Unexpected action shape: {actions.shape}, expected [B, action_dim] or [B, action_horizon, action_dim]")
+        # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
+        actions = batch["action"].to(device)
         
         # 处理状态信息（如果存在）
         states = None
@@ -399,14 +375,8 @@ def train_epoch(
             inputs["states"] = states
         outputs = model(inputs=inputs)
         
-            # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
-        if "loss" in outputs:
-            loss = outputs["loss"]
-        elif "action_loss" in outputs:
-            loss = outputs["action_loss"]
-        else:
-            # 如果没有损失，说明是推理模式，不应该发生
-            raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
+        # 模型在训练模式下固定返回action_loss
+        loss = outputs["action_loss"]
         
         # 梯度累积
         loss = loss / config.get("gradient_accumulation_steps", 1)
@@ -431,8 +401,14 @@ def train_epoch(
         total_loss += loss.item() * config.get("gradient_accumulation_steps", 1)
         num_batches += 1
         
-        # 更新进度条
-        progress_bar.set_postfix({"loss": f"{loss.item() * config.get('gradient_accumulation_steps', 1):.4f}"})
+        # 更新进度条，显示更多信息
+        current_avg_loss = total_loss / num_batches
+        current_lr = optimizer.param_groups[0]['lr']
+        progress_bar.set_postfix({
+            "loss": f"{loss.item() * config.get('gradient_accumulation_steps', 1):.4f}",
+            "avg_loss": f"{current_avg_loss:.4f}",
+            "lr": f"{current_lr:.2e}"
+        })
         
         # 日志记录（使用当前步数）
         if current_step % config.get("logging_steps", 100) == 0:
@@ -454,105 +430,69 @@ def train_epoch(
     return avg_loss, current_step
 
 
-def evaluate(model, dataloader, criterion, device, logger):
-    """评估模型"""
-    model.eval()
+def evaluate(model, dataloader, criterion, device, logger, max_eval_batches=50):
+    """
+    评估模型
+    
+    Args:
+        model: 模型
+        dataloader: 数据加载器
+        criterion: 损失函数（未使用，保持兼容性）
+        device: 设备
+        logger: 日志记录器
+        max_eval_batches: 最大评估批次数量，用于限制评估时间（默认50）
+    """
+    model.train()  # 设置为训练模式以计算损失（使用no_grad禁用梯度）
     total_loss = 0.0
     num_batches = 0
     
-    # 按任务和episode统计损失（如果可用）
-    task_losses = {}
-    episode_losses = {}
+    # 限制评估批次数量
+    total_batches = len(dataloader)
+    eval_batches = min(max_eval_batches, total_batches)
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            # 处理多相机图像
-            if "images" in batch:
-                images = {k: v.to(device) for k, v in batch["images"].items()}
-            elif "image" in batch:
-                images = batch["image"].to(device)
-            else:
-                raise ValueError("Batch must contain either 'images' (dict) or 'image' (tensor)")
+        progress_bar = tqdm(
+            enumerate(dataloader),
+            total=eval_batches,
+            desc="评估中",
+            unit="batch",
+            leave=True
+        )
+        
+        for batch_idx, batch in progress_bar:
+            # 限制评估批次数量
+            if batch_idx >= eval_batches:
+                break
             
+            # create_collate_fn已经返回处理好的格式
+            images = batch["images"]
             texts = batch["text"]
-            actions = batch["action"].to(device)  # 应该是 [B, action_horizon, action_dim]（HDF5格式）或 [B, action_dim]（JSON格式）
+            # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
+            actions = batch["action"].to(device)
             
-            # 处理actions维度：检查是否是action chunk
-            if actions.dim() == 2:
-                # JSON格式：只有单个动作，需要扩展为action chunk
-                if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_horizon'):
-                    action_horizon = model.action_head.action_horizon
-                else:
-                    action_horizon = 4
-                actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
-            elif actions.dim() == 3:
-                # HDF5格式：已经是action chunk
-                pass
-            else:
-                raise ValueError(f"Unexpected action shape: {actions.shape}")
-            
-            # 处理状态信息（如果存在）
-            states = None
-            if "state" in batch:
-                states = batch["state"].to(device)
-            
-            # 前向传播（评估模式，但提供actions以计算损失）
-            # 注意：模型需要处于训练模式才能计算损失（QwenGR00TVLAModel的forward方法只在self.training=True时计算损失）
-            # 使用torch.no_grad()禁用梯度，这样既不会更新参数，又能计算损失
-            model.train()  # 设置为训练模式以计算损失
-            # 使用统一输入格式
+            # 准备模型输入
             inputs = {
                 "images": images,
                 "instructions": texts,
                 "actions": actions
             }
-            if states is not None:
-                inputs["states"] = states
+            if "state" in batch:
+                inputs["states"] = batch["state"].to(device)
+            
             outputs = model(inputs=inputs)
             
-            # 获取损失（QwenGR00TVLAModel在训练模式下直接返回loss）
-            if "loss" in outputs:
-                loss = outputs["loss"]
-            elif "action_loss" in outputs:
-                loss = outputs["action_loss"]
-            else:
-                raise ValueError("Model output does not contain loss. Did you forget to provide actions?")
+            # 模型在训练模式下固定返回action_loss
+            loss = outputs["action_loss"]
+            
             total_loss += loss.item()
             num_batches += 1
             
-            # 统计任务和episode级别的损失
-            if "task_name" in batch:
-                task_names = batch["task_name"]
-                if isinstance(task_names, (list, tuple)):
-                    for i, task_name in enumerate(task_names):
-                        if task_name not in task_losses:
-                            task_losses[task_name] = []
-                        task_losses[task_name].append(loss.item())
-                elif isinstance(task_names, str):
-                    if task_names not in task_losses:
-                        task_losses[task_names] = []
-                    task_losses[task_names].append(loss.item())
-            
-            if "episode_id" in batch and "task_name" in batch:
-                episode_ids = batch["episode_id"]
-                task_names = batch["task_name"]
-                if isinstance(episode_ids, (list, tuple)) and isinstance(task_names, (list, tuple)):
-                    for i, (task_name, episode_id) in enumerate(zip(task_names, episode_ids)):
-                        key = (task_name, episode_id)
-                        if key not in episode_losses:
-                            episode_losses[key] = []
-                        episode_losses[key].append(loss.item())
+            # 更新进度条
+            current_avg_loss = total_loss / num_batches
+            progress_bar.set_postfix({"loss": f"{current_avg_loss:.4f}"})
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    logger.info(f"Validation Loss: {avg_loss:.4f}")
-    
-    # 打印任务级别的统计（如果有）
-    if task_losses:
-        logger.info("Task-level losses:")
-        for task_name, losses in sorted(task_losses.items()):
-            avg_task_loss = sum(losses) / len(losses) if losses else 0.0
-            logger.info(f"  {task_name}: {avg_task_loss:.4f} ({len(losses)} samples)")
-    
+    logger.info(f"Validation Loss: {avg_loss:.4f} (评估了 {num_batches}/{total_batches} 个批次)")
     return avg_loss
 
 
@@ -709,7 +649,6 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     
     # 从task_description配置中获取参数
     use_batch_task = task_description_config.get("use_batch_task", True)
-    use_tasks_jsonl = task_description_config.get("use_tasks_jsonl", True)
     
     # 使用config.training中的配置
     merged_training_config = training_config.copy()
@@ -742,10 +681,32 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         raise ValueError(f"数据集路径不存在: {dataset_path_obj}")
     
     print(f"  数据集路径: {dataset_path_obj}")
+    
+    # 2.5. 从配置文件读取数据集参数
+    print(f"\n步骤2.5: 从配置文件读取数据集参数")
+    
+    # 从配置读取相机和维度配置
+    image_keys = dataset_config.get("image_keys", ["observation.images.wrist_image"])
+    if not isinstance(image_keys, list):
+        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+    print(f"  图像键名（从配置）: {image_keys}")
+    
+    state_key = dataset_config.get("state_key", "observation.state")
+    print(f"  状态键名（从配置）: {state_key}")
+    
+    action_dim = dataset_config.get("action_dim", model_config.get("action_head", {}).get("action_dim", 7))
+    print(f"  动作维度（从配置）: {action_dim}")
+    
+    state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
+    print(f"  状态维度（从配置）: {state_dim}")
+    
+    # 从info.json获取fps（仅用于创建delta_timestamps）
     dataset_info = load_dataset_info(dataset_path_obj)
+    fps = dataset_info.get("fps", 10)
+    print(f"  数据集FPS（从info.json）: {fps}")
     
     # 创建归一化器
-    print(f"\n步骤2.5: 创建数据归一化器")
+    print(f"\n步骤2.6: 创建数据归一化器")
     try:
         normalizer = create_normalizer_from_dataset(dataset_path_obj)
         print(f"  ✓ 归一化器创建成功")
@@ -758,28 +719,9 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         print(f"  警告: 将不使用归一化，训练可能不稳定")
         normalizer = None
     
-    # 从info.json获取信息
-    fps = dataset_info.get("fps", 10)
-    print(f"  数据集FPS: {fps}")
-    
-    image_keys = get_image_keys_from_info(dataset_info)
-    print(f"  图像键名: {image_keys}")
-    
-    state_key = get_state_key_from_info(dataset_info)
-    print(f"  状态键名: {state_key}")
-    
-    state_dim = get_state_dim_from_info(dataset_info, default_state_dim=default_state_dim)
-    print(f"  状态维度: {state_dim}")
-    
     # 创建delta_timestamps
     delta_timestamps = create_delta_timestamps(action_horizon, fps)
     print(f"  Action horizon: {action_horizon}")
-    
-    # 加载任务描述
-    tasks_dict = {}
-    if use_tasks_jsonl and (dataset_path_obj / "meta" / "tasks.jsonl").exists():
-        tasks_dict = load_tasks_from_jsonl(dataset_path_obj)
-        print(f"  加载了{len(tasks_dict)}个任务描述")
     
     # 创建LeRobotDataset
     print(f"  创建LeRobotDataset...")
@@ -816,7 +758,6 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
         state_key=state_key,
-        tasks_dict=tasks_dict,
         image_size=image_size,
         use_batch_task=use_batch_task,
         normalizer=normalizer
@@ -839,6 +780,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     vlm_config = model_config.get("vlm", {})
     action_head_config = model_config.get("action_head", {}).copy()
     action_head_config["action_horizon"] = action_horizon
+    action_head_config["action_dim"] = action_dim  # 使用从配置读取的action_dim
     
     vla_config = model_config.get("vla", {}).copy()
     vla_config["future_action_window_size"] = action_horizon - 1
@@ -855,7 +797,14 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     model = model.to(device)
     print(f"  模型已移动到设备: {device}")
     print(f"  Action horizon: {action_horizon}")
+    print(f"  Action dimension: {action_dim}")
     print(f"  State dimension: {state_dim}")
+    
+    # 计算并打印可训练参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  总参数量: {total_params:,} ({total_params / 1e6:.2f}M)")
+    print(f"  可训练参数量: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
     
     # 5. 创建优化器和调度器
     print(f"\n步骤5: 创建优化器和调度器")
@@ -892,7 +841,6 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             custom_collate_fn = create_collate_fn(
                 image_keys=image_keys,
                 state_key=state_key,
-                tasks_dict=tasks_dict,
                 image_size=image_size,
                 use_batch_task=use_batch_task,
                 normalizer=normalizer
@@ -936,26 +884,11 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
         
-        # 准备输入
+        # create_collate_fn已经返回处理好的格式
         images = batch["images"]
         texts = batch["text"]
+        # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
         actions = batch["action"].to(device)
-        
-        # 验证actions维度
-        if actions.ndim != 3:
-            raise ValueError(f"意外的actions维度: {actions.shape}, 期望 [B, action_horizon, action_dim]")
-        if actions.shape[1] != action_horizon:
-            if actions.shape[1] < action_horizon:
-                last_action = actions[:, -1:, :]
-                padding = last_action.repeat(1, action_horizon - actions.shape[1], 1)
-                actions = torch.cat([actions, padding], dim=1)
-            else:
-                actions = actions[:, :action_horizon, :]
-        
-        # 处理状态（如果存在）
-        states = None
-        if "state" in batch:
-            states = batch["state"].to(device)
         
         # 准备模型输入
         inputs = {
@@ -963,19 +896,14 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             "instructions": texts,
             "actions": actions
         }
-        if states is not None:
-            inputs["states"] = states
+        if "state" in batch:
+            inputs["states"] = batch["state"].to(device)
         
         # 前向传播
         outputs = model(inputs=inputs)
         
-        # 获取损失
-        if "action_loss" in outputs:
-            loss = outputs["action_loss"]
-        elif "loss" in outputs:
-            loss = outputs["loss"]
-        else:
-            raise ValueError("模型输出中没有损失值")
+        # 模型在训练模式下固定返回action_loss
+        loss = outputs["action_loss"]
         
         # 反向传播
         loss.backward()

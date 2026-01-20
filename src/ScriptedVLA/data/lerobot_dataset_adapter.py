@@ -106,14 +106,23 @@ class LeRobotDatasetAdapter(Dataset):
     
     def _load_from_local(self):
         """从本地路径加载LeRobot格式数据集"""
-        # 检查是否是LeRobot格式（通常包含info.json和episode_*.hdf5文件）
-        info_file = self.dataset_path / "info.json"
+        # 检查是否是LeRobot格式（通常包含meta/info.json和episode_*.hdf5文件）
+        # LeRobot格式的info.json在meta目录下
+        info_file = self.dataset_path / "meta" / "info.json"
+        
+        # 也检查根目录下的info.json（向后兼容）
+        if not info_file.exists():
+            info_file = self.dataset_path / "info.json"
         
         if info_file.exists():
             # LeRobot格式：从info.json读取元数据，从HDF5文件读取数据
             self.samples = self._load_lerobot_format()
         else:
-            raise ValueError(f"Not a valid LeRobot dataset path: {self.dataset_path}")
+            raise ValueError(
+                f"Not a valid LeRobot dataset path: {self.dataset_path}\n"
+                f"  Expected to find info.json at: {self.dataset_path / 'meta' / 'info.json'}\n"
+                f"  or at: {self.dataset_path / 'info.json'}"
+            )
     
     def _load_lerobot_format(self) -> List[Dict]:
         """
@@ -126,7 +135,11 @@ class LeRobotDatasetAdapter(Dataset):
         转换为VLADataset兼容格式
         """
         samples = []
-        info_file = self.dataset_path / "info.json"
+        # LeRobot格式的info.json在meta目录下
+        info_file = self.dataset_path / "meta" / "info.json"
+        if not info_file.exists():
+            # 向后兼容：也检查根目录
+            info_file = self.dataset_path / "info.json"
         
         with open(info_file, 'r') as f:
             info = json.load(f)
