@@ -142,11 +142,11 @@ test:
     # 动作头配置（测试时使用较小的配置）
     action_head:
       hidden_dim: 768
-      num_layers: 2  # 测试时使用较少的层数
-      num_heads: 8
+      num_layers: 6  # 测试时使用较少的层数
+      num_heads: 12
       action_dim: 7
-      action_horizon: 4
-      num_inference_timesteps: 5
+      action_horizon: 50
+      num_inference_timesteps: 10
     
     # VLA模型配置
     vla:

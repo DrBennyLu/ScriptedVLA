@@ -23,86 +23,170 @@
 # Author: Benny Lu
 """
 VLA模型推理脚本
+从dataset/libero_object读取一帧数据，加载最新checkpoint，进行推理并对比GT
 """
 
 import torch
-import argparse
-from pathlib import Path
-from PIL import Image
 import numpy as np
-from typing import Dict, Optional, Union, List
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import (
     load_config,
     get_model_config,
-    get_inference_config,
     get_data_config,
     Normalizer
 )
+from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
+
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    HAS_LEROBOT = True
+except ImportError:
+    HAS_LEROBOT = False
+    LeRobotDataset = None
 
 
-def load_image(image_path: str, image_size: int = 224) -> torch.Tensor:
-    """
-    加载和预处理图像
+def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """查找最新的检查点文件"""
+    if not checkpoint_dir.exists():
+        return None
     
-    Args:
-        image_path: 图像路径
-        image_size: 图像尺寸
-        
-    Returns:
-        预处理后的图像张量 [1, C, H, W]
-    """
-    image = Image.open(image_path).convert("RGB")
-    image = image.resize((image_size, image_size))
+    checkpoint_files = list(checkpoint_dir.glob("checkpoint_step_*.pt"))
+    if not checkpoint_files:
+        return None
     
-    # 转换为张量并归一化
-    image_array = np.array(image)
-    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).float() / 255.0
+    max_step = 0
+    latest_checkpoint = None
     
-    # 添加batch维度
-    image_tensor = image_tensor.unsqueeze(0)
+    for checkpoint_file in checkpoint_files:
+        try:
+            filename = checkpoint_file.stem
+            step_str = filename.replace("checkpoint_step_", "")
+            step = int(step_str)
+            if step > max_step:
+                max_step = step
+                latest_checkpoint = checkpoint_file
+        except (ValueError, AttributeError):
+            continue
     
-    return image_tensor
+    return latest_checkpoint
+
+
+def load_dataset_frame(
+    dataset_path: str,
+    frame_idx: int = 0,
+    config_path: str = "config.yaml"
+) -> Dict:
+    """从数据集加载一帧数据"""
+    if not HAS_LEROBOT:
+        raise ImportError("lerobot library not installed. Install with: pip install lerobot==0.3.3")
+    
+    config = load_config(config_path)
+    data_config = get_data_config(config)
+    dataset_config = config.get("dataset", {})
+    
+    dataset_dir = Path(dataset_path).resolve()
+    if not dataset_dir.exists():
+        raise ValueError(f"Dataset path does not exist: {dataset_dir}")
+    
+    dataset_info = load_dataset_info(dataset_dir)
+    fps = dataset_info.get("fps", 10)
+    action_horizon = dataset_config.get("action_horizon", 50)
+    delta_timestamps = create_delta_timestamps(action_horizon, fps)
+    
+    dataset_name = dataset_dir.name
+    root_path_str = str(dataset_dir)
+    
+    lerobot_dataset = LeRobotDataset(
+        repo_id=dataset_name,
+        root=root_path_str,
+        delta_timestamps=delta_timestamps
+    )
+    
+    if len(lerobot_dataset) == 0:
+        raise ValueError(f"Dataset is empty: {dataset_path}")
+    
+    if frame_idx >= len(lerobot_dataset):
+        frame_idx = 0
+    
+    sample = lerobot_dataset[frame_idx]
+    
+    # 转换样本格式
+    result = {}
+    
+    # 处理图像
+    images_dict = {}
+    image_keys = [k for k in sample.keys() if k.startswith("observation.images.")]
+    
+    if image_keys:
+        for key in image_keys:
+            camera_name = key.replace("observation.images.", "")
+            img_tensor = sample[key]
+            if isinstance(img_tensor, torch.Tensor):
+                images_dict[camera_name] = img_tensor
+        result["images"] = images_dict if images_dict else {}
+    else:
+        result["images"] = {}
+    
+    # 处理文本指令
+    if "task" in sample:
+        result["text"] = sample["task"]
+    elif "instruction" in sample:
+        result["text"] = sample["instruction"]
+    else:
+        result["text"] = "Perform the task"
+    
+    # 处理动作
+    if "action" in sample:
+        result["action"] = sample["action"]
+    
+    # 处理状态
+    if "observation.state" in sample:
+        result["state"] = sample["observation.state"]
+    elif "observation" in sample and "state" in sample["observation"]:
+        result["state"] = sample["observation"]["state"]
+    elif "state" in sample:
+        result["state"] = sample["state"]
+    
+    return result
 
 
 def load_model_from_checkpoint(
     checkpoint_path: str,
     config_path: str = "config.yaml",
     device: Optional[str] = None
-) -> QwenGR00TVLAModel:
-    """
-    从checkpoint加载模型
-    
-    Args:
-        checkpoint_path: checkpoint文件路径
-        config_path: 配置文件路径
-        device: 设备（"cuda"或"cpu"），如果为None则自动选择
-        
-    Returns:
-        加载好的模型（已设置为eval模式）
-    """
-    # 加载配置
+) -> Tuple[QwenGR00TVLAModel, Optional[Normalizer]]:
+    """从checkpoint加载模型"""
     config = load_config(config_path)
     model_config = get_model_config(config)
     data_config = get_data_config(config)
-    inference_config = get_inference_config(config)
+    dataset_config = config.get("dataset", {})
     
-    # 获取相机和状态配置
-    camera_config = data_config.get("cameras", {})
-    camera_names = camera_config.get("names", ["global_img", "left_wrist_img"])
+    # 获取相机名称：从dataset.image_keys中提取
+    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+    camera_names = []
+    for key in image_keys:
+        if key.startswith("observation.images."):
+            camera_name = key.replace("observation.images.", "")
+            camera_names.append(camera_name)
+    
+    if not camera_names:
+        camera_names = ["global_img", "left_wrist_img"]  # 默认值
+    
+    # 获取状态配置
     robot_state_config = data_config.get("robot_state", {})
     use_state = robot_state_config.get("use_state", True)
     state_dim = robot_state_config.get("state_dim", 7)
     
     # 设置设备
     if device is None:
-        device = inference_config.get("device", "cuda") if torch.cuda.is_available() else "cpu"
-    device = torch.device(device)
-    print(f"Using device: {device}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
     
     # 创建模型
-    print("Loading model...")
     vla_config = model_config.get("vla", {})
     future_action_window_size = vla_config.get("future_action_window_size", 10)
     model = QwenGR00TVLAModel(
@@ -115,201 +199,69 @@ def load_model_from_checkpoint(
     )
     
     # 加载检查点
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
+    checkpoint_path_obj = Path(checkpoint_path)
+    if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # 严格加载模型状态，如果配置不匹配直接报错
+    checkpoint = torch.load(checkpoint_path_obj, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    print(f"  ✓ Model state loaded successfully")
-    
     model = model.to(device)
     model.eval()
     
-    # 加载归一化器（如果存在）
+    # 加载归一化器
     normalizer = None
     if "normalizer" in checkpoint:
         normalizer = Normalizer.from_dict(checkpoint["normalizer"])
-        print(f"Normalizer loaded from checkpoint")
     
     return model, normalizer
 
 
 def prepare_images_input(
-    images: Union[str, Dict[str, str], Dict[str, torch.Tensor], torch.Tensor],
-    camera_names: List[str],
-    image_size: int = 224,
-    device: Optional[torch.device] = None
-) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    准备图像输入（支持单相机和多相机）
-    
-    Args:
-        images: 图像输入，可以是：
-            - str: 单个图像路径（单相机模式）
-            - Dict[str, str]: {camera_name: image_path}（多相机模式）
-            - Dict[str, torch.Tensor]: {camera_name: tensor}（多相机模式，已处理）
-            - torch.Tensor: 单个图像tensor（单相机模式）
-        camera_names: 相机名称列表
-        image_size: 图像尺寸
-        device: 设备
-        
-    Returns:
-        处理后的图像输入（单相机返回tensor，多相机返回dict）
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 如果已经是tensor格式
-    if isinstance(images, torch.Tensor):
-        # 确保有batch维度
-        if images.dim() == 3:  # [C, H, W]
-            images = images.unsqueeze(0)  # [1, C, H, W]
-        images = images.to(device)
-        if len(camera_names) == 1:
-            return images
-        else:
-            # 多相机模式，但只提供了一个tensor，复制到所有相机
-            images_dict = {}
-            for cam_name in camera_names:
-                images_dict[cam_name] = images
-            return images_dict
-    
-    # 如果是dict且值已经是tensor
-    if isinstance(images, dict) and len(images) > 0:
-        # 检查第一个值是否是tensor
-        first_value = list(images.values())[0]
-        if isinstance(first_value, torch.Tensor):
-            images_dict = {}
-            for cam_name in camera_names:
-                if cam_name in images:
-                    img_tensor = images[cam_name]
-                    # 确保有batch维度
-                    if img_tensor.dim() == 3:  # [C, H, W]
-                        img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
-                    images_dict[cam_name] = img_tensor.to(device)
-                else:
-                    # 如果某个相机没有提供，使用第一个可用的
-                    if len(images) > 0:
-                        first_tensor = list(images.values())[0]
-                        if first_tensor.dim() == 3:  # [C, H, W]
-                            first_tensor = first_tensor.unsqueeze(0)  # [1, C, H, W]
-                        images_dict[cam_name] = first_tensor.to(device)
-                    else:
-                        raise ValueError(f"Cannot find image for camera {cam_name} and no fallback available")
-            return images_dict
-    
-    # 如果是字符串路径（单相机）
-    if isinstance(images, str):
-        image = load_image(images, image_size=image_size)
-        image = image.to(device)
-        if len(camera_names) == 1:
-            return image
-        else:
-            # 多相机模式，但只提供了一个图像路径，复制到所有相机
-            images_dict = {}
-            for cam_name in camera_names:
-                images_dict[cam_name] = image
-            return images_dict
-    
-    # 如果是dict且值是路径（多相机）
-    if isinstance(images, dict):
-        images_dict = {}
-        base_path = Path(list(images.values())[0]) if images else None
-        for cam_name in camera_names:
-            if cam_name in images:
-                img_path = images[cam_name]
-            else:
-                # 尝试从基础路径推断
-                if base_path:
-                    possible_paths = [
-                        base_path.parent / f"{cam_name}_{base_path.name}",
-                        base_path.parent / f"{base_path.stem}_{cam_name}{base_path.suffix}",
-                        base_path
-                    ]
-                    img_path = None
-                    for p in possible_paths:
-                        if p.exists():
-                            img_path = str(p)
-                            break
-                    if img_path is None:
-                        img_path = str(base_path)
-                else:
-                    raise ValueError(f"Cannot find image for camera {cam_name}")
-            
-            img_tensor = load_image(img_path, image_size=image_size)
+    images: Dict[str, torch.Tensor],
+    device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """准备图像输入"""
+    images_dict = {}
+    for cam_name, img_tensor in images.items():
+        if isinstance(img_tensor, torch.Tensor):
+            if img_tensor.dim() == 3:  # [C, H, W]
+                img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
             images_dict[cam_name] = img_tensor.to(device)
-        return images_dict
-    
-    raise ValueError(f"Unsupported images type: {type(images)}")
+    return images_dict
 
 
 def run_inference(
     model: QwenGR00TVLAModel,
-    images: Union[str, Dict[str, str], Dict[str, torch.Tensor], torch.Tensor],
-    instructions: Union[str, List[str]],
-    states: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    camera_names: Optional[List[str]] = None,
-    image_size: int = 224,
-    return_full_output: bool = False,
+    images: Dict[str, torch.Tensor],
+    instruction: str,
+    states: Optional[torch.Tensor] = None,
     normalizer: Optional[Normalizer] = None
-) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-    """
-    运行推理
-    
-    Args:
-        model: 已加载的模型
-        images: 图像输入（支持多种格式，见prepare_images_input）
-        instructions: 文本指令（字符串或字符串列表）
-        states: 机器人状态（可选）
-        camera_names: 相机名称列表（如果为None，从模型获取）
-        image_size: 图像尺寸
-        return_full_output: 如果为True，返回完整的输出字典；否则只返回动作数组
-        
-    Returns:
-        如果return_full_output=False: 动作数组 [action_dim] 或 [T, action_dim]
-        如果return_full_output=True: 完整的输出字典
-    """
+) -> np.ndarray:
+    """运行推理"""
     device = next(model.parameters()).device
     
-    # 获取相机名称
-    if camera_names is None:
-        camera_names = model.camera_names
-    
     # 准备图像输入
-    images_input = prepare_images_input(images, camera_names, image_size, device)
-    
-    # 处理指令
-    if isinstance(instructions, str):
-        instructions = [instructions]
+    images_input = prepare_images_input(images, device)
     
     # 处理状态
     if states is not None:
         if not isinstance(states, torch.Tensor):
             states = torch.tensor(np.array(states), dtype=torch.float32)
         states = states.to(device)
-        # 确保有batch维度
         if states.dim() == 1:
             states = states.unsqueeze(0)
     elif model.use_state:
-        # 如果没有提供状态，使用零向量
         states = torch.zeros(1, model.state_dim, device=device)
     
     # 推理
     inputs = {
         "images": images_input,
-        "instructions": instructions,
+        "instructions": [instruction],
         "states": states
     }
     
     with torch.no_grad():
         outputs = model.predict_action(inputs=inputs)
-    
-    if return_full_output:
-        return outputs
     
     # 提取动作
     if "normalized_actions" in outputs:
@@ -319,100 +271,180 @@ def run_inference(
     else:
         raise ValueError("Model output does not contain actions")
     
-    # 如果是tensor，转换为numpy
+    # 转换为numpy
     if isinstance(actions, torch.Tensor):
         actions = actions.cpu().numpy()
     
-    # 反归一化动作（如果提供了归一化器）
+    # 反归一化
     if normalizer is not None:
         actions = normalizer.denormalize_action(actions)
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu().numpy()
     
-    # 取第一个batch的动作
+    # 返回action chunk [T, action_dim]
     if len(actions.shape) == 3:  # [B, T, action_dim]
-        return actions[0, 0, :]  # [action_dim] - 取第一个batch的第一个时间步
-    elif len(actions.shape) == 2:  # [B, action_dim]
-        return actions[0, :]  # [action_dim]
+        return actions[0]  # [T, action_dim]
+    elif len(actions.shape) == 2:  # [B, action_dim] 或 [T, action_dim]
+        if actions.shape[0] == 1:  # [1, action_dim]
+            return actions[0:1]  # [1, action_dim]
+        else:
+            return actions  # [T, action_dim]
     else:
-        return actions[0]  # [action_dim]
+        return actions.reshape(1, -1)  # [1, action_dim]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VLA Model Inference")
+    """主函数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="VLA模型推理：从数据集读取一帧，推理并对比GT")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="./dataset/libero_object",
+        help="数据集路径"
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="./checkpoints",
+        help="检查点目录"
+    )
     parser.add_argument(
         "--config",
         type=str,
         default="config.yaml",
-        help="Path to config file"
+        help="配置文件路径"
     )
     parser.add_argument(
-        "--checkpoint",
+        "--frame_idx",
+        type=int,
+        default=0,
+        help="要测试的帧索引"
+    )
+    parser.add_argument(
+        "--device",
         type=str,
         default=None,
-        help="Path to model checkpoint (overrides config)"
+        help="设备（'cuda'或'cpu'），如果为None则自动选择"
     )
-    parser.add_argument(
-        "--image",
-        type=str,
-        required=True,
-        help="Path to input image"
-    )
-    parser.add_argument(
-        "--text",
-        type=str,
-        default="",
-        help="Text instruction (optional)"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Path to save output action (optional)"
-    )
+    
     args = parser.parse_args()
     
-    # 加载配置
-    config = load_config(args.config)
-    inference_config = get_inference_config(config)
-    model_config = get_model_config(config)
+    print("=" * 60)
+    print("VLA模型推理")
+    print("=" * 60)
     
-    # 加载模型
-    checkpoint_path = args.checkpoint or inference_config.get("checkpoint_path", "./checkpoints/best_model.pt")
-    model, normalizer = load_model_from_checkpoint(checkpoint_path, args.config)
+    # 1. 查找最新checkpoint
+    print("\n[Step 1] 查找最新checkpoint...")
+    checkpoint_dir = Path(args.checkpoint_dir)
+    latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     
-    # 获取图像尺寸
-    image_size = model_config.get("vlm", {}).get("image_size", 224)
+    if latest_checkpoint is None:
+        print(f"  ✗ 未找到checkpoint文件在: {checkpoint_dir}")
+        return
     
-    # 加载图像
-    print(f"Loading image: {args.image}")
-    images_input = args.image
+    print(f"  ✓ 找到最新checkpoint: {latest_checkpoint}")
     
-    # 运行推理
-    print("Running inference...")
-    actions = run_inference(
+    # 2. 加载模型
+    print("\n[Step 2] 加载模型...")
+    model, normalizer = load_model_from_checkpoint(
+        str(latest_checkpoint),
+        args.config,
+        args.device
+    )
+    device = next(model.parameters()).device
+    print(f"  ✓ 模型加载成功，设备: {device}")
+    
+    # 3. 加载数据集帧
+    print("\n[Step 3] 加载数据集帧...")
+    sample = load_dataset_frame(args.dataset, args.frame_idx, args.config)
+    print(f"  ✓ 数据加载成功")
+    print(f"    指令: {sample.get('text', 'N/A')}")
+    
+    # 4. 准备输入
+    images = sample.get("images", {})
+    if not images:
+        print("  ✗ 样本中没有图像数据")
+        return
+    
+    instruction = sample.get("text", "Perform the task")
+    states = sample.get("state")
+    if states is not None and isinstance(states, torch.Tensor):
+        states = states.numpy()
+    
+    # 5. 运行推理
+    print("\n[Step 4] 运行推理...")
+    predicted_actions = run_inference(
         model=model,
-        images=images_input,
-        instructions=args.text if args.text else "",
-        image_size=image_size,
+        images=images,
+        instruction=instruction,
+        states=states,
         normalizer=normalizer
     )
+    print(f"  ✓ 推理成功")
+    print(f"    预测action chunk形状: {predicted_actions.shape}")
     
-    # 打印结果
-    print("\n" + "="*50)
-    print("Predicted Actions:")
-    print("="*50)
+    # 6. 获取GT action chunk
+    print("\n[Step 5] 对比GT和预测...")
+    true_action = sample.get("action")
+    if true_action is None:
+        print("  ✗ 样本中没有action数据")
+        return
+    
+    if isinstance(true_action, torch.Tensor):
+        true_action = true_action.numpy()
+    
+    # 处理GT action维度
+    if len(true_action.shape) == 2:  # [action_horizon, action_dim]
+        true_actions = true_action
+    elif len(true_action.shape) == 1:  # [action_dim]
+        true_actions = true_action.reshape(1, -1)  # [1, action_dim]
+    else:
+        true_actions = true_action.reshape(-1, true_action.shape[-1])
+    
+    # 确保维度匹配
+    min_len = min(len(predicted_actions), len(true_actions))
+    predicted_actions = predicted_actions[:min_len]
+    true_actions = true_actions[:min_len]
+    
+    # 7. 计算并显示对比结果
+    print("\n" + "=" * 60)
+    print("推理结果与GT对比")
+    print("=" * 60)
+    
     action_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-    for name, value in zip(action_names, actions):
-        print(f"  {name:10s}: {value:8.4f}")
-    print("="*50)
+    action_dim = predicted_actions.shape[1]
     
-    # 保存结果（如果需要）
-    if args.output:
-        np.save(args.output, actions)
-        print(f"\nActions saved to: {args.output}")
+    # 逐时间步对比
+    print(f"\n{'Time':>6s} {'Action':>10s} {'Predicted':>12s} {'GT':>12s} {'Diff':>12s}")
+    print("-" * 60)
+    
+    mae_per_dim = np.zeros(action_dim)
+    for t in range(min_len):
+        pred = predicted_actions[t]
+        true = true_actions[t]
+        diff = np.abs(pred - true)
+        mae_per_dim += diff
+        
+        for i, name in enumerate(action_names[:action_dim]):
+            print(f"{t:>6d} {name:>10s} {pred[i]:12.4f} {true[i]:12.4f} {diff[i]:12.4f}")
+    
+    mae_per_dim /= min_len
+    mae_overall = np.mean(mae_per_dim)
+    
+    print("\n" + "-" * 60)
+    print(f"{'MAE per dim':>18s}", end="")
+    for i, name in enumerate(action_names[:action_dim]):
+        print(f" {name:>10s}", end="")
+    print()
+    print(f"{'':>18s}", end="")
+    for mae in mae_per_dim:
+        print(f" {mae:10.4f}", end="")
+    print()
+    print(f"{'Overall MAE':>18s} {mae_overall:10.4f}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-
