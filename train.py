@@ -36,6 +36,7 @@ from tqdm import tqdm
 import os
 import json
 import numpy as np
+import random
 from PIL import Image
 
 from src.ScriptedVLA.model import QwenGR00TVLAModel
@@ -54,6 +55,23 @@ try:
 except ImportError:
     HAS_LEROBOT = False
     LeRobotDataset = None
+
+
+def set_seed(seed: int):
+    """
+    设置随机种子以确保可重复性
+    
+    Args:
+        seed: 随机种子值
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 设置PyTorch的确定性模式（可能会影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def load_dataset_info(dataset_path: Path) -> dict:
@@ -158,16 +176,32 @@ def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
 
 
 def _tensor_to_pil_image(img_tensor, image_size=None):
-    """将tensor转换为PIL.Image"""
+    """
+    将tensor转换为PIL.Image
+    LeRobot数据集返回的图像已经是归一化到0-1的tensor，需要转换为0-255的PIL.Image
+    """
+    # 确保tensor格式为 [C, H, W]
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)  # [1, C, H, W] -> [C, H, W]
+    elif img_tensor.dim() != 3:
+        raise ValueError(f"Unexpected tensor shape: {img_tensor.shape}, expected [C, H, W]")
+    
+    # 转换为numpy数组 [H, W, C]
     img_tensor = img_tensor.permute(1, 2, 0)
     img_array = img_tensor.cpu().numpy()
     
-    # 转换为uint8
+    # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
+    # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
     if img_array.dtype != np.uint8:
-        if img_array.max() <= 1.0:
+        if img_array.max() <= 1.0 and img_array.min() >= 0.0:
+            # 0-1归一化的图像，转换为0-255
             img_array = (img_array * 255).astype(np.uint8)
-        else:
+        elif img_array.max() <= 255.0:
+            # 已经是0-255范围，直接转换类型
             img_array = img_array.astype(np.uint8)
+        else:
+            # 其他情况，先clamp到0-255再转换
+            img_array = np.clip(img_array, 0, 255).astype(np.uint8)
     
     # 确保是RGB格式
     if len(img_array.shape) == 2:
@@ -175,9 +209,9 @@ def _tensor_to_pil_image(img_tensor, image_size=None):
     elif img_array.shape[2] == 1:
         img_array = np.repeat(img_array, 3, axis=2)
     
-    img_pil = Image.fromarray(img_array)
+    img_pil = Image.fromarray(img_array, mode='RGB')
     if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
-        img_pil = img_pil.resize((image_size, image_size))
+        img_pil = img_pil.resize((image_size, image_size), Image.Resampling.LANCZOS)
     return img_pil
 
 
@@ -202,15 +236,15 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
         if missing_keys:
             raise ValueError(f"配置的图像键不存在于batch中: {missing_keys}, 可用键: {list(batch_dict.keys())}")
         
-        # 处理图像：统一处理，根据image_keys数量自动判断单相机/多相机
+        # 处理图像：根据config.yaml中的image_keys数量判断单相机/多相机
+        # 单相机（len(image_keys)==1）：List[PIL.Image]
+        # 多相机（len(image_keys)>1）：List[List[PIL.Image]]
         images_list = []
         for i in range(batch_size):
             if len(image_keys) == 1:
-                # 单相机：List[PIL.Image]
                 img_tensor = batch_dict[image_keys[0]][i]
                 images_list.append(_tensor_to_pil_image(img_tensor, image_size))
             else:
-                # 多相机：List[List[PIL.Image]]
                 camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size) 
                                 for key in image_keys]
                 images_list.append(camera_images)
@@ -626,6 +660,12 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"\n步骤1: 加载配置文件: {config_path}")
     config = load_config(config_path)
     
+    # 设置随机种子
+    seed = config.get("seed", 42)
+    print(f"\n步骤0.5: 设置随机种子: {seed}")
+    set_seed(seed)
+    print(f"  ✓ 随机种子已设置")
+    
     # 获取模型和训练配置
     model_config = get_model_config(config)
     training_config = get_training_config(config)
@@ -645,7 +685,9 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         local_path = dataset_path  # 使用命令行传入的路径
     
     action_horizon = dataset_config.get("action_horizon", 50)
-    image_size = dataset_config.get("image_size", 224)
+    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
+    vlm_config = model_config.get("vlm", {})
+    image_size = vlm_config.get("image_size", 224)
     
     # 从task_description配置中获取参数
     use_batch_task = task_description_config.get("use_batch_task", True)

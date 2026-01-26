@@ -30,6 +30,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import random
 
 from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import (
@@ -39,6 +40,7 @@ from src.ScriptedVLA.utils import (
     Normalizer
 )
 from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
+from PIL import Image
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -46,6 +48,23 @@ try:
 except ImportError:
     HAS_LEROBOT = False
     LeRobotDataset = None
+
+
+def set_seed(seed: int):
+    """
+    设置随机种子以确保可重复性
+    
+    Args:
+        seed: 随机种子值
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 设置PyTorch的确定性模式（可能会影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
@@ -216,17 +235,78 @@ def load_model_from_checkpoint(
     return model, normalizer
 
 
+def tensor_to_pil_image(img_tensor, image_size=None):
+    """
+    将tensor转换为PIL.Image
+    LeRobot数据集返回的图像已经是归一化到0-1的tensor，需要转换为0-255的PIL.Image
+    
+    Args:
+        img_tensor: torch.Tensor, shape [C, H, W] 或 [1, C, H, W]
+        image_size: int, 可选，目标图像尺寸（如果指定，会将图像resize到此尺寸）
+        
+    Returns:
+        PIL.Image: RGB格式的图像
+    """
+    # 确保tensor格式为 [C, H, W]
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)  # [1, C, H, W] -> [C, H, W]
+    elif img_tensor.dim() != 3:
+        raise ValueError(f"Unexpected tensor shape: {img_tensor.shape}, expected [C, H, W]")
+    
+    # 转换为numpy数组 [H, W, C]
+    img_tensor = img_tensor.permute(1, 2, 0)
+    img_array = img_tensor.cpu().numpy()
+    
+    # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
+    # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
+    if img_array.dtype != np.uint8:
+        if img_array.max() <= 1.0 and img_array.min() >= 0.0:
+            # 0-1归一化的图像，转换为0-255
+            img_array = (img_array * 255).astype(np.uint8)
+        elif img_array.max() <= 255.0:
+            # 已经是0-255范围，直接转换类型
+            img_array = img_array.astype(np.uint8)
+        else:
+            # 其他情况，先clamp到0-255再转换
+            img_array = np.clip(img_array, 0, 255).astype(np.uint8)
+    
+    # 确保是RGB格式
+    if len(img_array.shape) == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    elif img_array.shape[2] == 1:
+        img_array = np.repeat(img_array, 3, axis=2)
+    
+    img_pil = Image.fromarray(img_array, mode='RGB')
+    # 如果指定了image_size，resize图像
+    if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
+        img_pil = img_pil.resize((image_size, image_size), Image.Resampling.LANCZOS)
+    return img_pil
+
+
 def prepare_images_input(
     images: Dict[str, torch.Tensor],
-    device: torch.device
-) -> Dict[str, torch.Tensor]:
-    """准备图像输入"""
+    device: torch.device,
+    image_size: Optional[int] = None
+) -> Dict[str, Image.Image]:
+    """
+    准备图像输入，将tensor转换为PIL.Image格式
+    LeRobot数据集返回的图像已经是归一化到0-1的tensor，需要转换为0-255的PIL.Image
+    
+    Args:
+        images: Dict[str, torch.Tensor]，每个相机一个tensor，shape [C, H, W]
+        device: torch.device（未使用，保留以兼容旧代码）
+        image_size: int, 可选，目标图像尺寸（如果指定，会将图像resize到此尺寸）
+        
+    Returns:
+        Dict[str, Image.Image]: 每个相机一个PIL.Image
+    """
     images_dict = {}
     for cam_name, img_tensor in images.items():
         if isinstance(img_tensor, torch.Tensor):
-            if img_tensor.dim() == 3:  # [C, H, W]
-                img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
-            images_dict[cam_name] = img_tensor.to(device)
+            # 将tensor转换为PIL.Image（从0-1归一化转换为0-255），并resize到指定尺寸
+            images_dict[cam_name] = tensor_to_pil_image(img_tensor, image_size=image_size)
+        else:
+            raise ValueError(f"Unexpected image type for camera {cam_name}: {type(img_tensor)}")
     return images_dict
 
 
@@ -234,14 +314,44 @@ def run_inference(
     model: QwenGR00TVLAModel,
     images: Dict[str, torch.Tensor],
     instruction: str,
+    image_keys: list,
     states: Optional[torch.Tensor] = None,
-    normalizer: Optional[Normalizer] = None
+    normalizer: Optional[Normalizer] = None,
+    image_size: Optional[int] = None
 ) -> np.ndarray:
-    """运行推理"""
+    """
+    运行推理
+    
+    Args:
+        model: 模型
+        images: Dict[str, torch.Tensor]，每个相机一个tensor，shape [C, H, W]（LeRobot返回0-1归一化的tensor）
+        instruction: 文本指令
+        image_keys: list，图像键名列表（从config.yaml读取），用于判断单相机/多相机
+        states: 可选的状态信息
+        normalizer: 可选的归一化器
+        image_size: int, 可选，目标图像尺寸（如果指定，会将图像resize到此尺寸）
+        
+    Returns:
+        np.ndarray: 预测的动作
+    """
     device = next(model.parameters()).device
     
-    # 准备图像输入
-    images_input = prepare_images_input(images, device)
+    # 准备图像输入：将0-1归一化的tensor转换为PIL.Image（0-255范围），并resize到指定尺寸
+    images_pil_dict = prepare_images_input(images, device, image_size=image_size)
+    
+    # 根据config.yaml中的image_keys数量判断单相机/多相机
+    # 单相机：List[PIL.Image]，多相机：List[List[PIL.Image]]
+    if len(image_keys) == 1:
+        # 单相机模式
+        images_input = [list(images_pil_dict.values())[0]]
+    else:
+        # 多相机模式：按照image_keys的顺序排列图像
+        camera_names = []
+        for key in image_keys:
+            camera_name = key.replace("observation.images.", "")
+            if camera_name in images_pil_dict:
+                camera_names.append(camera_name)
+        images_input = [[images_pil_dict[name] for name in camera_names]]
     
     # 处理状态
     if states is not None:
@@ -335,6 +445,26 @@ def main():
     print("VLA模型推理")
     print("=" * 60)
     
+    # 加载配置并设置随机种子
+    config = load_config(args.config)
+    seed = config.get("seed", 42)
+    print(f"\n设置随机种子: {seed}")
+    set_seed(seed)
+    print(f"  ✓ 随机种子已设置")
+    
+    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
+    model_config = get_model_config(config)
+    vlm_config = model_config.get("vlm", {})
+    image_size = vlm_config.get("image_size", 224)
+    print(f"\n图像尺寸配置: {image_size}x{image_size}")
+    
+    # 从dataset配置中读取image_keys，用于判断单相机/多相机
+    dataset_config = config.get("dataset", {})
+    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+    if not isinstance(image_keys, list):
+        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+    print(f"图像键名配置: {image_keys} ({'单相机' if len(image_keys) == 1 else '多相机'})")
+    
     # 1. 查找最新checkpoint
     print("\n[Step 1] 查找最新checkpoint...")
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -379,8 +509,10 @@ def main():
         model=model,
         images=images,
         instruction=instruction,
+        image_keys=image_keys,
         states=states,
-        normalizer=normalizer
+        normalizer=normalizer,
+        image_size=image_size
     )
     print(f"  ✓ 推理成功")
     print(f"    预测action chunk形状: {predicted_actions.shape}")

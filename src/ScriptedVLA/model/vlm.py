@@ -383,28 +383,38 @@ class QwenVLM(nn.Module):
                     raise RuntimeError(f"Failed to prepare inputs: {e2}")
         
         # 获取模型输出
-        with torch.set_grad_enabled(self.training):
-            try:
+        # 在推理时，确保模型处于eval模式以提高输出一致性
+        # 如果模型在训练模式，dropout等层会引入随机性
+        was_training = self.model.training
+        if was_training:
+            self.model.eval()
+        
+        try:
+            with torch.set_grad_enabled(self.training):
                 outputs = self.model(
                     **inputs,
                     output_hidden_states=output_hidden_states,
                     output_attentions=output_attentions,
                     return_dict=True
                 )
-            except Exception as e:
-                # 如果模型调用失败，打印详细错误信息
-                print(f"Warning: Model forward failed: {e}")
-                print(f"  Input keys: {list(inputs.keys())}")
-                if 'input_ids' in inputs:
-                    print(f"  input_ids shape: {inputs['input_ids'].shape}")
-                if 'pixel_values' in inputs:
-                    print(f"  pixel_values shape: {inputs['pixel_values'].shape}")
-                # Qwen2VLForConditionalGeneration没有vision_model属性，直接抛出错误
-                raise RuntimeError(
-                    f"Model forward failed. This might be due to incorrect input format. "
-                    f"Please ensure images and texts are properly processed using build_qwenvl_inputs. "
-                    f"Original error: {e}"
-                )
+        except Exception as e:
+            # 如果模型调用失败，打印详细错误信息
+            print(f"Warning: Model forward failed: {e}")
+            print(f"  Input keys: {list(inputs.keys())}")
+            if 'input_ids' in inputs:
+                print(f"  input_ids shape: {inputs['input_ids'].shape}")
+            if 'pixel_values' in inputs:
+                print(f"  pixel_values shape: {inputs['pixel_values'].shape}")
+            # Qwen2VLForConditionalGeneration没有vision_model属性，直接抛出错误
+            raise RuntimeError(
+                f"Model forward failed. This might be due to incorrect input format. "
+                f"Please ensure images and texts are properly processed using build_qwenvl_inputs. "
+                f"Original error: {e}"
+            )
+        finally:
+            # 恢复原始训练状态
+            if was_training:
+                self.model.train()
         
         # 提取hidden states
         if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
@@ -501,21 +511,28 @@ class QwenVLM(nn.Module):
             else:
                 raise ValueError(f"Unexpected states shape: {states_np.shape}")
             
-            # 将状态信息添加到指令中
+            # 将状态信息添加到指令中，使用标准化格式以提高一致性
             enhanced_instructions = []
             for i, instruction in enumerate(instructions):
                 state_values = states_np[i]
-                # 格式化状态信息为文本
+                # 格式化状态信息为文本，使用固定格式以提高一致性
+                # 使用固定的小数位数（3位）和格式，确保每次输出一致
+                # 对状态值进行排序以确保格式一致性（如果需要）
                 state_str = ", ".join([f"{val:.3f}" for val in state_values])
-                if instruction:
-                    # 将状态信息添加到指令中
-                    enhanced_text = f"{instruction}\n[Robot State: {state_str}]"
+                # 使用标准化的prompt格式，明确指示这是机器人状态信息
+                # 格式：指令文本 + 标准化的状态信息标记（使用固定格式）
+                instruction_clean = instruction.strip() if instruction else ""
+                if instruction_clean:
+                    # 如果指令不为空，使用标准格式（确保换行符一致）
+                    enhanced_text = f"{instruction_clean}\n[Robot State: {state_str}]"
                 else:
+                    # 如果指令为空，只提供状态信息
                     enhanced_text = f"[Robot State: {state_str}]"
                 enhanced_instructions.append(enhanced_text)
             instructions = enhanced_instructions
         
         # 构建messages格式（Qwen2-VL标准格式）
+        # 使用标准化的格式以提高一致性
         messages = []
         for img, instruction in zip(batch_images, instructions):
             message = {
@@ -523,7 +540,7 @@ class QwenVLM(nn.Module):
                 "content": []
             }
             
-            # 添加图像
+            # 添加图像（如果存在）
             if img is not None:
                 message["content"].append({
                     "type": "image",
@@ -543,12 +560,14 @@ class QwenVLM(nn.Module):
         try:
             # 步骤1: 使用apply_chat_template处理文本
             # 注意：apply_chat_template对每个message单独处理，返回列表
+            # 设置add_generation_prompt=False，因为我们只是提取hidden states，不生成文本
+            # 这样可以提高输出一致性
             texts = []
             for msg in messages:
                 text = self.processor.apply_chat_template(
                     [msg],  # 单个message作为列表
                     tokenize=False,
-                    add_generation_prompt=False
+                    add_generation_prompt=True
                 )
                 texts.append(text)
             

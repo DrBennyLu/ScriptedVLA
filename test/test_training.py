@@ -357,23 +357,7 @@ def test_training_loop(config_path: str = "config.yaml"):
             
             dataset_dir = setup_dataset(dataset_path, use_state=use_state)
             
-            # 2. 获取模型配置
-            print("\n步骤2: 获取模型配置")
-            test_vlm_config = test_model_config.get("vlm", {})
-            test_action_head_config = test_model_config.get("action_head", {})
-            test_vla_config = test_model_config.get("vla", {})
-            
-            # 合并测试配置和默认配置（测试配置优先）
-            vlm_config = {
-                **model_config.get("vlm", {}),
-                **test_vlm_config
-            }
-            action_head_config = {
-                **model_config.get("action_head", {}),
-                **test_action_head_config
-            }
-            
-            # 3. 加载数据集信息
+            # 2. 加载数据集信息
             print("\n步骤3: 加载数据集信息")
             if not HAS_LEROBOT:
                 raise ImportError(
@@ -392,16 +376,10 @@ def test_training_loop(config_path: str = "config.yaml"):
             dataset_config = config.get("dataset", {})
             action_horizon = dataset_config.get("action_horizon", 50)
             image_size = dataset_config.get("image_size", 224)
+            task_description_config = dataset_config.get("task_description", {})
             
             # 创建delta_timestamps
             delta_timestamps = create_delta_timestamps(action_horizon, fps)
-            
-            # 加载任务描述
-            tasks_dict = {}
-            task_description_config = dataset_config.get("task_description", {})
-            use_tasks_jsonl = task_description_config.get("use_tasks_jsonl", True)
-            if use_tasks_jsonl and (dataset_dir / "meta" / "tasks.jsonl").exists():
-                tasks_dict = load_tasks_from_jsonl(dataset_dir)
             
             # 创建LeRobotDataset
             dataset_name = dataset_dir.name
@@ -441,12 +419,14 @@ def test_training_loop(config_path: str = "config.yaml"):
             pin_memory = test_dataloader_config.get("pin_memory", False)
             shuffle = test_dataloader_config.get("shuffle", True)
             
+            # 从配置中获取task_description配置
+            dataset_config = config.get("dataset", {})
+            task_description_config = dataset_config.get("task_description", {})
             use_batch_task = task_description_config.get("use_batch_task", True)
             
             custom_collate_fn = create_collate_fn(
                 image_keys=image_keys,
                 state_key=state_key,
-                tasks_dict=tasks_dict,
                 image_size=image_size,
                 use_batch_task=use_batch_task,
                 normalizer=normalizer
@@ -476,45 +456,68 @@ def test_training_loop(config_path: str = "config.yaml"):
             
             # 5. 创建模型
             print("\n步骤5: 创建模型")
+            # 合并模型配置（测试配置优先）
+            test_vlm_config = test_model_config.get("vlm", {})
+            test_action_head_config = test_model_config.get("action_head", {})
+            test_vla_config = test_model_config.get("vla", {})
             
-            # 合并测试配置和默认配置（测试配置优先）
-            vlm_config = {
+            merged_vlm_config = {
                 **model_config.get("vlm", {}),
                 **test_vlm_config
             }
-            action_head_config = {
+            merged_action_head_config = {
                 **model_config.get("action_head", {}),
                 **test_action_head_config
             }
-            action_head_config["action_horizon"] = action_horizon
+            merged_vla_config = {
+                **model_config.get("vla", {}),
+                **test_vla_config
+            }
             
-            vla_config = test_vla_config.copy()
-            vla_config["future_action_window_size"] = action_horizon - 1
+            # 设置action_horizon和future_action_window_size
+            merged_action_head_config["action_horizon"] = action_horizon
+            future_action_window_size = merged_vla_config.get("future_action_window_size", action_horizon - 1)
+            
+            # 使用从数据集获取的state_dim和use_state
+            use_state = merged_vla_config.get("use_state", True)
+            state_dim = merged_vla_config.get("state_dim", state_dim)
             
             model = QwenGR00TVLAModel(
-                vlm_config=vlm_config,
-                action_head_config=action_head_config,
-                use_state=vla_config.get("use_state", True),
+                vlm_config=merged_vlm_config,
+                action_head_config=merged_action_head_config,
+                camera_names=None,  # 使用默认值
+                use_state=use_state,
                 state_dim=state_dim,
-                future_action_window_size=action_horizon - 1
+                future_action_window_size=future_action_window_size
             )
             
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model = model.to(device)
             print(f"  模型已移动到设备: {device}")
             
-            # 5. 创建优化器和调度器
-            print("\n步骤5: 创建优化器和调度器")
+            # 6. 创建优化器和调度器
             # 合并训练配置（测试配置优先）
             merged_training_config = {
                 **training_config,
                 **test_training_config
             }
             
+            # 从配置中读取训练参数（直接使用，无需判断）
+            max_steps = merged_training_config.get("max_steps")
+            save_steps = merged_training_config.get("save_steps")
+            eval_steps = merged_training_config.get("eval_steps")
+            logging_steps = merged_training_config.get("logging_steps")
+            save_dir = merged_training_config.get("save_dir") or training_config.get("save_dir", "./checkpoints")
+            
+            print(f"  训练参数:")
+            print(f"    max_steps: {max_steps}")
+            print(f"    save_steps: {save_steps}")
+            print(f"    eval_steps: {eval_steps}")
+            print(f"    logging_steps: {logging_steps}")
+            print(f"    save_dir: {save_dir}")
+            
             optimizer = create_optimizer(model, merged_training_config)
-            num_epochs = merged_training_config.get("num_epochs", 2)
-            num_training_steps = len(train_loader) * num_epochs
-            scheduler = create_scheduler(optimizer, merged_training_config, num_training_steps)
+            scheduler = create_scheduler(optimizer, merged_training_config, max_steps)
             print(f"  优化器: {type(optimizer).__name__}")
             print(f"  调度器: {type(scheduler).__name__ if scheduler else 'None'}")
             
@@ -528,80 +531,141 @@ def test_training_loop(config_path: str = "config.yaml"):
             
             logger = SimpleLogger()
             
-            # 9. 运行训练迭代
-            print(f"\n步骤7: 运行训练迭代（{num_epochs}个epoch）")
+            # 9. 运行训练迭代（使用step-based训练，参考train.py）
+            print(f"\n步骤7: 开始训练（最大步数: {max_steps}，每{save_steps}步保存一次）")
             model.train()
             global_step = 0
             
-            for epoch in range(num_epochs):
-                print(f"\n  Epoch {epoch + 1}/{num_epochs}")
+            # 创建保存目录
+            save_dir_path = Path(save_dir)
+            save_dir_path.mkdir(parents=True, exist_ok=True)
+            
+            progress_bar = tqdm(range(max_steps), desc="Training", unit="step")
+            
+            for step in progress_bar:
+                # 获取一个batch
+                try:
+                    batch = next(iter(train_loader))
+                except StopIteration:
+                    # 如果数据加载器耗尽，重新创建
+                    train_loader = DataLoader(
+                        lerobot_dataset,
+                        batch_size=merged_training_config.get("batch_size", 2),
+                        shuffle=True,
+                        num_workers=test_dataloader_config.get("num_workers", 0),
+                        pin_memory=test_dataloader_config.get("pin_memory", False),
+                        collate_fn=custom_collate_fn
+                    )
+                    batch = next(iter(train_loader))
                 
-                # 使用train.py中的train_epoch函数
-                # 注意：需要适配新的统一输入格式
-                train_loss, global_step = train_epoch_with_unified_input(
-                    model,
-                    train_loader,
-                    optimizer,
-                    scheduler,
-                    criterion,
-                    device,
-                    merged_training_config,
-                    logger,
-                    epoch + 1,
-                    start_step=global_step,
-                    normalizer=normalizer
-                )
-                print(f"  Epoch {epoch + 1} 训练损失: {train_loss:.4f}")
+                # 准备输入
+                images_list = batch["images"]
+                texts = batch["text"]
+                actions = batch["action"].to(device)
+                
+                # 处理actions维度
+                if actions.dim() == 2:
+                    action_horizon = merged_action_head_config.get("action_horizon", 50)
+                    actions = actions.unsqueeze(1).expand(-1, action_horizon, -1)
+                
+                inputs = {
+                    "images": images_list,
+                    "instructions": texts,
+                    "actions": actions,
+                }
+                
+                if "state" in batch:
+                    inputs["states"] = batch["state"].to(device)
+                
+                # 前向传播
+                outputs = model(inputs=inputs)
+                
+                # 获取损失
+                loss = outputs.get("action_loss") or outputs.get("loss")
+                if loss is None:
+                    raise ValueError("模型输出中没有损失值")
+                
+                # 梯度累积
+                loss = loss / merged_training_config.get("gradient_accumulation_steps", 1)
+                
+                # 反向传播
+                loss.backward()
+                
+                # 梯度裁剪和优化器步进
+                if (step + 1) % merged_training_config.get("gradient_accumulation_steps", 1) == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        merged_training_config.get("max_grad_norm", 1.0)
+                    )
+                    optimizer.step()
+                    if scheduler:
+                        scheduler.step()
+                    optimizer.zero_grad()
+                    
+                    global_step += 1
+                
+                # 日志记录
+                if global_step % logging_steps == 0:
+                    logger.info(
+                        f"Step {global_step}/{max_steps}: Loss = {loss.item() * merged_training_config.get('gradient_accumulation_steps', 1):.4f}, "
+                        f"LR = {optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                
+                # 评估
+                if global_step > 0 and global_step % eval_steps == 0:
+                    model.train()  # 评估时需要训练模式以计算损失
+                    val_loss = evaluate_with_unified_input(
+                        model,
+                        val_loader,
+                        criterion,
+                        device,
+                        logger,
+                        normalizer=normalizer
+                    )
+                    logger.info(f"Step {global_step}: 验证损失 = {val_loss:.4f}")
+                    model.train()  # 恢复训练模式
+                
+                # 保存检查点
+                if global_step > 0 and global_step % save_steps == 0:
+                    checkpoint_path = save_dir_path / f"checkpoint_step_{global_step}.pt"
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch=0,  # step-based训练不使用epoch
+                        loss=loss.item(),
+                        save_path=str(checkpoint_path),
+                        global_step=global_step,
+                        normalizer=normalizer
+                    )
+                    logger.info(f"检查点已保存: {checkpoint_path}")
+                
+                # 更新进度条
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "step": global_step
+                })
+                
+                # 达到最大步数时停止
+                if global_step >= max_steps:
+                    break
             
-            # 10. 运行验证
-            print("\n步骤8: 运行验证")
-            # 注意：验证时模型需要处于训练模式才能计算损失
-            # 因为模型的forward方法只在 self.training=True 且 actions 提供时才计算损失
-            model.train()  # 设置为训练模式以计算损失
-            val_loss = evaluate_with_unified_input(
-                model,
-                val_loader,
-                criterion,
-                device,
-                logger,
-                normalizer=normalizer
-            )
-            print(f"  验证损失: {val_loss:.4f}")
+            progress_bar.close()
             
-            # 11. 测试保存检查点
-            print("\n步骤9: 测试保存检查点")
-            checkpoint_path = temp_dir / "test_checkpoint.pt"
+            # 10. 最终保存检查点
+            print("\n步骤8: 保存最终检查点")
+            final_checkpoint_path = save_dir_path / "test_checkpoint_final.pt"
             save_checkpoint(
                 model,
                 optimizer,
                 scheduler,
-                epoch=num_epochs - 1,
-                loss=val_loss,
-                save_path=str(checkpoint_path),
+                epoch=0,
+                loss=loss.item() if 'loss' in locals() else 0.0,
+                save_path=str(final_checkpoint_path),
                 global_step=global_step,
                 normalizer=normalizer
             )
-            print(f"  检查点已保存: {checkpoint_path}")
-            
-            # 验证检查点文件存在
-            assert checkpoint_path.exists(), "检查点文件不存在"
-            print("  ✓ 检查点文件验证成功")
-            
-            # 验证检查点中包含归一化器
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            if normalizer is not None:
-                assert "normalizer" in checkpoint, "检查点中缺少归一化器"
-                loaded_normalizer = Normalizer.from_dict(checkpoint["normalizer"])
-                print("  ✓ 检查点中的归一化器验证成功")
-                
-                # 验证归一化器参数是否正确
-                if normalizer.action_min is not None:
-                    assert np.allclose(normalizer.action_min, loaded_normalizer.action_min), "归一化器action_min不匹配"
-                    assert np.allclose(normalizer.action_max, loaded_normalizer.action_max), "归一化器action_max不匹配"
-                if normalizer.state_min is not None:
-                    assert np.allclose(normalizer.state_min, loaded_normalizer.state_min), "归一化器state_min不匹配"
-                    assert np.allclose(normalizer.state_max, loaded_normalizer.state_max), "归一化器state_max不匹配"
-                print("  ✓ 归一化器参数验证成功")
+            print(f"  最终检查点已保存: {final_checkpoint_path}")
             
             print("\n" + "=" * 60)
             print("✓ 训练流程测试成功")

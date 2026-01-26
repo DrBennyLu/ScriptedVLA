@@ -5,7 +5,7 @@ model:
   # VLM配置（Qwen）
   vlm:
     model_name: "Qwen/Qwen2-VL-2B-Instruct"  # 推荐使用Qwen2-VL-2B-Instruct，或 "Qwen/Qwen-VL-Chat"
-    image_size: 448  # 推荐使用448以获得更好的视觉理解效果
+    image_size: 224  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
     cache_dir: "./cache/models"  # VLM模型本地缓存路径，如果为null则从HuggingFace下载
@@ -21,8 +21,8 @@ model:
     # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
     # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
     # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
-    action_horizon: 11  # 默认值，可以根据需要调整（实际值会从dataset配置中读取）
-    num_inference_timesteps: 50  # Flow Matching推理步数
+    action_horizon: 50  # 默认值，可以根据需要调整（实际值会从dataset配置中读取）
+    num_inference_timesteps: 10  # Flow Matching推理步数
     patch_size: 16
     num_patches: 196  # 14x14 patches for 224x224 image
     
@@ -33,7 +33,10 @@ model:
     # future_action_window_size: 未来动作窗口大小
     # 注意：action_horizon = future_action_window_size + 1
     # 如果action_horizon=11，则future_action_window_size=10
-    future_action_window_size: 10  # 默认值，应该等于action_horizon - 1（实际值会从dataset配置中计算）
+    future_action_window_size: 49  # 默认值，应该等于action_horizon - 1（实际值会从dataset配置中计算）
+
+# 随机种子配置（用于保证训练和推理的可重复性）
+seed: 42
 
 # 训练配置
 training:
@@ -141,7 +144,7 @@ test:
     
     # 动作头配置（测试时使用较小的配置）
     action_head:
-      hidden_dim: 768
+      hidden_dim: 1536
       num_layers: 6  # 测试时使用较少的层数
       num_heads: 12
       action_dim: 7
@@ -151,8 +154,8 @@ test:
     # VLA模型配置
     vla:
       use_state: true
-      state_dim: 7
-      future_action_window_size: 3
+      state_dim: 8
+      future_action_window_size: 49
   
   # 测试训练配置
   training:
@@ -164,6 +167,16 @@ test:
     learning_rate: 1e-4
     # 权重衰减
     weight_decay: 0.01
+    # 最大训练步数（与training.max_steps对齐）
+    max_steps: 100
+    # 保存检查点的间隔步数（与training.save_steps对齐）
+    save_steps: 50
+    # 评估间隔步数（与training.eval_steps对齐）
+    eval_steps: 50
+    # 日志记录间隔步数（与training.logging_steps对齐）
+    logging_steps: 10
+    # 保存目录（如果为null，则使用training.save_dir）
+    save_dir: ./test_temp
     # 优化器配置
     optimizer:
       type: "adamw"
@@ -178,8 +191,6 @@ test:
     gradient_accumulation_steps: 1
     # 最大梯度范数
     max_grad_norm: 1.0
-    # 日志记录步数
-    logging_steps: 10
   
   # 测试数据加载器配置
   dataloader:

@@ -321,13 +321,31 @@ class QwenGR00TVLAModel(nn.Module):
                 batch_images = []
                 for i in range(batch_size):
                     img = img_tensor[i]  # [C, H, W]
+                    # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
                     # 转换为numpy数组 [H, W, C]
-                    img = img.clamp(0, 1) if img.max() <= 1.0 else img.clamp(0, 255)
-                    if img.max() <= 1.0:
-                        img_np = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                    img = img.permute(1, 2, 0).cpu().numpy()
+                    
+                    # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
+                    if img.dtype != np.uint8:
+                        if img.max() <= 1.0 and img.min() >= 0.0:
+                            # 0-1归一化的图像，转换为0-255
+                            img_np = (img * 255).astype(np.uint8)
+                        elif img.max() <= 255.0:
+                            # 已经是0-255范围，直接转换类型
+                            img_np = img.astype(np.uint8)
+                        else:
+                            # 其他情况，先clamp到0-255再转换
+                            img_np = np.clip(img, 0, 255).astype(np.uint8)
                     else:
-                        img_np = img.byte().permute(1, 2, 0).cpu().numpy()
-                    pil_img = Image.fromarray(img_np)
+                        img_np = img
+                    
+                    # 确保是RGB格式
+                    if len(img_np.shape) == 2:
+                        img_np = np.stack([img_np] * 3, axis=-1)
+                    elif img_np.shape[2] == 1:
+                        img_np = np.repeat(img_np, 3, axis=2)
+                    
+                    pil_img = Image.fromarray(img_np, mode='RGB')
                     batch_images.append(pil_img)
             else:
                 raise ValueError("Empty images dict")
@@ -346,13 +364,31 @@ class QwenGR00TVLAModel(nn.Module):
             batch_images = []
             for i in range(batch_size):
                 img = images[i]  # [C, H, W]
+                # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
                 # 转换为numpy数组 [H, W, C]
-                img = img.clamp(0, 1) if img.max() <= 1.0 else img.clamp(0, 255)
-                if img.max() <= 1.0:
-                    img_np = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
+                img = img.permute(1, 2, 0).cpu().numpy()
+                
+                # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
+                if img.dtype != np.uint8:
+                    if img.max() <= 1.0 and img.min() >= 0.0:
+                        # 0-1归一化的图像，转换为0-255
+                        img_np = (img * 255).astype(np.uint8)
+                    elif img.max() <= 255.0:
+                        # 已经是0-255范围，直接转换类型
+                        img_np = img.astype(np.uint8)
+                    else:
+                        # 其他情况，先clamp到0-255再转换
+                        img_np = np.clip(img, 0, 255).astype(np.uint8)
                 else:
-                    img_np = img.byte().permute(1, 2, 0).cpu().numpy()
-                pil_img = Image.fromarray(img_np)
+                    img_np = img
+                
+                # 确保是RGB格式
+                if len(img_np.shape) == 2:
+                    img_np = np.stack([img_np] * 3, axis=-1)
+                elif img_np.shape[2] == 1:
+                    img_np = np.repeat(img_np, 3, axis=2)
+                
+                pil_img = Image.fromarray(img_np, mode='RGB')
                 batch_images.append(pil_img)
         elif isinstance(images, list):
             # 已经是PIL Image列表

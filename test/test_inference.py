@@ -36,12 +36,14 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import yaml
 import tempfile
+import random
+from PIL import Image
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from inference import load_model_from_checkpoint, run_inference
+from inference import load_model_from_checkpoint, run_inference, prepare_images_input
 from src.ScriptedVLA.utils import load_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter
 from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
@@ -54,7 +56,24 @@ except ImportError:
     LeRobotDataset = None
 
 
-def get_test_model_config(config_path: str = "config.yaml", dataset_path: Optional[str] = None) -> str:
+def set_seed(seed: int):
+    """
+    设置随机种子以确保可重复性
+    
+    Args:
+        seed: 随机种子值
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 设置PyTorch的确定性模式（可能会影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_test_model_config(config_path: str = "config.yaml", dataset_path: Optional[str] = None, use_test_config: bool = False) -> str:
     """
     获取应用了测试配置后的临时配置文件路径
     与test_training.py使用相同的配置读取方式，包括从数据集信息中获取state_dim
@@ -62,6 +81,7 @@ def get_test_model_config(config_path: str = "config.yaml", dataset_path: Option
     Args:
         config_path: 原始配置文件路径
         dataset_path: 数据集路径（用于获取state_dim等信息）
+        use_test_config: 是否使用test配置（默认False，直接使用原始配置以确保与训练时一致）
         
     Returns:
         临时配置文件路径（如果使用了测试配置），否则返回原路径
@@ -71,8 +91,9 @@ def get_test_model_config(config_path: str = "config.yaml", dataset_path: Option
     test_model_config = test_config.get("model", {})
     data_config = get_data_config(config)
     
-    # 如果存在测试模型配置，创建临时配置文件
-    if test_model_config:
+    # 只有在明确指定使用测试配置时才应用测试配置
+    # 默认情况下，推理测试应该使用与训练时相同的配置
+    if use_test_config and test_model_config:
         # 合并测试配置（测试配置优先）
         original_model_config = config.get("model", {})
         
@@ -180,7 +201,7 @@ def validate_checkpoint(
         temp_config_path = None
         try:
             # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
-            test_config_path = get_test_model_config(config_path, dataset_path=dataset_path)
+            test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=True)
             if test_config_path != config_path:
                 temp_config_path = test_config_path
             
@@ -390,6 +411,26 @@ def test_inference_from_dataset(
     print("VLA模型单帧推理测试")
     print("=" * 60)
     
+    # 加载配置并设置随机种子
+    config = load_config(config_path)
+    seed = config.get("seed", 42)
+    print(f"\n设置随机种子: {seed}")
+    set_seed(seed)
+    print(f"  ✓ 随机种子已设置")
+    
+    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
+    model_config = get_model_config(config)
+    vlm_config = model_config.get("vlm", {})
+    image_size = vlm_config.get("image_size", 224)
+    print(f"\n图像尺寸配置: {image_size}x{image_size}")
+    
+    # 从dataset配置中读取image_keys，用于判断单相机/多相机
+    dataset_config = config.get("dataset", {})
+    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+    if not isinstance(image_keys, list):
+        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+    print(f"图像键名配置: {image_keys} ({'单相机' if len(image_keys) == 1 else '多相机'})")
+    
     result = {
         "success": False,
         "predicted_actions": None,
@@ -454,7 +495,8 @@ def test_inference_from_dataset(
         # 2. 加载模型checkpoint（使用测试配置，与test_training.py一致）
         print("\n[Step 2] 加载模型checkpoint...")
         # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
-        test_config_path = get_test_model_config(config_path, dataset_path=dataset_path)
+        # 默认不使用测试配置，直接使用原始配置以确保与训练时一致
+        test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
         temp_config_path = None
         if test_config_path != config_path:
             temp_config_path = test_config_path
@@ -462,6 +504,30 @@ def test_inference_from_dataset(
             print(f"  使用测试配置: hidden_dim={config['model']['action_head'].get('hidden_dim', 'unknown')}, num_layers={config['model']['action_head'].get('num_layers', 'unknown')}")
             if "data" in config and "robot_state" in config["data"]:
                 print(f"  state_dim={config['data']['robot_state'].get('state_dim', 'unknown')}")
+            # 重新读取image_keys（使用测试配置）
+            dataset_config = config.get("dataset", {})
+            image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+            if not isinstance(image_keys, list):
+                raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+        else:
+            # 如果没有使用测试配置，确保使用原始config
+            config = load_config(config_path)
+            # 重新读取image_keys（使用原始配置）
+            dataset_config = config.get("dataset", {})
+            image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+            if not isinstance(image_keys, list):
+                raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+        
+        # 从model.vlm.image_size读取图像尺寸（优先使用测试配置中的，如果没有则使用原始配置）
+        model_config = get_model_config(config)
+        vlm_config = model_config.get("vlm", {})
+        image_size = vlm_config.get("image_size", 224)
+        
+        # 从dataset配置中读取image_keys，用于判断单相机/多相机
+        dataset_config = config.get("dataset", {})
+        image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+        if not isinstance(image_keys, list):
+            raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
         
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
@@ -486,43 +552,47 @@ def test_inference_from_dataset(
             result["errors"].append(error_msg)
             return result
         
+        # 根据config.yaml中的image_keys处理图像
+        # LeRobot返回的图像已经是0-1归一化的tensor，保持原样传递给run_inference
+        images_dict = {}
         if isinstance(images, dict):
-            # 多相机模式：转换为tensor dict
-            images_dict = {}
-            for cam_name, img_tensor in images.items():
-                # 确保tensor在正确的设备上
-                if isinstance(img_tensor, torch.Tensor):
-                    # 确保tensor格式正确 [C, H, W] 或 [1, C, H, W]
-                    if img_tensor.dim() == 3:  # [C, H, W]
-                        # 保持 [C, H, W] 格式，prepare_images_input会处理batch维度
-                        images_dict[cam_name] = img_tensor
-                    elif img_tensor.dim() == 4:  # [1, C, H, W] 或 [B, C, H, W]
-                        # 如果是batch格式，取第一个
-                        if img_tensor.shape[0] == 1:
-                            images_dict[cam_name] = img_tensor.squeeze(0)  # [C, H, W]
+            # 从image_keys中提取相机名称，按顺序处理
+            for key in image_keys:
+                camera_name = key.replace("observation.images.", "")
+                if camera_name in images:
+                    img_tensor = images[camera_name]
+                    if isinstance(img_tensor, torch.Tensor):
+                        # 确保tensor格式正确 [C, H, W]
+                        if img_tensor.dim() == 3:  # [C, H, W]
+                            images_dict[camera_name] = img_tensor
+                        elif img_tensor.dim() == 4:  # [1, C, H, W] 或 [B, C, H, W]
+                            if img_tensor.shape[0] == 1:
+                                images_dict[camera_name] = img_tensor.squeeze(0)  # [C, H, W]
+                            else:
+                                images_dict[camera_name] = img_tensor[0]  # [C, H, W]
                         else:
-                            # 多个batch，取第一个
-                            images_dict[cam_name] = img_tensor[0]  # [C, H, W]
+                            raise ValueError(f"Unexpected image tensor shape for camera {camera_name}: {img_tensor.shape}")
                     else:
-                        raise ValueError(f"Unexpected image tensor shape for camera {cam_name}: {img_tensor.shape}")
-                else:
-                    raise ValueError(f"Unexpected image type for camera {cam_name}: {type(img_tensor)}")
-            images_input = images_dict
-        else:
-            # 单相机模式
-            if isinstance(images, torch.Tensor):
-                # 确保格式正确
+                        raise ValueError(f"Unexpected image type for camera {camera_name}: {type(img_tensor)}")
+        elif isinstance(images, torch.Tensor):
+            # 如果images是tensor，且image_keys只有一个，则使用第一个相机名
+            if len(image_keys) == 1:
+                camera_name = image_keys[0].replace("observation.images.", "")
                 if images.dim() == 3:  # [C, H, W]
-                    images_input = images
+                    images_dict[camera_name] = images
                 elif images.dim() == 4:  # [1, C, H, W] 或 [B, C, H, W]
                     if images.shape[0] == 1:
-                        images_input = images.squeeze(0)  # [C, H, W]
+                        images_dict[camera_name] = images.squeeze(0)  # [C, H, W]
                     else:
-                        images_input = images[0]  # [C, H, W]
+                        images_dict[camera_name] = images[0]  # [C, H, W]
                 else:
                     raise ValueError(f"Unexpected images tensor shape: {images.shape}")
             else:
-                raise ValueError(f"Unexpected images type: {type(images)}")
+                raise ValueError(f"当image_keys有多个时，images必须是dict格式")
+        else:
+            raise ValueError(f"Unexpected images type: {type(images)}")
+        
+        images_input = images_dict
         
         # 提取指令
         instruction = sample.get("text", sample.get("instruction", ""))
@@ -539,15 +609,145 @@ def test_inference_from_dataset(
                 states = states.numpy()
             print(f"  State shape: {states.shape if states is not None else None}")
         
-        # 4. 运行推理
-        print("\n[Step 4] 运行推理...")
+        # 4. 显示输入图像和打印chat内容（在输入模型之前）
+        print("\n[Step 4] 显示输入图像和chat内容...")
+        
+        # 准备图像（转换为PIL Image）
+        device_obj = next(model.parameters()).device
+        images_pil_dict = prepare_images_input(images_input, device_obj, image_size=image_size)
+        
+        # 显示图像（最多2张）
+        image_list = list(images_pil_dict.values())
+        num_images_to_show = min(2, len(image_list))
+        
+        if num_images_to_show > 0:
+            fig, axes = plt.subplots(1, num_images_to_show, figsize=(5 * num_images_to_show, 5))
+            if num_images_to_show == 1:
+                axes = [axes]
+            
+            for idx in range(num_images_to_show):
+                img = image_list[idx]
+                camera_name = list(images_pil_dict.keys())[idx]
+                axes[idx].imshow(img)
+                axes[idx].set_title(f"Input Image {idx+1}: {camera_name}", fontsize=10)
+                axes[idx].axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+            print(f"  ✓ 已显示 {num_images_to_show} 张输入图像")
+        
+        # 获取并打印chat内容
+        # 根据image_keys数量判断单相机/多相机
+        if len(image_keys) == 1:
+            # 单相机模式
+            images_for_model = [list(images_pil_dict.values())[0]]
+        else:
+            # 多相机模式：按照image_keys的顺序排列图像
+            camera_names = []
+            for key in image_keys:
+                camera_name = key.replace("observation.images.", "")
+                if camera_name in images_pil_dict:
+                    camera_names.append(camera_name)
+            images_for_model = [[images_pil_dict[name] for name in camera_names]]
+        
+        # 准备状态（转换为tensor）
+        states_tensor = None
+        if states is not None:
+            if not isinstance(states, torch.Tensor):
+                states_tensor = torch.tensor(np.array(states), dtype=torch.float32)
+            else:
+                states_tensor = states
+            states_tensor = states_tensor.to(device_obj)
+            if states_tensor.dim() == 1:
+                states_tensor = states_tensor.unsqueeze(0)
+        elif model.use_state:
+            states_tensor = torch.zeros(1, model.state_dim, device=device_obj)
+        
+        # 调用build_qwenvl_inputs获取chat内容
+        try:
+            qwen_inputs = model.qwen_vl_interface.build_qwenvl_inputs(
+                images=images_for_model,
+                instructions=[instruction],
+                states=states_tensor if model.use_state else None
+            )
+            
+            # 获取处理后的文本（从processor.apply_chat_template的输出）
+            # 我们需要重新构建messages来获取chat内容
+            messages = []
+            enhanced_instruction = instruction
+            
+            # 如果使用状态，需要构建增强的指令
+            if model.use_state and states_tensor is not None:
+                states_np = states_tensor.detach().cpu().numpy()
+                if states_np.ndim == 3:
+                    states_np = states_np[:, 0, :]
+                state_values = states_np[0]
+                state_str = ", ".join([f"{val:.3f}" for val in state_values])
+                if instruction and instruction.strip():
+                    enhanced_instruction = f"{instruction.strip()}\n[Robot State: {state_str}]"
+                else:
+                    enhanced_instruction = f"[Robot State: {state_str}]"
+            
+            # 构建message
+            message = {
+                "role": "user",
+                "content": []
+            }
+            
+            # 添加图像
+            if images_for_model and len(images_for_model) > 0:
+                img = images_for_model[0] if not isinstance(images_for_model[0], list) else images_for_model[0][0]
+                if img is not None:
+                    message["content"].append({
+                        "type": "image",
+                        "image": img
+                    })
+            
+            # 添加文本指令
+            instruction_clean = enhanced_instruction.strip() if enhanced_instruction else ""
+            if not instruction_clean:
+                instruction_clean = "Analyze the image and provide visual understanding."
+            
+            message["content"].append({
+                "type": "text",
+                "text": instruction_clean
+            })
+            
+            messages.append(message)
+            
+            # 使用processor的apply_chat_template获取chat内容
+            if hasattr(model.qwen_vl_interface.processor, 'apply_chat_template'):
+                chat_text = model.qwen_vl_interface.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                print("\n" + "=" * 60)
+                print("输入模型的Chat内容:")
+                print("=" * 60)
+                print(chat_text)
+                print("=" * 60)
+            else:
+                print("\n" + "=" * 60)
+                print("输入模型的指令内容:")
+                print("=" * 60)
+                print(f"Instruction: {instruction_clean}")
+                print("=" * 60)
+            
+        except Exception as e:
+            print(f"  警告: 无法获取chat内容: {e}")
+            print(f"  使用原始指令: {instruction}")
+        
+        # 5. 运行推理
+        print("\n[Step 5] 运行推理...")
         predicted_actions = run_inference(
             model=model,
             images=images_input,
-            instructions=instruction,
+            instruction=instruction,
+            image_keys=image_keys,
             states=states,
-            return_full_output=False,
-            normalizer=normalizer
+            normalizer=normalizer,
+            image_size=image_size
         )
         
         # 验证输出维度
@@ -576,7 +776,7 @@ def test_inference_from_dataset(
         print(f"  ✓ 推理成功")
         print(f"    预测动作维度: {pred_action.shape}")
         
-        # 5. 显示结果并比较
+        # 6. 显示结果并比较
         print("\n" + "=" * 60)
         print("推理结果与GT比较")
         print("=" * 60)
@@ -782,6 +982,26 @@ def test_episode_inference_with_3d_visualization(
     print("VLA模型Episode推理测试（3D可视化）")
     print("=" * 60)
     
+    # 加载配置并设置随机种子
+    config = load_config(config_path)
+    seed = config.get("seed", 42)
+    print(f"\n设置随机种子: {seed}")
+    set_seed(seed)
+    print(f"  ✓ 随机种子已设置")
+    
+    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
+    model_config = get_model_config(config)
+    vlm_config = model_config.get("vlm", {})
+    image_size = vlm_config.get("image_size", 224)
+    print(f"\n图像尺寸配置: {image_size}x{image_size}")
+    
+    # 从dataset配置中读取image_keys，用于判断单相机/多相机
+    dataset_config = config.get("dataset", {})
+    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+    if not isinstance(image_keys, list):
+        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
+    print(f"图像键名配置: {image_keys} ({'单相机' if len(image_keys) == 1 else '多相机'})")
+    
     result = {
         "success": False,
         "episode_id": episode_id,
@@ -806,7 +1026,8 @@ def test_episode_inference_with_3d_visualization(
         # 2. 加载模型（使用测试配置，与test_training.py一致）
         print("\n[Step 2] 加载模型...")
         # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
-        test_config_path = get_test_model_config(config_path, dataset_path=dataset_path)
+        # 默认不使用测试配置，直接使用原始配置以确保与训练时一致
+        test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
         temp_config_path = None
         if test_config_path != config_path:
             temp_config_path = test_config_path
@@ -814,6 +1035,20 @@ def test_episode_inference_with_3d_visualization(
             print(f"  使用测试配置: hidden_dim={config['model']['action_head'].get('hidden_dim', 'unknown')}, num_layers={config['model']['action_head'].get('num_layers', 'unknown')}")
             if "data" in config and "robot_state" in config["data"]:
                 print(f"  state_dim={config['data']['robot_state'].get('state_dim', 'unknown')}")
+        else:
+            # 如果没有使用测试配置，确保使用原始config
+            config = load_config(config_path)
+        
+        # 从model.vlm.image_size读取图像尺寸（优先使用测试配置中的，如果没有则使用原始配置）
+        model_config = get_model_config(config)
+        vlm_config = model_config.get("vlm", {})
+        image_size = vlm_config.get("image_size", 224)
+        
+        # 从dataset配置中读取image_keys，用于判断单相机/多相机
+        dataset_config = config.get("dataset", {})
+        image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+        if not isinstance(image_keys, list):
+            raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
         
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
@@ -840,19 +1075,37 @@ def test_episode_inference_with_3d_visualization(
             if frame_idx % 10 == 0:
                 print(f"  处理帧 {frame_idx + 1}/{len(episode_frames)}...")
             
-            # 提取图像
+            # 根据config.yaml中的image_keys处理图像
+            # LeRobot返回的图像已经是0-1归一化的tensor，保持原样传递给run_inference
             images = sample.get("images", {})
+            images_dict = {}
             if isinstance(images, dict):
-                images_dict = {}
-                for cam_name, img_tensor in images.items():
-                    if isinstance(img_tensor, torch.Tensor):
-                        images_dict[cam_name] = img_tensor.to(device_obj)
-                images_input = images_dict
-            else:
-                if isinstance(images, torch.Tensor):
-                    images_input = images.to(device_obj)
+                # 从image_keys中提取相机名称，按顺序处理
+                for key in image_keys:
+                    camera_name = key.replace("observation.images.", "")
+                    if camera_name in images:
+                        img_tensor = images[camera_name]
+                        if isinstance(img_tensor, torch.Tensor):
+                            # 确保格式为 [C, H, W]
+                            if img_tensor.dim() == 4:
+                                img_tensor = img_tensor.squeeze(0)  # [1, C, H, W] -> [C, H, W]
+                            images_dict[camera_name] = img_tensor.cpu()  # 保持在CPU，run_inference会处理
+            elif isinstance(images, torch.Tensor):
+                # 如果images是tensor，且image_keys只有一个，则使用第一个相机名
+                if len(image_keys) == 1:
+                    camera_name = image_keys[0].replace("observation.images.", "")
+                    if images.dim() == 4:
+                        images = images.squeeze(0)  # [1, C, H, W] -> [C, H, W]
+                    images_dict[camera_name] = images.cpu()  # 保持在CPU，run_inference会处理
                 else:
-                    continue
+                    continue  # 多相机模式但images是tensor，跳过
+            else:
+                continue  # 未知格式，跳过
+            
+            if not images_dict:
+                continue  # 没有有效的图像，跳过
+            
+            images_input = images_dict
             
             # 提取指令
             instruction = sample.get("text", sample.get("instruction", "Perform the task"))
@@ -864,15 +1117,126 @@ def test_episode_inference_with_3d_visualization(
                 if isinstance(states, torch.Tensor):
                     states = states.numpy()
             
+            # 显示输入图像和打印chat内容（仅对第一帧）
+            if frame_idx == 0:
+                print(f"\n  [帧 {frame_idx + 1}] 显示输入图像和chat内容...")
+                
+                # 准备图像（转换为PIL Image）
+                images_pil_dict = prepare_images_input(images_input, device_obj, image_size=image_size)
+                
+                # 显示图像（最多2张）
+                image_list = list(images_pil_dict.values())
+                num_images_to_show = min(2, len(image_list))
+                
+                if num_images_to_show > 0:
+                    fig, axes = plt.subplots(1, num_images_to_show, figsize=(5 * num_images_to_show, 5))
+                    if num_images_to_show == 1:
+                        axes = [axes]
+                    
+                    for idx in range(num_images_to_show):
+                        img = image_list[idx]
+                        camera_name = list(images_pil_dict.keys())[idx]
+                        axes[idx].imshow(img)
+                        axes[idx].set_title(f"Input Image {idx+1}: {camera_name}", fontsize=10)
+                        axes[idx].axis('off')
+                    
+                    plt.tight_layout()
+                    plt.show()
+                    print(f"    ✓ 已显示 {num_images_to_show} 张输入图像")
+                
+                # 获取并打印chat内容
+                if len(image_keys) == 1:
+                    images_for_model = [list(images_pil_dict.values())[0]]
+                else:
+                    camera_names = []
+                    for key in image_keys:
+                        camera_name = key.replace("observation.images.", "")
+                        if camera_name in images_pil_dict:
+                            camera_names.append(camera_name)
+                    images_for_model = [[images_pil_dict[name] for name in camera_names]]
+                
+                # 准备状态（转换为tensor）
+                states_tensor = None
+                if states is not None:
+                    if not isinstance(states, torch.Tensor):
+                        states_tensor = torch.tensor(np.array(states), dtype=torch.float32)
+                    else:
+                        states_tensor = states
+                    states_tensor = states_tensor.to(device_obj)
+                    if states_tensor.dim() == 1:
+                        states_tensor = states_tensor.unsqueeze(0)
+                elif model.use_state:
+                    states_tensor = torch.zeros(1, model.state_dim, device=device_obj)
+                
+                # 调用build_qwenvl_inputs获取chat内容
+                try:
+                    enhanced_instruction = instruction
+                    if model.use_state and states_tensor is not None:
+                        states_np = states_tensor.detach().cpu().numpy()
+                        if states_np.ndim == 3:
+                            states_np = states_np[:, 0, :]
+                        state_values = states_np[0]
+                        state_str = ", ".join([f"{val:.3f}" for val in state_values])
+                        if instruction and instruction.strip():
+                            enhanced_instruction = f"{instruction.strip()}\n[Robot State: {state_str}]"
+                        else:
+                            enhanced_instruction = f"[Robot State: {state_str}]"
+                    
+                    message = {
+                        "role": "user",
+                        "content": []
+                    }
+                    
+                    if images_for_model and len(images_for_model) > 0:
+                        img = images_for_model[0] if not isinstance(images_for_model[0], list) else images_for_model[0][0]
+                        if img is not None:
+                            message["content"].append({
+                                "type": "image",
+                                "image": img
+                            })
+                    
+                    instruction_clean = enhanced_instruction.strip() if enhanced_instruction else ""
+                    if not instruction_clean:
+                        instruction_clean = "Analyze the image and provide visual understanding."
+                    
+                    message["content"].append({
+                        "type": "text",
+                        "text": instruction_clean
+                    })
+                    
+                    messages = [message]
+                    
+                    if hasattr(model.qwen_vl_interface.processor, 'apply_chat_template'):
+                        chat_text = model.qwen_vl_interface.processor.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=False
+                        )
+                        print("\n    " + "=" * 56)
+                        print("    输入模型的Chat内容:")
+                        print("    " + "=" * 56)
+                        print(f"    {chat_text}")
+                        print("    " + "=" * 56)
+                    else:
+                        print("\n    " + "=" * 56)
+                        print("    输入模型的指令内容:")
+                        print("    " + "=" * 56)
+                        print(f"    Instruction: {instruction_clean}")
+                        print("    " + "=" * 56)
+                except Exception as e:
+                    print(f"    警告: 无法获取chat内容: {e}")
+                    print(f"    使用原始指令: {instruction}")
+            
             # 运行推理
             try:
                 predicted_action = run_inference(
                     model=model,
                     images=images_input,
-                    instructions=instruction,
+                    instruction=instruction,
+                    image_keys=image_keys,
                     states=states,
-                    return_full_output=False,
-                    normalizer=normalizer
+                    normalizer=normalizer,
+                    image_size=image_size
                 )
                 
                 # 提取x, y, z（前三维）
@@ -1127,6 +1491,13 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # 加载配置并设置随机种子
+    config = load_config(args.config)
+    seed = config.get("seed", 42)
+    print(f"设置随机种子: {seed}")
+    set_seed(seed)
+    print(f"  ✓ 随机种子已设置")
     
     # 检查数据集路径
     dataset_path = Path(args.dataset)

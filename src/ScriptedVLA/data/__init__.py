@@ -8,7 +8,6 @@ from .dataset import (
     filter_dataset_by_hierarchy,
     get_dataset_statistics
 )
-from .download_datasets import download_dataset, download_libero_dataset, download_act_dataset
 from .libero_dataset import LIBERODataset, create_libero_dataset_from_config
 from .act_dataset import ACTDataset, create_act_dataset_from_config
 try:
@@ -24,9 +23,6 @@ __all__ = [
     "create_dummy_dataset",
     "filter_dataset_by_hierarchy",
     "get_dataset_statistics",
-    "download_dataset",
-    "download_libero_dataset",
-    "download_act_dataset",
     "LIBERODataset",
     "create_libero_dataset_from_config",
     "ACTDataset",
