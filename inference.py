@@ -162,12 +162,14 @@ def load_dataset_frame(
         result["action"] = sample["action"]
     
     # 处理状态
+    # lerobot数据集的状态数据保存在observation.state键下
     if "observation.state" in sample:
         result["state"] = sample["observation.state"]
     elif "observation" in sample and "state" in sample["observation"]:
         result["state"] = sample["observation"]["state"]
     elif "state" in sample:
         result["state"] = sample["state"]
+    # 注意：如果没有找到状态数据，result中不会有"state"键，这是正常的
     
     return result
 

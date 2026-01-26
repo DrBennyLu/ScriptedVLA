@@ -37,6 +37,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import yaml
 import tempfile
 import random
+import gc
 from PIL import Image
 
 # 添加项目根目录到路径
@@ -181,13 +182,17 @@ def validate_checkpoint(
         
         info["checkpoint_exists"] = True
         
-        # 加载checkpoint
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device(device)
+        # 加载checkpoint（验证时使用CPU，避免占用GPU显存）
+        # 注意：验证时使用CPU加载checkpoint，实际推理时会使用GPU
+        validation_device = torch.device("cpu")
         
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # 在验证前清理显存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # 强制同步，确保显存释放
+            torch.cuda.synchronize()
+        
+        checkpoint = torch.load(checkpoint_path, map_location=validation_device)
         info["checkpoint_keys"] = list(checkpoint.keys())
         
         # 验证必需的键
@@ -198,31 +203,54 @@ def validate_checkpoint(
             return False, info
         
         # 尝试加载模型（使用测试配置，与test_training.py一致）
+        # 注意：验证时使用CPU加载模型，避免占用GPU显存
         temp_config_path = None
+        model = None
         try:
             # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
             test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=True)
             if test_config_path != config_path:
                 temp_config_path = test_config_path
             
-            model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
-            info["model_loaded"] = True
-            info["normalizer_loaded"] = normalizer is not None
-            info["model_type"] = type(model).__name__
+            # 验证时使用CPU加载模型，避免占用GPU显存
+            # 这样可以确保验证过程不会影响后续的GPU推理
+            validation_device = torch.device("cpu")
             
-            # 获取模型维度信息
-            if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_dim'):
-                info["action_dim"] = model.action_head.action_dim
-            elif hasattr(model, 'action_dim'):
-                info["action_dim"] = model.action_dim
-            
-            if hasattr(model, 'state_dim'):
-                info["state_dim"] = model.state_dim
+            # 加载模型以验证（使用torch.no_grad()和CPU节省显存）
+            with torch.no_grad():
+                model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, str(validation_device))
+                info["model_loaded"] = True
+                info["normalizer_loaded"] = normalizer is not None
+                info["model_type"] = type(model).__name__
+                
+                # 获取模型维度信息
+                if hasattr(model, 'action_head') and hasattr(model.action_head, 'action_dim'):
+                    info["action_dim"] = model.action_head.action_dim
+                elif hasattr(model, 'action_dim'):
+                    info["action_dim"] = model.action_dim
+                
+                if hasattr(model, 'state_dim'):
+                    info["state_dim"] = model.state_dim
                 
         except Exception as e:
             info["errors"].append(f"模型加载失败: {str(e)}")
             return False, info
         finally:
+            # 释放模型以节省显存
+            if model is not None:
+                # 确保模型在CPU上，然后删除
+                try:
+                    model = model.cpu()
+                except:
+                    pass
+                del model
+                # 清理CPU和GPU缓存
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    # 强制同步，确保显存释放
+                    torch.cuda.synchronize()
             # 清理临时配置文件
             if temp_config_path and Path(temp_config_path).exists():
                 Path(temp_config_path).unlink()
@@ -364,10 +392,34 @@ def load_dataset_frame(
         result["action"] = sample["action"]
     
     # 处理状态
-    if "observation" in sample and "state" in sample["observation"]:
+    # lerobot数据集的状态数据保存在observation.state键下
+    if "observation.state" in sample:
+        result["state"] = sample["observation.state"]
+        print(f"  ✓ 从 'observation.state' 键提取状态数据")
+    elif "observation" in sample and "state" in sample["observation"]:
         result["state"] = sample["observation"]["state"]
+        print(f"  ✓ 从 'observation.state' 嵌套键提取状态数据")
     elif "state" in sample:
         result["state"] = sample["state"]
+        print(f"  ✓ 从 'state' 键提取状态数据")
+    else:
+        print(f"  ⚠️  警告: 无法找到状态数据，可用键: {list(sample.keys())}")
+    
+    # 调试：打印状态数据信息
+    if "state" in result:
+        state_data = result["state"]
+        if isinstance(state_data, torch.Tensor):
+            print(f"  状态数据形状: {state_data.shape}")
+            print(f"  状态数据范围: [{state_data.min().item():.4f}, {state_data.max().item():.4f}]")
+            print(f"  状态数据均值: {state_data.mean().item():.4f}")
+            if state_data.numel() > 0 and state_data.abs().sum().item() < 1e-6:
+                print(f"  ⚠️  警告: 状态数据全为0，可能数据提取有问题")
+        elif isinstance(state_data, np.ndarray):
+            print(f"  状态数据形状: {state_data.shape}")
+            print(f"  状态数据范围: [{state_data.min():.4f}, {state_data.max():.4f}]")
+            print(f"  状态数据均值: {state_data.mean():.4f}")
+            if state_data.size > 0 and np.abs(state_data).sum() < 1e-6:
+                print(f"  ⚠️  警告: 状态数据全为0，可能数据提取有问题")
     
     # 处理episode和step信息
     if "episode_index" in sample:
@@ -531,6 +583,10 @@ def test_inference_from_dataset(
         
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
+            # 确保模型处于eval模式并清理显存
+            model.eval()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         finally:
             # 清理临时配置文件
             if temp_config_path and Path(temp_config_path).exists():
@@ -602,12 +658,20 @@ def test_inference_from_dataset(
         print(f"  Instruction: {instruction}")
         
         # 提取状态（如果使用）
+        # lerobot数据集的状态数据保存在observation.state键下
         states = None
         if "state" in sample:
             states = sample["state"]
             if isinstance(states, torch.Tensor):
                 states = states.numpy()
             print(f"  State shape: {states.shape if states is not None else None}")
+            if states is not None:
+                print(f"  State range: [{states.min():.4f}, {states.max():.4f}]")
+                print(f"  State mean: {states.mean():.4f}")
+                if states.size > 0 and np.abs(states).sum() < 1e-6:
+                    print(f"  ⚠️  警告: 状态数据全为0，可能数据提取有问题")
+        else:
+            print(f"  ⚠️  警告: sample中没有'state'键，可用键: {list(sample.keys())}")
         
         # 4. 显示输入图像和打印chat内容（在输入模型之前）
         print("\n[Step 4] 显示输入图像和chat内容...")
@@ -1052,6 +1116,10 @@ def test_episode_inference_with_3d_visualization(
         
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
+            # 确保模型处于eval模式并清理显存
+            model.eval()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         finally:
             # 清理临时配置文件
             if temp_config_path and Path(temp_config_path).exists():

@@ -228,8 +228,20 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
     """
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
+        
+        # 调试：检查第一个样本的原始格式
+        if len(batch_list) > 0:
+            first_sample = batch_list[0]
+            if not isinstance(first_sample, dict):
+                raise ValueError(f"batch_list中的样本应该是字典，但得到: {type(first_sample)}")
+        
         batch_dict = default_collate(batch_list)
         batch_size = len(batch_list)
+        
+        # 调试：打印batch_dict中的所有键（仅在第一次调用时）
+        if not hasattr(collate_fn, '_debug_printed'):
+            print(f"[调试] collate_fn - batch_dict中的键: {list(batch_dict.keys())}")
+            collate_fn._debug_printed = True
         
         # 验证图像键是否存在
         missing_keys = [k for k in image_keys if k not in batch_dict]
@@ -255,11 +267,50 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
             actions = normalizer.normalize_action(actions)
         
         # 处理states：归一化（如果存在）
+        # lerobot数据集的状态数据保存在observation.state键下
         states = None
         if state_key in batch_dict:
             states = batch_dict[state_key]
-            if normalizer is not None:
-                states = normalizer.normalize_state(states)
+            # 调试：打印状态数据信息（仅在第一次调用时）
+            if not hasattr(collate_fn, '_state_debug_printed'):
+                print(f"[调试] collate_fn - 找到状态键 '{state_key}'，形状: {states.shape if isinstance(states, torch.Tensor) else type(states)}")
+                if isinstance(states, torch.Tensor) and states.numel() > 0:
+                    print(f"[调试] collate_fn - 状态数据范围: [{states.min().item():.4f}, {states.max().item():.4f}]")
+                    print(f"[调试] collate_fn - 状态数据均值: {states.mean().item():.4f}")
+                    print(f"[调试] collate_fn - 状态数据前3个样本: {states[:min(3, states.shape[0]), :min(5, states.shape[1])].tolist()}")
+                collate_fn._state_debug_printed = True
+            
+            # 检查状态数据是否有效（不全为0）
+            if isinstance(states, torch.Tensor):
+                if states.numel() > 0 and states.abs().sum().item() > 1e-6:
+                    if normalizer is not None:
+                        states = normalizer.normalize_state(states)
+                else:
+                    # 如果状态全为0，可能是数据问题，打印警告
+                    import warnings
+                    warnings.warn(f"状态数据全为0，可能数据提取有问题。batch_dict中的键: {list(batch_dict.keys())}")
+                    states = None
+            else:
+                if normalizer is not None:
+                    states = normalizer.normalize_state(states)
+        else:
+            # 如果state_key不在batch_dict中，尝试查找可能的键名
+            possible_state_keys = [k for k in batch_dict.keys() if 'state' in k.lower()]
+            if possible_state_keys:
+                import warnings
+                warnings.warn(f"配置的状态键 '{state_key}' 不在batch中。可用键: {list(batch_dict.keys())}，可能的状态键: {possible_state_keys}")
+                # 尝试使用第一个可能的状态键
+                if len(possible_state_keys) > 0:
+                    print(f"[警告] 尝试使用可能的状态键: {possible_state_keys[0]}")
+                    states = batch_dict[possible_state_keys[0]]
+                    if normalizer is not None:
+                        states = normalizer.normalize_state(states)
+            else:
+                import warnings
+                warnings.warn(f"配置的状态键 '{state_key}' 不在batch中，且没有找到任何包含'state'的键。可用键: {list(batch_dict.keys())}")
+                # 调试：打印第一个样本的原始键
+                if len(batch_list) > 0:
+                    print(f"[调试] 第一个样本的原始键: {list(batch_list[0].keys())}")
         
         # 处理文本任务描述
         # lerobot数据集中的task字段直接返回字符串列表
@@ -917,6 +968,29 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     
     # 创建数据加载器的迭代器，以便循环使用
     loader_iter = iter(train_loader)
+    # 调试：检查第一个batch的状态数据
+    print(f"\n[调试] 检查第一个batch的状态数据...")
+    try:
+        test_batch = next(iter(train_loader))
+        print(f"  Batch中的键: {list(test_batch.keys())}")
+        if "state" in test_batch:
+            state_data = test_batch["state"]
+            print(f"  状态数据形状: {state_data.shape}")
+            print(f"  状态数据类型: {type(state_data)}")
+            if isinstance(state_data, torch.Tensor):
+                print(f"  状态数据范围: [{state_data.min().item():.4f}, {state_data.max().item():.4f}]")
+                print(f"  状态数据均值: {state_data.mean().item():.4f}")
+                print(f"  状态数据前3个样本的前5个值:")
+                for i in range(min(3, state_data.shape[0])):
+                    print(f"    样本{i}: {state_data[i, :min(5, state_data.shape[1])].tolist()}")
+        else:
+            print(f"  ⚠️  警告: batch中没有'state'键！")
+            print(f"  这可能导致模型无法使用状态信息。")
+    except Exception as e:
+        print(f"  ⚠️  无法检查第一个batch: {e}")
+        import traceback
+        traceback.print_exc()
+    
     progress_bar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc="Training")
     
     for step in progress_bar:

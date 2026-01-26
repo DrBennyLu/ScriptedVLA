@@ -454,6 +454,32 @@ def test_training_loop(config_path: str = "config.yaml"):
             print(f"  训练数据加载器长度: {len(train_loader)} batches")
             print(f"  验证数据加载器长度: {len(val_loader)} batches")
             
+            # 调试：检查第一个batch的状态数据
+            print(f"\n[调试] 检查第一个batch的状态数据...")
+            try:
+                test_batch = next(iter(train_loader))
+                print(f"  Batch中的键: {list(test_batch.keys())}")
+                if "state" in test_batch:
+                    state_data = test_batch["state"]
+                    print(f"  状态数据形状: {state_data.shape}")
+                    print(f"  状态数据类型: {type(state_data)}")
+                    if isinstance(state_data, torch.Tensor):
+                        print(f"  状态数据范围: [{state_data.min().item():.4f}, {state_data.max().item():.4f}]")
+                        print(f"  状态数据均值: {state_data.mean().item():.4f}")
+                        print(f"  状态数据前3个样本的前5个值:")
+                        for i in range(min(3, state_data.shape[0])):
+                            print(f"    样本{i}: {state_data[i, :min(5, state_data.shape[1])].tolist()}")
+                        if state_data.numel() > 0 and state_data.abs().sum().item() < 1e-6:
+                            print(f"  ⚠️  警告: 状态数据全为0，可能数据提取有问题")
+                else:
+                    print(f"  ⚠️  警告: batch中没有'state'键！")
+                    print(f"  这可能导致模型无法使用状态信息。")
+                    print(f"  配置的状态键名: {state_key}")
+            except Exception as e:
+                print(f"  ⚠️  无法检查第一个batch: {e}")
+                import traceback
+                traceback.print_exc()
+            
             # 5. 创建模型
             print("\n步骤5: 创建模型")
             # 合并模型配置（测试配置优先）
