@@ -480,12 +480,13 @@ class QwenVLM(nn.Module):
         
         # 处理图像格式
         if images and len(images) > 0:
-            if isinstance(images[0], list):
-                # 多相机模式：取第一个相机（或可以扩展为融合多个相机）
-                batch_images = [img_list[0] if img_list else None for img_list in images]
-            else:
-                # 单相机模式
-                batch_images = images
+            batch_images = images
+            # if isinstance(images[0], list):
+            #     # 多相机模式：取第一个相机（或可以扩展为融合多个相机）
+            #     batch_images = [img_list[0] if img_list else None for img_list in images]
+            # else:
+            #     # 单相机模式
+            #     batch_images = images
         else:
             raise ValueError(f"Empty images list or None")
         
@@ -534,19 +535,20 @@ class QwenVLM(nn.Module):
         # 构建messages格式（Qwen2-VL标准格式）
         # 使用标准化的格式以提高一致性
         messages = []
-        for img, instruction in zip(batch_images, instructions):
+        for imgs, instruction in zip(batch_images, instructions):
             message = {
                 "role": "user",
                 "content": []
             }
             
             # 添加图像（如果存在）
-            if img is not None:
-                message["content"].append({
-                    "type": "image",
-                    "image": img
-                })
-            
+            if imgs is not None:
+                #message["content"].append({
+                #    "type": "image",
+                #    "image": img
+                #})
+                message["content"] = [{"type":"image", "image":img} for img in imgs]
+                
             # 添加文本指令
             if instruction:
                 message["content"].append({
