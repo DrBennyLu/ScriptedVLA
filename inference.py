@@ -393,16 +393,8 @@ def run_inference(
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu().numpy()
     
-    # 返回action chunk [T, action_dim]
-    if len(actions.shape) == 3:  # [B, T, action_dim]
-        return actions[0]  # [T, action_dim]
-    elif len(actions.shape) == 2:  # [B, action_dim] 或 [T, action_dim]
-        if actions.shape[0] == 1:  # [1, action_dim]
-            return actions[0:1]  # [1, action_dim]
-        else:
-            return actions  # [T, action_dim]
-    else:
-        return actions.reshape(1, -1)  # [1, action_dim]
+    # 返回 action chunk [T, action_dim]（去掉 batch 维）
+    return actions.squeeze(0)
 
 
 def main():

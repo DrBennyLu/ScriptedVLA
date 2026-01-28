@@ -529,10 +529,7 @@ class FlowMatchingActionHead(nn.Module):
             return_features: 是否返回中间特征（向后兼容）
             
         Returns:
-            如果训练模式（actions提供）：
-                loss: 标量损失值
-            如果推理模式（actions为None）：
-                actions: 预测的动作 [B, action_horizon, action_dim]
+            loss: 标量损失值（训练时需提供 actions；推理请使用 predict_action）
         """
         device = vlm_features.device
         batch_size = vlm_features.shape[0]
@@ -625,7 +622,8 @@ class FlowMatchingActionHead(nn.Module):
                 x = block(
                     x,
                     encoder_hidden_states=vlm_features_seq,  # VLM特征作为交叉注意力的key和value
-                    encoder_attention_mask=encoder_attention_mask
+                    encoder_attention_mask=encoder_attention_mask,
+                    temb=temb  # 时间嵌入（用于 AdaLayerNorm）
                 )
             
             # 最终归一化
@@ -641,11 +639,12 @@ class FlowMatchingActionHead(nn.Module):
             if return_features:
                 return loss, x
             return loss
-        
-        # 推理模式：预测动作
-        else:
-            return self.predict_action(vlm_features, states, encoder_attention_mask)
-    
+
+        raise ValueError(
+            "forward() 仅用于训练且需提供 actions；"
+            "推理请使用 predict_action(vlm_features, states, encoder_attention_mask)。"
+        )
+
     @torch.no_grad()
     def predict_action(
         self,

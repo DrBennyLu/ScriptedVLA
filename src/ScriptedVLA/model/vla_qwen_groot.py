@@ -29,7 +29,6 @@ Qwen-GR00T架构的VLA模型
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Tuple, Union, List
-from PIL import Image
 import numpy as np
 
 from .vlm import QwenVLM
@@ -182,8 +181,7 @@ class QwenGR00TVLAModel(nn.Module):
                 - actions: Optional[torch.Tensor]，目标动作序列 [B, action_horizon, action_dim]（训练时需要）
             
         Returns:
-            {"action_loss": loss_value} 如果训练模式（actions提供）
-            {"actions": predicted_actions} 如果推理模式（actions为None）
+            {"action_loss": loss_value} 训练时需提供 actions；推理请使用 predict_action(inputs)。
         """
         # 提取输入字段
         images = inputs.get("images")
@@ -259,13 +257,11 @@ class QwenGR00TVLAModel(nn.Module):
                 
                 return {"action_loss": action_loss}
             else:
-                # 推理模式
-                pred_actions = self.action_model.predict_action(
-                    last_hidden,
-                    states=states
+                raise ValueError(
+                    "forward() 仅用于训练且需提供 inputs['actions']；"
+                    "推理请使用 predict_action(inputs=inputs)。"
                 )
-                return {"actions": pred_actions}
-    
+
     @torch.inference_mode()
     def predict_action(
         self,
@@ -274,135 +270,36 @@ class QwenGR00TVLAModel(nn.Module):
     ) -> Dict[str, np.ndarray]:
         """
         预测动作（推理模式，统一输入格式）
+
+        调用方（如 inference.run_inference）负责将图像转为 PIL，此处仅接收已处理好的图像。
         
         Args:
-            inputs: 统一输入字典，包含以下字段：
-                - images: 图像，可以是：
-                    - List[PIL.Image] 或 List[List[PIL.Image]]（多相机）
-                    - torch.Tensor [B, C, H, W]（单相机）
-                    - Dict[str, torch.Tensor] {camera_name: [B, C, H, W]}（多相机）
+            inputs: 统一输入字典，包含：
+                - images: List[PIL.Image] 或 List[List[PIL.Image]]（多相机），已由调用方转换
                 - instructions: List[str]，文本指令列表
                 - states: Optional[torch.Tensor]，机器人状态 [B, state_dim] 或 [B, 1, state_dim]
             
         Returns:
-            dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+            dict: normalized_actions (np.ndarray), shape [B, T, action_dim]
         """
-        # 提取输入字段
         images = inputs.get("images")
         instructions = inputs.get("instructions")
         states = inputs.get("states")
-        
-        # 验证必需字段
+
         if images is None:
             raise ValueError("inputs['images'] is required")
         if instructions is None:
             raise ValueError("inputs['instructions'] is required")
-        
-        # 转换图像格式：将tensor转换为PIL Image
-        # build_qwenvl_inputs期望List[PIL.Image]或List[List[PIL.Image]]
-        if isinstance(images, dict):
-            # 多相机模式：Dict[str, torch.Tensor] -> List[PIL.Image]
-            # 取第一个相机（或可以扩展为融合多个相机）
-            first_camera = list(images.keys())[0] if images else None
-            if first_camera:
-                img_tensor = images[first_camera]
-                # 确保有batch维度
-                if img_tensor.dim() == 3:  # [C, H, W]
-                    img_tensor = img_tensor.unsqueeze(0)  # [1, C, H, W]
-                elif img_tensor.dim() == 4:
-                    # 已经是 [B, C, H, W] 格式
-                    pass
-                else:
-                    raise ValueError(f"Unexpected image tensor shape: {img_tensor.shape}")
-                
-                # 转换为PIL Image
-                batch_size = img_tensor.shape[0]
-                batch_images = []
-                for i in range(batch_size):
-                    img = img_tensor[i]  # [C, H, W]
-                    # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
-                    # 转换为numpy数组 [H, W, C]
-                    img = img.permute(1, 2, 0).cpu().numpy()
-                    
-                    # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
-                    if img.dtype != np.uint8:
-                        if img.max() <= 1.0 and img.min() >= 0.0:
-                            # 0-1归一化的图像，转换为0-255
-                            img_np = (img * 255).astype(np.uint8)
-                        elif img.max() <= 255.0:
-                            # 已经是0-255范围，直接转换类型
-                            img_np = img.astype(np.uint8)
-                        else:
-                            # 其他情况，先clamp到0-255再转换
-                            img_np = np.clip(img, 0, 255).astype(np.uint8)
-                    else:
-                        img_np = img
-                    
-                    # 确保是RGB格式
-                    if len(img_np.shape) == 2:
-                        img_np = np.stack([img_np] * 3, axis=-1)
-                    elif img_np.shape[2] == 1:
-                        img_np = np.repeat(img_np, 3, axis=2)
-                    
-                    pil_img = Image.fromarray(img_np, mode='RGB')
-                    batch_images.append(pil_img)
-            else:
-                raise ValueError("Empty images dict")
-        elif isinstance(images, torch.Tensor):
-            # 单相机模式：torch.Tensor -> List[PIL.Image]
-            # 确保有batch维度
-            if images.dim() == 3:  # [C, H, W]
-                images = images.unsqueeze(0)  # [1, C, H, W]
-            elif images.dim() == 4:
-                # 已经是 [B, C, H, W] 格式
-                pass
-            else:
-                raise ValueError(f"Unexpected images tensor shape: {images.shape}")
-            
-            batch_size = images.shape[0]
-            batch_images = []
-            for i in range(batch_size):
-                img = images[i]  # [C, H, W]
-                # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
-                # 转换为numpy数组 [H, W, C]
-                img = img.permute(1, 2, 0).cpu().numpy()
-                
-                # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
-                if img.dtype != np.uint8:
-                    if img.max() <= 1.0 and img.min() >= 0.0:
-                        # 0-1归一化的图像，转换为0-255
-                        img_np = (img * 255).astype(np.uint8)
-                    elif img.max() <= 255.0:
-                        # 已经是0-255范围，直接转换类型
-                        img_np = img.astype(np.uint8)
-                    else:
-                        # 其他情况，先clamp到0-255再转换
-                        img_np = np.clip(img, 0, 255).astype(np.uint8)
-                else:
-                    img_np = img
-                
-                # 确保是RGB格式
-                if len(img_np.shape) == 2:
-                    img_np = np.stack([img_np] * 3, axis=-1)
-                elif img_np.shape[2] == 1:
-                    img_np = np.repeat(img_np, 3, axis=2)
-                
-                pil_img = Image.fromarray(img_np, mode='RGB')
-                batch_images.append(pil_img)
-        elif isinstance(images, list):
-            # 已经是PIL Image列表
-            batch_images = images
-        else:
-            raise ValueError(f"Unsupported images type: {type(images)}")
-        
-        # 统一处理states维度：确保为[B, state_dim]或[B, 1, state_dim]
+        if not isinstance(images, list) or len(images) == 0:
+            raise ValueError("inputs['images'] must be a non-empty list (List[PIL.Image] or List[List[PIL.Image]])")
+
+        # 统一处理 states 维度：确保为 [B, state_dim] 或 [B, 1, state_dim]
         if states is not None and self.use_state:
             states = self._normalize_states(states)
-        
-        # Step 1: QwenVL输入格式（包含状态信息）
+
+        # Step 1: QwenVL 输入格式（包含状态信息）
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=batch_images,
+            images=images,
             instructions=instructions,
             states=states if self.use_state else None
         )
