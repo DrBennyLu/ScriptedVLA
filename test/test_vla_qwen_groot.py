@@ -50,7 +50,8 @@ def test_qwen_groot_initialization():
             vlm_config=vlm_config,
             action_head_config=action_head_config,
             camera_names=["global_img"],
-            use_state=True,
+            use_state_vlm=True,
+            use_state_action_head=True,
             state_dim=7,
             future_action_window_size=3,
             past_action_window_size=0
@@ -92,7 +93,8 @@ def test_qwen_groot_forward_images_texts():
         model = QwenGR00TVLAModel(
             vlm_config=vlm_config,
             action_head_config=action_head_config,
-            use_state=True,
+            use_state_vlm=True,
+            use_state_action_head=True,
             state_dim=7,
             future_action_window_size=3
         )
@@ -231,7 +233,8 @@ def test_qwen_groot_without_state():
         model = QwenGR00TVLAModel(
             vlm_config=vlm_config,
             action_head_config=action_head_config,
-            use_state=False,  # 不使用状态
+            use_state_vlm=False,  # 不使用状态
+            use_state_action_head=False,
             state_dim=7,
             future_action_window_size=3
         )
@@ -289,7 +292,8 @@ def test_qwen_groot_repeated_diffusion_steps():
         model = QwenGR00TVLAModel(
             vlm_config=vlm_config,
             action_head_config=action_head_config,
-            use_state=True,
+            use_state_vlm=True,
+            use_state_action_head=True,
             state_dim=7,
             future_action_window_size=3
         )

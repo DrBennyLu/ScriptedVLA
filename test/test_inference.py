@@ -802,7 +802,11 @@ def test_inference_from_dataset(
             print(f"  警告: 无法获取chat内容: {e}")
             print(f"  使用原始指令: {instruction}")
         
-        # 5. 运行推理
+        # 5. 运行推理（从 config 读取是否对 action/state 做归一化）
+        config = load_config(test_config_path)
+        data_config = get_data_config(config)
+        normalize_action = data_config.get("normalize_action", True)
+        normalize_state = data_config.get("normalize_state", True)
         print("\n[Step 5] 运行推理...")
         predicted_actions = run_inference(
             model=model,
@@ -811,7 +815,9 @@ def test_inference_from_dataset(
             image_keys=image_keys,
             states=states,
             normalizer=normalizer,
-            image_size=image_size
+            image_size=image_size,
+            normalize_action=normalize_action,
+            normalize_state=normalize_state,
         )
         
         # 验证输出维度
@@ -1132,7 +1138,10 @@ def test_episode_inference_with_3d_visualization(
         result["num_frames"] = len(episode_frames)
         print(f"  ✓ Episode包含 {len(episode_frames)} 帧")
         
-        # 4. 对每一帧进行推理
+        # 4. 对每一帧进行推理（从 config 读取是否对 action/state 做归一化）
+        data_config = get_data_config(config)
+        normalize_action = data_config.get("normalize_action", True)
+        normalize_state = data_config.get("normalize_state", True)
         print(f"\n[Step 4] 对每一帧进行推理...")
         predicted_xyz_list = []
         true_xyz_list = []
@@ -1304,7 +1313,9 @@ def test_episode_inference_with_3d_visualization(
                     image_keys=image_keys,
                     states=states,
                     normalizer=normalizer,
-                    image_size=image_size
+                    image_size=image_size,
+                    normalize_action=normalize_action,
+                    normalize_state=normalize_state,
                 )
                 
                 # 提取x, y, z（前三维）

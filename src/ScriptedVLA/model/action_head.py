@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -314,6 +314,7 @@ class FlowMatchingActionHead(nn.Module):
         action_horizon: int = 10,  # 动作序列长度
         dropout: float = 0.1,
         use_cross_attention: bool = True,
+        use_state: bool = True,
         state_dim: Optional[int] = None,
         num_target_vision_tokens: int = 32,
         max_seq_len: int = 1024,
@@ -341,7 +342,8 @@ class FlowMatchingActionHead(nn.Module):
             action_horizon: 动作序列长度（未来动作窗口大小）
             dropout: Dropout比例
             use_cross_attention: 是否使用交叉注意力
-            state_dim: 状态维度（如果使用状态）
+            use_state: 是否使用机器人状态
+            state_dim: 状态维度（当 use_state 为 True 时有效）
             num_target_vision_tokens: 目标视觉token数量（future_tokens的数量）
                 - 作用：可学习的占位符token，通过交叉注意力从VLM特征中提取信息
                 - 如何确定：通常通过实验调优（16, 32, 64等），或参考VLM输出的视觉token数量
@@ -369,6 +371,7 @@ class FlowMatchingActionHead(nn.Module):
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.use_cross_attention = use_cross_attention
+        self.use_state = use_state
         self.add_pos_embed = add_pos_embed
         self.num_timestep_buckets = num_timestep_buckets
         self.num_inference_timesteps = num_inference_timesteps
@@ -383,8 +386,8 @@ class FlowMatchingActionHead(nn.Module):
         else:
             self.timestep_encoder = None
         
-        # 状态编码器（如果使用状态）
-        if state_dim is not None and state_dim > 0:
+        # 状态编码器（当 use_state 为 True 且 state_dim 有效时）
+        if use_state and state_dim is not None and state_dim > 0:
             self.state_encoder = MLP(
                 input_dim=state_dim,
                 hidden_dim=hidden_dim,

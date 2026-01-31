@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -47,9 +47,10 @@ class QwenGR00TVLAModel(nn.Module):
         vlm_config: Dict,
         action_head_config: Dict,
         camera_names: Optional[List[str]] = None,
-        use_state: bool = True,
+        use_state_vlm: bool = True,
+        use_state_action_head: bool = True,
         state_dim: int = 7,
-        future_action_window_size: int = 10,
+        future_action_window_size: int = 49,
         past_action_window_size: int = 0
     ):
         """
@@ -59,7 +60,8 @@ class QwenGR00TVLAModel(nn.Module):
             vlm_config: VLM配置字典
             action_head_config: 动作头配置字典
             camera_names: 相机名称列表
-            use_state: 是否使用机器人状态
+            use_state_vlm: VLM 是否使用机器人状态
+            use_state_action_head: 动作头是否使用机器人状态
             state_dim: 状态维度
             future_action_window_size: 未来动作窗口大小
             past_action_window_size: 过去动作窗口大小
@@ -68,7 +70,8 @@ class QwenGR00TVLAModel(nn.Module):
         
         self.camera_names = camera_names or ["global_img"]
         self.num_cameras = len(self.camera_names)
-        self.use_state = use_state
+        self.use_state_vlm = use_state_vlm
+        self.use_state_action_head = use_state_action_head
         self.state_dim = state_dim
         self.future_action_window_size = future_action_window_size
         self.past_action_window_size = past_action_window_size
@@ -81,7 +84,9 @@ class QwenGR00TVLAModel(nn.Module):
             image_size=vlm_config.get("image_size", 224),
             max_seq_length=vlm_config.get("max_seq_length", 512),
             freeze=vlm_config.get("freeze_vlm", True),
-            cache_dir=vlm_config.get("cache_dir", None)
+            cache_dir=vlm_config.get("cache_dir", None),
+            use_state=vlm_config.get("use_state", use_state_vlm),
+            state_dim=state_dim
         )
         
         # 获取VLM的hidden_size
@@ -104,7 +109,8 @@ class QwenGR00TVLAModel(nn.Module):
             action_horizon=action_head_config.get("action_horizon", self.future_action_window_size + 1),
             dropout=action_head_config.get("dropout", 0.1),
             use_cross_attention=action_head_config.get("use_cross_attention", True),
-            state_dim=state_dim if self.use_state else None,
+            use_state=action_head_config.get("use_state", use_state_action_head),
+            state_dim=state_dim if use_state_action_head else None,
             num_target_vision_tokens=action_head_config.get("num_target_vision_tokens", 32),
             max_seq_len=action_head_config.get("max_seq_len", 1024),
             add_pos_embed=action_head_config.get("add_pos_embed", True),
@@ -112,14 +118,19 @@ class QwenGR00TVLAModel(nn.Module):
             noise_beta_beta=action_head_config.get("noise_beta_beta", 1.0),
             noise_s=action_head_config.get("noise_s", 0.999),
             num_timestep_buckets=action_head_config.get("num_timestep_buckets", 1000),
-            num_inference_timesteps=action_head_config.get("num_inference_timesteps", 50),
+            num_inference_timesteps=action_head_config.get("num_inference_timesteps", 10),
             cross_attention_dim=vlm_hidden_size if action_head_hidden_dim != vlm_hidden_size else None,
             # 新增参数：时间嵌入和归一化相关
-            norm_type=action_head_config.get("norm_type", "layer_norm"),  # 'layer_norm' or 'ada_norm'
+            norm_type=action_head_config.get("norm_type", "ada_norm"),  # 'layer_norm' or 'ada_norm'
             norm_elementwise_affine=action_head_config.get("norm_elementwise_affine", False),
             norm_eps=action_head_config.get("norm_eps", 1e-5),
             compute_dtype=action_head_config.get("compute_dtype", torch.float32)
         )
+    
+    @property
+    def use_state(self) -> bool:
+        """是否使用状态（VLM 或动作头任一使用即为 True，用于推理时是否需要默认 state）"""
+        return self.use_state_vlm or self.use_state_action_head
     
     def _normalize_states(self, states: Union[torch.Tensor, np.ndarray, List]) -> torch.Tensor:
         """
@@ -198,14 +209,14 @@ class QwenGR00TVLAModel(nn.Module):
         batch_images = images
         
         # 统一处理states维度：确保为[B, state_dim]或[B, 1, state_dim]
-        if states is not None and self.use_state:
+        if states is not None and (self.use_state_vlm or self.use_state_action_head):
             states = self._normalize_states(states)
         
         # Step 1: QwenVL输入格式（包含状态信息）
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images,
             instructions=instructions,
-            states=states if self.use_state else None
+            states=states if self.use_state_vlm else None
         )
         
         # Step 2: 获取VLM输出
@@ -230,7 +241,7 @@ class QwenGR00TVLAModel(nn.Module):
                 actions_target = actions[:, -(self.future_action_window_size + 1):, :]  # (B, action_horizon, action_dim)
                 
                 # 重复扩散步数（如果配置了）
-                repeated_diffusion_steps = kwargs.get("repeated_diffusion_steps", 1)
+                repeated_diffusion_steps = kwargs.get("repeated_diffusion_steps", 0)
                 if repeated_diffusion_steps > 1:
                     actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
                     last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
@@ -246,13 +257,13 @@ class QwenGR00TVLAModel(nn.Module):
                     action_loss = self.action_model(
                         last_hidden_repeated,
                         actions=actions_target_repeated,
-                        states=states_repeated
+                        states=states_repeated if self.use_state_action_head else None
                     )
                 else:
                     action_loss = self.action_model(
                         last_hidden,
                         actions=actions_target,
-                        states=states
+                        states=states if self.use_state_action_head else None
                     )
                 
                 return {"action_loss": action_loss}
@@ -294,14 +305,14 @@ class QwenGR00TVLAModel(nn.Module):
             raise ValueError("inputs['images'] must be a non-empty list (List[PIL.Image] or List[List[PIL.Image]])")
 
         # 统一处理 states 维度：确保为 [B, state_dim] 或 [B, 1, state_dim]
-        if states is not None and self.use_state:
+        if states is not None and (self.use_state_vlm or self.use_state_action_head):
             states = self._normalize_states(states)
 
         # Step 1: QwenVL 输入格式（包含状态信息）
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=images,
             instructions=instructions,
-            states=states if self.use_state else None
+            states=states if self.use_state_vlm else None
         )
         
         # Step 2: 获取VLM输出
@@ -321,7 +332,7 @@ class QwenGR00TVLAModel(nn.Module):
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
                 last_hidden,
-                states=states
+                states=states if self.use_state_action_head else None
             )  # (B, chunk_len, action_dim)
         
         normalized_actions = pred_actions.detach().cpu().numpy()

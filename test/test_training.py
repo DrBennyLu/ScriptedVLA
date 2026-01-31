@@ -34,7 +34,6 @@ from src.ScriptedVLA.utils import (
 from train import (
     create_optimizer, 
     create_scheduler, 
-    train_epoch, 
     evaluate, 
     save_checkpoint,
     create_collate_fn,
@@ -353,8 +352,9 @@ def test_training_loop(config_path: str = "config.yaml"):
             print("\n步骤1: 设置数据集")
             dataset_path = test_config.get("dataset_path", "./dataset/libero_object")
             robot_state_config = data_config.get("robot_state", {})
-            use_state = robot_state_config.get("use_state", True)
-            
+            use_state_vlm = robot_state_config.get("use_state_vlm", robot_state_config.get("use_state", True))
+            use_state_action_head = robot_state_config.get("use_state_action_head", robot_state_config.get("use_state", True))
+            use_state = use_state_vlm or use_state_action_head  # 任一侧使用状态则数据集需要状态
             dataset_dir = setup_dataset(dataset_path, use_state=use_state)
             
             # 2. 加载数据集信息
@@ -423,13 +423,16 @@ def test_training_loop(config_path: str = "config.yaml"):
             dataset_config = config.get("dataset", {})
             task_description_config = dataset_config.get("task_description", {})
             use_batch_task = task_description_config.get("use_batch_task", True)
-            
+            normalize_action = data_config.get("normalize_action", True)
+            normalize_state = data_config.get("normalize_state", True)
             custom_collate_fn = create_collate_fn(
                 image_keys=image_keys,
                 state_key=state_key,
                 image_size=image_size,
                 use_batch_task=use_batch_task,
-                normalizer=normalizer
+                normalizer=normalizer,
+                normalize_action=normalize_action,
+                normalize_state=normalize_state,
             )
             
             train_loader = DataLoader(
@@ -504,15 +507,17 @@ def test_training_loop(config_path: str = "config.yaml"):
             merged_action_head_config["action_horizon"] = action_horizon
             future_action_window_size = merged_vla_config.get("future_action_window_size", action_horizon - 1)
             
-            # 使用从数据集获取的state_dim和use_state
-            use_state = merged_vla_config.get("use_state", True)
+            # 使用从数据集获取的state_dim和 use_state_vlm / use_state_action_head
+            use_state_vlm = merged_vla_config.get("use_state_vlm", merged_vla_config.get("use_state", True))
+            use_state_action_head = merged_vla_config.get("use_state_action_head", merged_vla_config.get("use_state", True))
             state_dim = merged_vla_config.get("state_dim", state_dim)
             
             model = QwenGR00TVLAModel(
                 vlm_config=merged_vlm_config,
                 action_head_config=merged_action_head_config,
                 camera_names=None,  # 使用默认值
-                use_state=use_state,
+                use_state_vlm=use_state_vlm,
+                use_state_action_head=use_state_action_head,
                 state_dim=state_dim,
                 future_action_window_size=future_action_window_size
             )
@@ -727,7 +732,7 @@ def train_epoch_with_unified_input(
 ):
     """
     适配统一输入格式的训练epoch函数
-    基于train.py中的train_epoch，使用create_collate_fn处理后的batch格式
+    使用 create_collate_fn 处理后的 batch 格式，执行一个 epoch 的训练步骤（与 train_with_lerobot_dataset 中的循环逻辑一致）
     注意：create_collate_fn已经处理了归一化和图像格式转换
     """
     model.train()

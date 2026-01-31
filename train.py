@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -46,15 +46,31 @@ from src.ScriptedVLA.utils import (
     get_training_config,
     get_data_config,
     create_normalizer_from_dataset,
-    Normalizer
+    create_normalizer_from_lerobot_meta,
+    Normalizer,
 )
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     HAS_LEROBOT = True
+
+    class LeRobotDatasetSubset(LeRobotDataset):
+        """
+        LeRobotDataset 子类，修复使用 episodes=subset 时的索引越界问题。
+        当传入 episodes 列表时，hf_dataset 中每行的 episode_index 仍是原始 episode 编号，
+        而 episode_data_index 是按子集位置 (0..len(episodes)-1) 建的，需在 _get_query_indices
+        中将原始 episode 编号映射为子集内位置。
+        """
+
+        def _get_query_indices(self, idx: int, ep_idx: int):
+            if self.episodes is not None and ep_idx in self.episodes:
+                ep_idx = self.episodes.index(ep_idx)
+            return super()._get_query_indices(idx, ep_idx)
+
 except ImportError:
     HAS_LEROBOT = False
     LeRobotDataset = None
+    LeRobotDatasetSubset = None
 
 
 def set_seed(seed: int):
@@ -215,7 +231,15 @@ def _tensor_to_pil_image(img_tensor, image_size=None):
     return img_pil
 
 
-def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=True, normalizer=None):
+def create_collate_fn(
+    image_keys,
+    state_key,
+    image_size=None,
+    use_batch_task=True,
+    normalizer=None,
+    normalize_action=True,
+    normalize_state=True,
+):
     """
     创建collate函数，处理lerobot返回的batch格式
     
@@ -225,6 +249,8 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
         image_size: 图像尺寸（可选）
         use_batch_task: 是否使用batch中的task字段
         normalizer: 归一化器（可选）
+        normalize_action: 是否对 action 做归一化（需 normalizer）
+        normalize_state: 是否对 state 做归一化（需 normalizer）
     """
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
@@ -261,12 +287,12 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
                                 for key in image_keys]
                 images_list.append(camera_images)
         
-        # 处理actions：归一化
+        # 处理 actions：按配置决定是否归一化
         actions = batch_dict["action"]
-        if normalizer is not None:
+        if normalize_action and normalizer is not None:
             actions = normalizer.normalize_action(actions)
-        
-        # 处理states：归一化（如果存在）
+
+        # 处理 states：按配置决定是否归一化（如果存在）
         # lerobot数据集的状态数据保存在observation.state键下
         states = None
         if state_key in batch_dict:
@@ -283,7 +309,7 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
             # 检查状态数据是否有效（不全为0）
             if isinstance(states, torch.Tensor):
                 if states.numel() > 0 and states.abs().sum().item() > 1e-6:
-                    if normalizer is not None:
+                    if normalize_state and normalizer is not None:
                         states = normalizer.normalize_state(states)
                 else:
                     # 如果状态全为0，可能是数据问题，打印警告
@@ -291,7 +317,7 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
                     warnings.warn(f"状态数据全为0，可能数据提取有问题。batch_dict中的键: {list(batch_dict.keys())}")
                     states = None
             else:
-                if normalizer is not None:
+                if normalize_state and normalizer is not None:
                     states = normalizer.normalize_state(states)
         else:
             # 如果state_key不在batch_dict中，尝试查找可能的键名
@@ -303,7 +329,7 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
                 if len(possible_state_keys) > 0:
                     print(f"[警告] 尝试使用可能的状态键: {possible_state_keys[0]}")
                     states = batch_dict[possible_state_keys[0]]
-                    if normalizer is not None:
+                    if normalize_state and normalizer is not None:
                         states = normalizer.normalize_state(states)
             else:
                 import warnings
@@ -403,135 +429,32 @@ def create_scheduler(optimizer, config, num_training_steps):
         return None
 
 
-def train_epoch(
+def evaluate(
     model,
     dataloader,
-    optimizer,
-    scheduler,
-    criterion,
     device,
-    config,
-    logger,
-    epoch,
-    start_step=0
+    criterion=None,
+    logger=None,
+    max_eval_batches=50,
 ):
     """
-    训练一个epoch
-    
-    Args:
-        start_step: 起始全局步数
-        
-    Returns:
-        (avg_loss, last_step): 平均损失和最后一个步数
-    """
-    model.train()
-    total_loss = 0.0
-    num_batches = 0
-    current_step = start_step
-    
-    progress_bar = tqdm(
-        dataloader, 
-        desc=f"Epoch {epoch}",
-        unit="batch",
-        leave=True
-    )
-    
-    for batch_idx, batch in enumerate(progress_bar):
-        # create_collate_fn已经返回处理好的PIL.Image列表格式
-        # 单相机: List[PIL.Image]，多相机: List[List[PIL.Image]]
-        images = batch["images"]
-        texts = batch["text"]
-        # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
-        actions = batch["action"].to(device)
-        
-        # 处理状态信息（如果存在）
-        states = None
-        if "state" in batch:
-            states = batch["state"].to(device)
-        
-        # 前向传播（训练模式，提供actions以计算损失）
-        # 使用统一输入格式
-        inputs = {
-            "images": images,
-            "instructions": texts,
-            "actions": actions
-        }
-        if states is not None:
-            inputs["states"] = states
-        outputs = model(inputs=inputs)
-        
-        # 模型在训练模式下固定返回action_loss
-        loss = outputs["action_loss"]
-        
-        # 梯度累积
-        loss = loss / config.get("gradient_accumulation_steps", 1)
-        
-        # 反向传播
-        loss.backward()
-        
-        # 梯度裁剪和优化器步进
-        if (batch_idx + 1) % config.get("gradient_accumulation_steps", 1) == 0:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                config.get("max_grad_norm", 1.0)
-            )
-            optimizer.step()
-            if scheduler:
-                scheduler.step()
-            optimizer.zero_grad()
-            
-            # 只有在实际优化器步进时才增加步数
-            current_step += 1
-        
-        total_loss += loss.item() * config.get("gradient_accumulation_steps", 1)
-        num_batches += 1
-        
-        # 更新进度条，显示更多信息
-        current_avg_loss = total_loss / num_batches
-        current_lr = optimizer.param_groups[0]['lr']
-        progress_bar.set_postfix({
-            "loss": f"{loss.item() * config.get('gradient_accumulation_steps', 1):.4f}",
-            "avg_loss": f"{current_avg_loss:.4f}",
-            "lr": f"{current_lr:.2e}"
-        })
-        
-        # 日志记录（使用当前步数）
-        if current_step % config.get("logging_steps", 100) == 0:
-            # 获取批次中的层次化信息（用于日志）
-            task_info = ""
-            if "task_name" in batch:
-                task_names = batch["task_name"]
-                if isinstance(task_names, list) and len(task_names) > 0:
-                    task_info = f", Task: {task_names[0]}"
-                elif isinstance(task_names, str):
-                    task_info = f", Task: {task_names}"
-            
-            logger.info(
-                f"Step {current_step}: Loss = {loss.item() * config.get('gradient_accumulation_steps', 1):.4f}, "
-                f"LR = {optimizer.param_groups[0]['lr']:.2e}{task_info}"
-            )
-    
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    return avg_loss, current_step
-
-
-def evaluate(model, dataloader, criterion, device, logger, max_eval_batches=50):
-    """
-    评估模型
+    评估模型（与 train_with_lerobot_dataset 使用的 batch 格式一致，参考 inference 的数据流：dataloader 迭代得到 batch，前向得到 loss）。
     
     Args:
         model: 模型
-        dataloader: 数据加载器
-        criterion: 损失函数（未使用，保持兼容性）
+        dataloader: 数据加载器（与训练使用相同的 create_collate_fn 格式：images, text, action, state）
         device: 设备
-        logger: 日志记录器
+        criterion: 损失函数（未使用，保持兼容性）
+        logger: 日志记录器，若为 None 则在屏幕上打印评估结果
         max_eval_batches: 最大评估批次数量，用于限制评估时间（默认50）
+        
+    Returns:
+        float: 平均验证 loss
     """
-    model.train()  # 设置为训练模式以计算损失（使用no_grad禁用梯度）
+    was_training = model.training
+    model.eval()
     total_loss = 0.0
     num_batches = 0
-    
-    # 限制评估批次数量
     total_batches = len(dataloader)
     eval_batches = min(max_eval_batches, total_batches)
     
@@ -539,45 +462,38 @@ def evaluate(model, dataloader, criterion, device, logger, max_eval_batches=50):
         progress_bar = tqdm(
             enumerate(dataloader),
             total=eval_batches,
-            desc="评估中",
+            desc="Eval",
             unit="batch",
-            leave=True
+            leave=True,
         )
-        
         for batch_idx, batch in progress_bar:
-            # 限制评估批次数量
             if batch_idx >= eval_batches:
                 break
-            
-            # create_collate_fn已经返回处理好的格式
             images = batch["images"]
             texts = batch["text"]
-            # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
             actions = batch["action"].to(device)
-            
-            # 准备模型输入
             inputs = {
                 "images": images,
                 "instructions": texts,
-                "actions": actions
+                "actions": actions,
             }
             if "state" in batch:
                 inputs["states"] = batch["state"].to(device)
-            
             outputs = model(inputs=inputs)
-            
-            # 模型在训练模式下固定返回action_loss
             loss = outputs["action_loss"]
-            
             total_loss += loss.item()
             num_batches += 1
-            
-            # 更新进度条
-            current_avg_loss = total_loss / num_batches
-            progress_bar.set_postfix({"loss": f"{current_avg_loss:.4f}"})
+            progress_bar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
+    
+    if was_training:
+        model.train()
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    logger.info(f"Validation Loss: {avg_loss:.4f} (评估了 {num_batches}/{total_batches} 个批次)")
+    msg = f"Eval Loss: {avg_loss:.4f} (batches {num_batches}/{total_batches})"
+    if logger is not None:
+        logger.info(msg)
+    else:
+        print(f"\n  [Eval] {msg}")
     return avg_loss
 
 
@@ -759,12 +675,14 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         save_steps = merged_training_config.get("save_steps", 5000)
     
     eval_steps = merged_training_config.get("eval_steps", 5000)
+    max_eval_batches = merged_training_config.get("max_eval_batches", 50)
     logging_steps = merged_training_config.get("logging_steps", 100)
     
     # 打印训练参数信息
     print(f"\n训练参数（从配置文件读取）:")
     print(f"  save_steps: {save_steps}")
     print(f"  eval_steps: {eval_steps}")
+    print(f"  max_eval_batches: {max_eval_batches}")
     print(f"  logging_steps: {logging_steps}")
     
     # 2. 加载LeRobot数据集
@@ -798,62 +716,77 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     fps = dataset_info.get("fps", 10)
     print(f"  数据集FPS（从info.json）: {fps}")
     
-    # 创建归一化器
-    print(f"\n步骤2.6: 创建数据归一化器")
-    try:
-        normalizer = create_normalizer_from_dataset(dataset_path_obj)
-        print(f"  ✓ 归一化器创建成功")
-        if normalizer.action_min is not None:
-            print(f"  Action范围: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
-        if normalizer.state_min is not None:
-            print(f"  State范围: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
-    except Exception as e:
-        print(f"  ✗ 归一化器创建失败: {e}")
-        print(f"  警告: 将不使用归一化，训练可能不稳定")
-        normalizer = None
-    
     # 创建delta_timestamps
     delta_timestamps = create_delta_timestamps(action_horizon, fps)
     print(f"  Action horizon: {action_horizon}")
-    
-    # 创建LeRobotDataset
-    print(f"  创建LeRobotDataset...")
-    # 验证info.json文件存在
+
+    # 创建LeRobotDataset（需先创建数据集，才能从 meta.episodes_stats 构建归一化器）
+    print(f"\n步骤2.6: 创建 LeRobotDataset 与归一化器")
     info_file = dataset_path_obj / "meta" / "info.json"
     if not info_file.exists():
         raise ValueError(f"本地数据集路径不存在或无效: {info_file}")
-    
+
     dataset_name = dataset_path_obj.name
-    root_path_str = str(dataset_path_obj)  # 使用数据集目录本身作为root，而不是父目录
-    
+    root_path_str = str(dataset_path_obj)
+
     print(f"  本地数据集路径: {dataset_path_obj}")
     print(f"  数据集名称 (repo_id): {dataset_name}")
-    print(f"  Root路径: {root_path_str}")
-    
     try:
-        lerobot_dataset = LeRobotDataset(
+        # 只训练一种task
+        episode_slice = [0, 22, 25, 28, 30, 41, 47, 59, 63, 73, 91, 116, 119, 172, 206, 234, 236,
+        237, 238, 239, 240, 242, 243, 266, 277, 286, 287, 307, 314, 315, 332, 339, 348, 350, 352,
+        353, 365, 366, 368, 370, 390, 393, 400, 411, 420]
+        # 使用 LeRobotDatasetSubset 以修复 episodes=subset 时 episode_data_index 索引越界
+        lerobot_dataset = LeRobotDatasetSubset(
             repo_id=dataset_name,
             root=root_path_str,
-            delta_timestamps=delta_timestamps
+            delta_timestamps=delta_timestamps,
+            episodes=episode_slice
         )
-        print(f"  ✓ 使用本地数据集创建成功: repo_id={dataset_name}, root={root_path_str}")
+        print(f"  ✓ LeRobotDataset 创建成功: repo_id={dataset_name}, root={root_path_str}")
     except Exception as e:
         print(f"  ✗ 创建LeRobotDataset失败: {e}")
         import traceback
         traceback.print_exc()
         raise
+
+    # 从 lerobot_dataset.meta.episodes_stats 创建归一化器（不遍历数据集、不依赖 episodes_stats.jsonl）
+    try:
+        normalizer = create_normalizer_from_lerobot_meta(
+            lerobot_dataset,
+            state_key=state_key,
+            action_key="action",
+        )
+        print(f"  ✓ 归一化器已从 meta.episodes_stats 创建")
+        if normalizer.action_min is not None:
+            print(f"  Action 范围（用于反归一化）: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
+        if normalizer.state_min is not None:
+            print(f"  State 范围（用于传入动作头前归一化）: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
+    except Exception as e:
+        print(f"  从 meta.episodes_stats 创建归一化器失败: {e}，尝试从 meta/episodes_stats.jsonl 创建")
+        try:
+            normalizer = create_normalizer_from_dataset(dataset_path_obj)
+            print(f"  ✓ 归一化器已从 episodes_stats.jsonl 创建")
+        except Exception as e2:
+            print(f"  ✗ 归一化器创建失败: {e2}")
+            print(f"  警告: 将不使用归一化，训练可能不稳定")
+            normalizer = None
     
     # 3. 创建数据加载器
     print(f"\n步骤3: 创建数据加载器")
     print(f"  Batch size: {batch_size}")
     print(f"  最大训练步数: {max_steps}")
     
+    normalize_action = data_config.get("normalize_action", True)
+    normalize_state = data_config.get("normalize_state", True)
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
         state_key=state_key,
         image_size=image_size,
         use_batch_task=use_batch_task,
-        normalizer=normalizer
+        normalizer=normalizer,
+        normalize_action=normalize_action,
+        normalize_state=normalize_state,
     )
     
     train_loader = DataLoader(
@@ -878,10 +811,13 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     vla_config = model_config.get("vla", {}).copy()
     vla_config["future_action_window_size"] = action_horizon - 1
     
+    use_state_vlm = vla_config.get("use_state_vlm", vla_config.get("use_state", True))
+    use_state_action_head = vla_config.get("use_state_action_head", vla_config.get("use_state", True))
     model = QwenGR00TVLAModel(
         vlm_config=vlm_config,
         action_head_config=action_head_config,
-        use_state=vla_config.get("use_state", True),
+        use_state_vlm=use_state_vlm,
+        use_state_action_head=use_state_action_head,
         state_dim=state_dim,
         future_action_window_size=action_horizon - 1
     )
@@ -936,7 +872,9 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                 state_key=state_key,
                 image_size=image_size,
                 use_batch_task=use_batch_task,
-                normalizer=normalizer
+                normalizer=normalizer,
+                normalize_action=normalize_action,
+                normalize_state=normalize_state,
             )
             # 重新创建DataLoader以使用新的collate_fn
             train_loader = DataLoader(
@@ -1052,6 +990,18 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                   f"Loss = {loss_value:.4f}, "
                   f"Avg Loss = {avg_loss:.4f}, "
                   f"LR = {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # 每eval_steps步进行一次验证评估，并在屏幕上显示结果
+        if (step + 1) % eval_steps == 0:
+            eval_loss = evaluate(
+                model,
+                train_loader,
+                device,
+                criterion=None,
+                logger=None,
+                max_eval_batches=max_eval_batches,
+            )
+            progress_bar.write(f"  [Eval] Step {step + 1}: Eval Loss = {eval_loss:.4f}")
         
         # 保存检查点（只在save_steps的倍数时保存，避免重复保存）
         if (step + 1) % save_steps == 0:

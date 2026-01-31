@@ -79,7 +79,9 @@ def _run_inference(
     images: Dict[str, torch.Tensor],
     instruction: str,
     states: Optional[torch.Tensor] = None,
-    normalizer: Optional[Normalizer] = None
+    normalizer: Optional[Normalizer] = None,
+    normalize_action: bool = True,
+    normalize_state: bool = True,
 ) -> np.ndarray:
     """
     运行推理（内部函数，避免循环导入）
@@ -90,6 +92,8 @@ def _run_inference(
         instruction: 文本指令
         states: 机器人状态
         normalizer: 动作归一化器
+        normalize_action: 是否对输出 action 反归一化
+        normalize_state: 是否对输入 state 归一化
         
     Returns:
         预测的动作序列 [T, action_dim]
@@ -99,13 +103,15 @@ def _run_inference(
     # 准备图像输入
     images_input = prepare_images_input(images, device)
     
-    # 处理状态
+    # 处理状态（按配置决定是否对输入 state 归一化）
     if states is not None:
         if not isinstance(states, torch.Tensor):
             states = torch.tensor(np.array(states), dtype=torch.float32)
         states = states.to(device)
         if states.dim() == 1:
             states = states.unsqueeze(0)
+        if normalize_state and normalizer is not None:
+            states = normalizer.normalize_state(states)
     elif model.use_state:
         states = torch.zeros(1, model.state_dim, device=device)
     
@@ -131,11 +137,11 @@ def _run_inference(
     if isinstance(actions, torch.Tensor):
         actions = actions.cpu().numpy()
     
-    # 反归一化
-    if normalizer is not None:
+    # 按配置决定是否对输出 action 反归一化
+    if normalize_action and normalizer is not None:
         actions = normalizer.denormalize_action(actions)
-        if isinstance(actions, torch.Tensor):
-            actions = actions.cpu().numpy()
+    if isinstance(actions, torch.Tensor):
+        actions = actions.cpu().numpy()
     
     # 返回action chunk [T, action_dim]
     if len(actions.shape) == 3:  # [B, T, action_dim]
@@ -253,7 +259,9 @@ def run_episode_in_simulation(
     normalizer: Optional[Normalizer] = None,
     max_steps: int = 200,
     render: bool = True,
-    action_horizon: int = 1
+    action_horizon: int = 1,
+    normalize_action: bool = True,
+    normalize_state: bool = True,
 ) -> Dict:
     """
     在仿真环境中运行一个episode
@@ -362,7 +370,9 @@ def run_episode_in_simulation(
                     images=images_dict,
                     instruction=instruction,
                     states=state,
-                    normalizer=normalizer
+                    normalizer=normalizer,
+                    normalize_action=normalize_action,
+                    normalize_state=normalize_state,
                 )
                 
                 # predicted_actions应该是 [T, action_dim] 格式

@@ -613,10 +613,13 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml"):
     else:
         print(f"  使用数据集的状态维度: {state_dim}")
     
+    use_state_vlm = vla_config.get("use_state_vlm", vla_config.get("use_state", True))
+    use_state_action_head = vla_config.get("use_state_action_head", vla_config.get("use_state", True))
     model = QwenGR00TVLAModel(
         vlm_config=vlm_config,
         action_head_config=action_head_config,
-        use_state=vla_config.get("use_state", True),
+        use_state_vlm=use_state_vlm,
+        use_state_action_head=use_state_action_head,
         state_dim=state_dim,  # 使用从数据集获取的实际状态维度
         future_action_window_size=action_horizon - 1
     )

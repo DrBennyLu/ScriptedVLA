@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -123,7 +123,7 @@ def load_dataset_frame(
         root=root_path_str,
         delta_timestamps=delta_timestamps
     )
-    
+
     if len(lerobot_dataset) == 0:
         raise ValueError(f"Dataset is empty: {dataset_path}")
     
@@ -196,9 +196,11 @@ def load_model_from_checkpoint(
     if not camera_names:
         camera_names = ["global_img", "left_wrist_img"]  # 默认值
     
-    # 获取状态配置
+    # 获取状态配置（优先从 model.vla 读取，否则从 data.robot_state 读取）
     robot_state_config = data_config.get("robot_state", {})
-    use_state = robot_state_config.get("use_state", True)
+    vla_config = model_config.get("vla", {})
+    use_state_vlm = vla_config.get("use_state_vlm", robot_state_config.get("use_state_vlm", robot_state_config.get("use_state", True)))
+    use_state_action_head = vla_config.get("use_state_action_head", robot_state_config.get("use_state_action_head", robot_state_config.get("use_state", True)))
     state_dim = robot_state_config.get("state_dim", 7)
     
     # 设置设备
@@ -208,13 +210,13 @@ def load_model_from_checkpoint(
         device = torch.device(device)
     
     # 创建模型
-    vla_config = model_config.get("vla", {})
     future_action_window_size = vla_config.get("future_action_window_size", 10)
     model = QwenGR00TVLAModel(
         vlm_config=model_config.get("vlm", {}),
         action_head_config=model_config.get("action_head", {}),
         camera_names=camera_names,
-        use_state=use_state,
+        use_state_vlm=use_state_vlm,
+        use_state_action_head=use_state_action_head,
         state_dim=state_dim,
         future_action_window_size=future_action_window_size
     )
@@ -319,7 +321,9 @@ def run_inference(
     image_keys: list,
     states: Optional[torch.Tensor] = None,
     normalizer: Optional[Normalizer] = None,
-    image_size: Optional[int] = None
+    image_size: Optional[int] = None,
+    normalize_action: bool = True,
+    normalize_state: bool = True,
 ) -> np.ndarray:
     """
     运行推理
@@ -332,6 +336,8 @@ def run_inference(
         states: 可选的状态信息
         normalizer: 可选的归一化器
         image_size: int, 可选，目标图像尺寸（如果指定，会将图像resize到此尺寸）
+        normalize_action: 是否对模型输出的 action 做反归一化（需 normalizer）
+        normalize_state: 是否对输入 state 做归一化后再送入模型（需 normalizer）
         
     Returns:
         np.ndarray: 预测的动作
@@ -355,13 +361,15 @@ def run_inference(
                 camera_names.append(camera_name)
         images_input = [[images_pil_dict[name] for name in camera_names]]
     
-    # 处理状态
+    # 处理状态（按配置决定是否对输入 state 归一化）
     if states is not None:
         if not isinstance(states, torch.Tensor):
             states = torch.tensor(np.array(states), dtype=torch.float32)
         states = states.to(device)
         if states.dim() == 1:
             states = states.unsqueeze(0)
+        if normalize_state and normalizer is not None:
+            states = normalizer.normalize_state(states)
     elif model.use_state:
         states = torch.zeros(1, model.state_dim, device=device)
     
@@ -387,11 +395,11 @@ def run_inference(
     if isinstance(actions, torch.Tensor):
         actions = actions.cpu().numpy()
     
-    # 反归一化
-    if normalizer is not None:
+    # 按配置决定是否对输出 action 反归一化
+    if normalize_action and normalizer is not None:
         actions = normalizer.denormalize_action(actions)
-        if isinstance(actions, torch.Tensor):
-            actions = actions.cpu().numpy()
+    if isinstance(actions, torch.Tensor):
+        actions = actions.cpu().numpy()
     
     # 返回 action chunk [T, action_dim]（去掉 batch 维）
     return actions.squeeze(0)
@@ -497,7 +505,10 @@ def main():
     if states is not None and isinstance(states, torch.Tensor):
         states = states.numpy()
     
-    # 5. 运行推理
+    # 5. 运行推理（从 config 读取是否对 action/state 做归一化）
+    data_config = get_data_config(config)
+    normalize_action = data_config.get("normalize_action", True)
+    normalize_state = data_config.get("normalize_state", True)
     print("\n[Step 4] 运行推理...")
     predicted_actions = run_inference(
         model=model,
@@ -506,7 +517,9 @@ def main():
         image_keys=image_keys,
         states=states,
         normalizer=normalizer,
-        image_size=image_size
+        image_size=image_size,
+        normalize_action=normalize_action,
+        normalize_state=normalize_state,
     )
     print(f"  ✓ 推理成功")
     print(f"    预测action chunk形状: {predicted_actions.shape}")

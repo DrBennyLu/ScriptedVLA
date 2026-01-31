@@ -29,6 +29,7 @@ Qwen VLM模型封装
 
 import torch
 import torch.nn as nn
+import os
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from typing import Optional, Tuple, Dict, List, Union
 from PIL import Image
@@ -98,26 +99,43 @@ class QwenVLM(nn.Module):
         self.use_state = use_state
         self.state_dim = state_dim
         
-        # 加载Qwen VLM模型和处理器
+        # 如果指定了cache_dir，设置环境变量强制离线模式，防止联网
+        # 必须在调用 from_pretrained 之前设置
         if cache_dir:
+            # 设置环境变量强制离线模式
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE"] = "1"
             print(f"Loading Qwen VLM model from cache: {model_name} (cache: {cache_dir})")
+            print("  Offline mode enabled: TRANSFORMERS_OFFLINE=1, HF_HUB_OFFLINE=1")
         else:
             print(f"Loading Qwen VLM model: {model_name}")
         
         try:
             # 尝试加载processor（Qwen2-VL使用AutoProcessor）
+            processor_kwargs = {
+                "cache_dir": cache_dir,
+                "trust_remote_code": True
+            }
+            # 如果指定了cache_dir，强制只使用本地文件，不联网
+            if cache_dir:
+                processor_kwargs["local_files_only"] = True
             self.processor = AutoProcessor.from_pretrained(
                 model_name,
-                cache_dir=cache_dir,
-                trust_remote_code=True
+                **processor_kwargs
             )
         except Exception as e:
             # 如果没有processor，使用tokenizer
             print(f"Warning: Failed to load processor, trying tokenizer: {e}")
+            tokenizer_kwargs = {
+                "cache_dir": cache_dir,
+                "trust_remote_code": True
+            }
+            # 如果指定了cache_dir，强制只使用本地文件，不联网
+            if cache_dir:
+                tokenizer_kwargs["local_files_only"] = True
             self.processor = AutoTokenizer.from_pretrained(
                 model_name,
-                cache_dir=cache_dir,
-                trust_remote_code=True
+                **tokenizer_kwargs
             )
         
         # 加载模型（优先使用Qwen2VLForConditionalGeneration）
@@ -130,6 +148,9 @@ class QwenVLM(nn.Module):
                     "torch_dtype": "auto",
                     "trust_remote_code": True
                 }
+                # 如果指定了cache_dir，强制只使用本地文件，不联网
+                if cache_dir:
+                    load_kwargs["local_files_only"] = True
                 # 只有在没有指定cache_dir时才使用device_map="auto"
                 # 因为device_map="auto"可能与手动设备控制冲突
                 if cache_dir is None:
@@ -154,11 +175,16 @@ class QwenVLM(nn.Module):
                 # 回退到AutoModelForCausalLM
                 try:
                     from transformers import AutoModelForCausalLM
+                    fallback_kwargs = {
+                        "cache_dir": cache_dir,
+                        "torch_dtype": torch.float32,
+                        "trust_remote_code": True
+                    }
+                    if cache_dir:
+                        fallback_kwargs["local_files_only"] = True
                     self.model = AutoModelForCausalLM.from_pretrained(
                         model_name,
-                        cache_dir=cache_dir,
-                        torch_dtype=torch.float32,
-                        trust_remote_code=True
+                        **fallback_kwargs
                     )
                     print(f"✓ 使用 AutoModelForCausalLM 加载")
                 except Exception as e2:
@@ -170,22 +196,32 @@ class QwenVLM(nn.Module):
             # 对于非Qwen2-VL模型，使用AutoModelForCausalLM
             try:
                 from transformers import AutoModelForCausalLM
+                model_kwargs = {
+                    "cache_dir": cache_dir,
+                    "torch_dtype": torch.float32,
+                    "trust_remote_code": True
+                }
+                if cache_dir:
+                    model_kwargs["local_files_only"] = True
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    cache_dir=cache_dir,
-                    torch_dtype=torch.float32,
-                    trust_remote_code=True
+                    **model_kwargs
                 )
                 print(f"✓ 使用 AutoModelForCausalLM 加载")
                 self._use_device_map = False
             except Exception as e:
                 print(f"✗ AutoModelForCausalLM 加载失败: {e}")
                 # 最后尝试AutoModel
+                automodel_kwargs = {
+                    "cache_dir": cache_dir,
+                    "torch_dtype": torch.float32,
+                    "trust_remote_code": True
+                }
+                if cache_dir:
+                    automodel_kwargs["local_files_only"] = True
                 self.model = AutoModel.from_pretrained(
                     model_name,
-                    cache_dir=cache_dir,
-                    torch_dtype=torch.float32,
-                    trust_remote_code=True
+                    **automodel_kwargs
                 )
                 print(f"⚠ 使用 AutoModel 加载，可能不支持 generate 方法")
                 self._use_device_map = False

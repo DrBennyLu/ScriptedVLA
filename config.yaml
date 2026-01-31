@@ -9,10 +9,12 @@ model:
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
     cache_dir: "./cache/models"  # VLM模型本地缓存路径，如果为null则从HuggingFace下载
+    use_state: false  # VLM是否使用机器人状态（可选，未设置时使用 model.vla.use_state_vlm）
   
   # 动作头配置（Flow Matching）
   action_head:
     type: "flow_matching"  # Flow Matching动作头
+    use_state: true  # 动作头是否使用机器人状态（可选，未设置时使用 model.vla.use_state_action_head）
     hidden_dim: 1536  # 与VLM输出维度匹配
     num_layers: 6
     num_heads: 12
@@ -25,11 +27,15 @@ model:
     num_inference_timesteps: 10  # Flow Matching推理步数
     patch_size: 16
     num_patches: 196  # 14x14 patches for 224x224 image
+    norm_type: "ada_norm"
     
   # 完整VLA模型
   vla:
     use_cross_attention: true
     cross_attention_layers: 3
+    # 是否使用状态信息（VLM 与动作头独立配置）
+    use_state_vlm: false          # VLM 是否使用机器人状态（如关节角等）作为输入
+    use_state_action_head: true  # 动作头是否使用机器人状态
     # future_action_window_size: 未来动作窗口大小
     # 注意：action_horizon = future_action_window_size + 1
     # 如果action_horizon=11，则future_action_window_size=10
@@ -40,7 +46,7 @@ seed: 42
 
 # 训练配置
 training:
-  batch_size: 8
+  batch_size: 16
   num_epochs: 100
   learning_rate: 1e-4
   weight_decay: 0.01
@@ -63,7 +69,8 @@ training:
   # 保存配置
   save_dir: "./checkpoints"
   save_steps: 50    #5000
-  eval_steps: 50    #5000
+  eval_steps: 50    #5000  # 每隔多少步进行一次验证评估
+  max_eval_batches: 50     # 每次评估最多使用的 batch 数
   logging_steps: 10 #100
   
   # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
@@ -110,12 +117,17 @@ dataset:
 
 # 数据配置（用于获取默认状态维度等）
 data:
+  # 是否对 action/state 进行归一化（训练时归一化输入，推理时按配置反归一化输出或归一化输入 state）
+  normalize_action: false   # 训练时对 action 归一化，推理时对模型输出反归一化
+  normalize_state: false   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
+  
   # 机器人状态配置
   robot_state:
     # 状态维度（从配置中直接指定，不再从数据集自动获取）
     state_dim: 8
-    # 是否使用状态信息
-    use_state: true
+    # 是否使用状态信息（VLM 与动作头独立配置，若未设置则从 model.vla 读取）
+    use_state_vlm: false          # VLM 是否使用状态
+    use_state_action_head: true  # 动作头是否使用状态
 
 # 推理配置
 inference:
@@ -150,10 +162,12 @@ test:
       action_dim: 7
       action_horizon: 50
       num_inference_timesteps: 10
+      norm_type: "ada_norm"
     
     # VLA模型配置
     vla:
-      use_state: true
+      use_state_vlm: true
+      use_state_action_head: true
       state_dim: 8
       future_action_window_size: 49
   

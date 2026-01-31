@@ -13,7 +13,9 @@ from .logger import setup_logger, log_model_info
 from .normalization import (
     Normalizer,
     create_normalizer_from_dataset,
-    compute_normalization_stats_from_episodes_stats
+    create_normalizer_from_lerobot_meta,
+    compute_normalization_stats_from_episodes_stats,
+    compute_normalization_stats_from_episodes_stats_items,
 )
 
 __all__ = [
@@ -26,6 +28,8 @@ __all__ = [
     "log_model_info",
     "Normalizer",
     "create_normalizer_from_dataset",
-    "compute_normalization_stats_from_episodes_stats"
+    "create_normalizer_from_lerobot_meta",
+    "compute_normalization_stats_from_episodes_stats",
+    "compute_normalization_stats_from_episodes_stats_items",
 ]
 
