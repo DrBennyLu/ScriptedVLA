@@ -39,7 +39,12 @@ from src.ScriptedVLA.utils import (
     get_data_config,
     Normalizer
 )
-from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
+from train import (
+    load_dataset_info,
+    get_state_dim_from_info,
+    create_delta_timestamps,
+    LeRobotDatasetSubset,
+)
 from PIL import Image
 
 try:
@@ -172,6 +177,94 @@ def load_dataset_frame(
     # 注意：如果没有找到状态数据，result中不会有"state"键，这是正常的
     
     return result
+
+
+def load_dataset_episode(
+    dataset_path: str,
+    episode_id: int = 0,
+    config_path: str = "config.yaml"
+) -> list:
+    """
+    从数据集加载一个episode的所有帧数据
+    使用 LeRobotDatasetSubset(episodes=[episode_id]) 创建只含该 episode 的子集，避免遍历全量数据。
+
+    Args:
+        dataset_path: 数据集路径
+        episode_id: episode ID
+        config_path: 配置文件路径
+
+    Returns:
+        包含该episode所有帧的列表，按 step_id 排序
+    """
+    if not HAS_LEROBOT or LeRobotDatasetSubset is None:
+        raise ImportError("lerobot library not installed. Install with: pip install lerobot==0.3.3")
+
+    config = load_config(config_path)
+    dataset_config = config.get("dataset", {})
+
+    dataset_dir = Path(dataset_path).resolve()
+    if not dataset_dir.exists():
+        raise ValueError(f"Dataset path does not exist: {dataset_dir}")
+
+    dataset_info = load_dataset_info(dataset_dir)
+    fps = dataset_info.get("fps", 10)
+    action_horizon = dataset_config.get("action_horizon", 50)
+    delta_timestamps = create_delta_timestamps(action_horizon, fps)
+
+    dataset_name = dataset_dir.name
+    root_path_str = str(dataset_dir)
+
+    # 使用 episodes=[episode_id] 创建只含该 episode 的子集
+    lerobot_dataset = LeRobotDatasetSubset(
+        repo_id=dataset_name,
+        root=root_path_str,
+        delta_timestamps=delta_timestamps,
+        episodes=[episode_id],
+    )
+
+    if len(lerobot_dataset) == 0:
+        raise ValueError(f"No frames found for episode {episode_id}")
+
+    episode_frames = []
+    for idx in range(len(lerobot_dataset)):
+        sample = lerobot_dataset[idx]
+        result = {}
+        images_dict = {}
+        image_keys = [k for k in sample.keys() if k.startswith("observation.images.")]
+
+        if image_keys:
+            for key in image_keys:
+                camera_name = key.replace("observation.images.", "")
+                img_tensor = sample[key]
+                if isinstance(img_tensor, torch.Tensor):
+                    images_dict[camera_name] = img_tensor
+            result["images"] = images_dict if images_dict else {}
+        else:
+            result["images"] = {}
+
+        if "task" in sample:
+            result["text"] = sample["task"]
+        elif "instruction" in sample:
+            result["text"] = sample["instruction"]
+        else:
+            result["text"] = "Perform the task"
+
+        if "action" in sample:
+            result["action"] = sample["action"]
+
+        if "observation.state" in sample:
+            result["state"] = sample["observation.state"]
+        elif "observation" in sample and "state" in sample["observation"]:
+            result["state"] = sample["observation"]["state"]
+        elif "state" in sample:
+            result["state"] = sample["state"]
+
+        result["episode_id"] = sample.get("episode_index", episode_id)
+        result["step_id"] = sample.get("frame_index", idx)
+        episode_frames.append(result)
+
+    episode_frames.sort(key=lambda x: x.get("step_id", 0))
+    return episode_frames
 
 
 def load_model_from_checkpoint(

@@ -25,7 +25,7 @@ model:
     # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
     action_horizon: 50  # 默认值，可以根据需要调整（实际值会从dataset配置中读取）
     num_inference_timesteps: 10  # Flow Matching推理步数
-    patch_size: 16
+    patch_size: 8
     num_patches: 196  # 14x14 patches for 224x224 image
     norm_type: "ada_norm"
     
@@ -46,7 +46,7 @@ seed: 42
 
 # 训练配置
 training:
-  batch_size: 16
+  batch_size: 8
   num_epochs: 100
   learning_rate: 1e-4
   weight_decay: 0.01
@@ -68,13 +68,14 @@ training:
   
   # 保存配置
   save_dir: "./checkpoints"
-  save_steps: 50    #5000
-  eval_steps: 50    #5000  # 每隔多少步进行一次验证评估
-  max_eval_batches: 50     # 每次评估最多使用的 batch 数
-  logging_steps: 10 #100
+  save_steps: 2500    #5000
+  eval_steps: 2500    #5000  # 每隔多少步进行一次验证评估
+  max_eval_batches: 1     # 每次评估最多使用的 batch 数
+  logging_steps: 100 #100
   
   # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
-  max_steps: 100    #20000
+  # 100 步远远不足，建议至少 5000–20000 步才能学到合理策略
+  max_steps: 5000   #20000
   
   # 混合精度训练
   fp16: false
@@ -118,8 +119,9 @@ dataset:
 # 数据配置（用于获取默认状态维度等）
 data:
   # 是否对 action/state 进行归一化（训练时归一化输入，推理时按配置反归一化输出或归一化输入 state）
-  normalize_action: false   # 训练时对 action 归一化，推理时对模型输出反归一化
-  normalize_state: false   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
+  # 重要：Flow Matching 应在归一化空间 [-1,1] 训练，否则各维度尺度差异大、符号易错、难以收敛
+  normalize_action: true   # 训练时对 action 归一化，推理时对模型输出反归一化（强烈建议开启）
+  normalize_state: true   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
   
   # 机器人状态配置
   robot_state:

@@ -306,12 +306,12 @@ class FlowMatchingActionHead(nn.Module):
     
     def __init__(
         self,
-        hidden_dim: int = 768,
+        hidden_dim: int = 1536,
         num_layers: int = 6,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         action_dim: int = 7,
-        action_horizon: int = 10,  # 动作序列长度
+        action_horizon: int = 50,  # 动作序列长度
         dropout: float = 0.1,
         use_cross_attention: bool = True,
         use_state: bool = True,
@@ -323,7 +323,7 @@ class FlowMatchingActionHead(nn.Module):
         noise_beta_beta: float = 1.0,
         noise_s: float = 0.999,
         num_timestep_buckets: int = 1000,
-        num_inference_timesteps: int = 50,
+        num_inference_timesteps: int = 10,
         cross_attention_dim: Optional[int] = None,
         norm_type: str = "ada_norm",  # 'layer_norm' or 'ada_norm'
         norm_elementwise_affine: bool = False,
@@ -551,8 +551,8 @@ class FlowMatchingActionHead(nn.Module):
             vlm_features_seq = vlm_features_seq.to(dtype=torch.float32)
             vlm_features_seq = self.vlm_projection(vlm_features_seq)
         
-        # 训练模式：计算Flow Matching损失
-        if actions is not None and self.training:
+        # 提供 actions 时计算 Flow Matching 损失（训练与评估均可用）
+        if actions is not None:
             # 采样噪声和时间步
             noise = torch.randn_like(actions)  # [B, action_horizon, action_dim]
             t = self.sample_time(batch_size, device, actions.dtype)  # [B]
@@ -644,7 +644,7 @@ class FlowMatchingActionHead(nn.Module):
             return loss
 
         raise ValueError(
-            "forward() 仅用于训练且需提供 actions；"
+            "forward() 在训练/评估时需提供 actions；"
             "推理请使用 predict_action(vlm_features, states, encoder_attention_mask)。"
         )
 
@@ -780,5 +780,7 @@ class FlowMatchingActionHead(nn.Module):
             # Euler积分更新动作
             actions = actions + dt * pred_velocity
         
+        # 推理输出裁剪：若训练使用归一化空间 [-1,1]，推理时 clamp 可避免极端值导致反归一化异常
+        actions = torch.clamp(actions, -1.0, 1.0)
         return actions
 

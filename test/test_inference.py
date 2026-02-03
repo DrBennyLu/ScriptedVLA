@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -44,7 +44,13 @@ from PIL import Image
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from inference import load_model_from_checkpoint, run_inference, prepare_images_input
+from inference import (
+    load_model_from_checkpoint,
+    run_inference,
+    prepare_images_input,
+    load_dataset_episode,
+    find_latest_checkpoint,
+)
 from src.ScriptedVLA.utils import load_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter
 from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
@@ -885,147 +891,6 @@ def test_inference_from_dataset(
         return result
 
 
-def load_dataset_episode(
-    dataset_path: str,
-    episode_id: int = 0,
-    config_path: str = "config.yaml"
-) -> List[Dict]:
-    """
-    从数据集中加载一个完整的episode
-    
-    Args:
-        dataset_path: 数据集路径
-        episode_id: episode ID
-        config_path: 配置文件路径
-        
-    Returns:
-        包含该episode所有帧的列表，按step_id排序
-    """
-    if not HAS_LEROBOT:
-        raise ImportError(
-            "lerobot library not installed. "
-            "Install with: pip install lerobot==0.3.3"
-        )
-    
-    # 加载配置
-    config = load_config(config_path)
-    dataset_config = config.get("dataset", {})
-    
-    # 获取数据集信息
-    dataset_dir = Path(dataset_path).resolve()
-    if not dataset_dir.exists():
-        raise ValueError(f"Dataset path does not exist: {dataset_dir}")
-    
-    dataset_info = load_dataset_info(dataset_dir)
-    fps = dataset_info.get("fps", 10)
-    action_horizon = dataset_config.get("action_horizon", 50)
-    
-    # 创建delta_timestamps
-    delta_timestamps = create_delta_timestamps(action_horizon, fps)
-    
-    # 创建LeRobotDataset（与test_training.py一致）
-    dataset_name = dataset_dir.name
-    root_path_str = str(dataset_dir)
-    
-    print(f"Loading dataset from: {dataset_dir}")
-    lerobot_dataset = LeRobotDataset(
-        repo_id=dataset_name,
-        root=root_path_str,
-        delta_timestamps=delta_timestamps
-    )
-    
-    # 检查数据集长度
-    if len(lerobot_dataset) == 0:
-        raise ValueError(f"Dataset is empty: {dataset_path}")
-    
-    # 收集该episode的所有帧
-    episode_frames = []
-    print(f"Searching for frames in episode {episode_id}...")
-    
-    for idx in range(len(lerobot_dataset)):
-        sample = lerobot_dataset[idx]
-        
-        # 获取episode_index
-        sample_episode_id = sample.get("episode_index", -1)
-        
-        if sample_episode_id == episode_id:
-            # 转换样本格式
-            result = {}
-            
-            # 处理图像（LeRobotDataset返回的格式：键名是 observation.images.{camera_name}）
-            images_dict = {}
-            image_keys = [k for k in sample.keys() if k.startswith("observation.images.")]
-            
-            if image_keys:
-                for key in image_keys:
-                    # 提取相机名称（例如 "observation.images.image" -> "image"）
-                    camera_name = key.replace("observation.images.", "")
-                    img_tensor = sample[key]
-                    
-                    # LeRobotDataset返回的是 [C, H, W] 格式的tensor
-                    if isinstance(img_tensor, torch.Tensor):
-                        images_dict[camera_name] = img_tensor
-                
-                if len(images_dict) > 0:
-                    result["images"] = images_dict
-                else:
-                    result["images"] = {}
-            else:
-                # 尝试其他可能的格式
-                if "observation" in sample and "images" in sample["observation"]:
-                    obs_images = sample["observation"]["images"]
-                    if isinstance(obs_images, dict) and len(obs_images) > 0:
-                        result["images"] = obs_images
-                    else:
-                        result["images"] = {}
-                elif "images" in sample:
-                    images = sample["images"]
-                    if isinstance(images, dict) and len(images) > 0:
-                        result["images"] = images
-                    else:
-                        result["images"] = {}
-                else:
-                    result["images"] = {}
-            
-            # 处理文本指令
-            if "task" in sample:
-                result["text"] = sample["task"]
-            elif "instruction" in sample:
-                result["text"] = sample["instruction"]
-            else:
-                result["text"] = "Perform the task"
-            
-            # 处理动作
-            if "action" in sample:
-                result["action"] = sample["action"]
-            
-            # 处理状态
-            if "observation.state" in sample:
-                result["state"] = sample["observation.state"]
-            elif "observation" in sample and "state" in sample["observation"]:
-                result["state"] = sample["observation"]["state"]
-            elif "state" in sample:
-                result["state"] = sample["state"]
-            
-            # 处理episode和step信息
-            result["episode_id"] = sample_episode_id
-            if "frame_index" in sample:
-                result["step_id"] = sample["frame_index"]
-            else:
-                result["step_id"] = idx  # 使用索引作为step_id
-            
-            episode_frames.append(result)
-    
-    # 按step_id排序
-    episode_frames.sort(key=lambda x: x.get("step_id", 0))
-    
-    if not episode_frames:
-        raise ValueError(f"No frames found for episode {episode_id}")
-    
-    print(f"Found {len(episode_frames)} frames in episode {episode_id}")
-    return episode_frames
-
-
 def test_episode_inference_with_3d_visualization(
     dataset_path: str = "./dataset/libero_object",
     checkpoint_path: str = "./checkpoints/best_model.pt",
@@ -1083,6 +948,18 @@ def test_episode_inference_with_3d_visualization(
     }
     
     try:
+        # 0. 解析checkpoint路径（支持目录，与inference.py一致）
+        checkpoint_path_obj = Path(checkpoint_path)
+        if checkpoint_path_obj.is_dir():
+            latest_ckpt = find_latest_checkpoint(checkpoint_path_obj)
+            if latest_ckpt is None:
+                error_msg = f"目录中未找到checkpoint: {checkpoint_path}"
+                print(f"  ✗ {error_msg}")
+                result["errors"].append(error_msg)
+                return result
+            checkpoint_path = str(latest_ckpt)
+            print(f"\n使用目录中的最新checkpoint: {checkpoint_path}")
+        
         # 1. 验证checkpoint
         print("\n[Step 1] 验证checkpoint文件...")
         is_valid, checkpoint_info = validate_checkpoint(checkpoint_path, config_path, device, dataset_path=dataset_path)
@@ -1186,6 +1063,11 @@ def test_episode_inference_with_3d_visualization(
             
             # 提取指令
             instruction = sample.get("text", sample.get("instruction", "Perform the task"))
+            
+            # 必须有GT action才能对比轨迹
+            true_action_raw = sample.get("action")
+            if true_action_raw is None:
+                continue
             
             # 提取状态
             states = None
@@ -1304,7 +1186,7 @@ def test_episode_inference_with_3d_visualization(
                     print(f"    警告: 无法获取chat内容: {e}")
                     print(f"    使用原始指令: {instruction}")
             
-            # 运行推理
+                # 运行推理（与inference.py的run_inference调用方式一致）
             try:
                 predicted_action = run_inference(
                     model=model,
@@ -1318,27 +1200,25 @@ def test_episode_inference_with_3d_visualization(
                     normalize_state=normalize_state,
                 )
                 
-                # 提取x, y, z（前三维）
-                if len(predicted_action.shape) == 1:
-                    pred_xyz = predicted_action[:3]  # [x, y, z]
-                elif len(predicted_action.shape) == 2:
-                    pred_xyz = predicted_action[0, :3]  # 取第一个时间步的x, y, z
+                # 提取x, y, z（前三维）- run_inference返回 [T, action_dim]，取第一个时间步作为当前帧的目标位姿
+                pred_action = np.asarray(predicted_action)
+                if pred_action.ndim == 1:
+                    pred_xyz = pred_action[:3].astype(np.float64)
                 else:
-                    pred_xyz = predicted_action.flatten()[:3]
+                    pred_xyz = pred_action[0, :3].astype(np.float64)
                 
                 predicted_xyz_list.append(pred_xyz)
                 
-                # 提取真实动作的x, y, z
-                true_action = sample.get("action")
+                # 提取真实动作的x, y, z（与inference.py中GT处理逻辑一致）
+                true_action = true_action_raw
                 if isinstance(true_action, torch.Tensor):
                     true_action = true_action.numpy()
+                true_action = np.asarray(true_action)
                 
-                if len(true_action.shape) == 1:
-                    true_xyz = true_action[:3]  # [x, y, z]
-                elif len(true_action.shape) == 2:
-                    true_xyz = true_action[0, :3]  # 取第一个时间步的x, y, z
+                if true_action.ndim == 1:
+                    true_xyz = true_action[:3].astype(np.float64)
                 else:
-                    true_xyz = true_action.flatten()[:3]
+                    true_xyz = true_action[0, :3].astype(np.float64)
                 
                 true_xyz_list.append(true_xyz)
                 
@@ -1376,100 +1256,87 @@ def test_episode_inference_with_3d_visualization(
         result["true_xyz"] = true_xyz
         result["mae"] = mae_overall
         
-        # 6. 绘制3D轨迹对比图
-        print(f"\n[Step 5] 绘制3D轨迹对比图...")
+        # 6. 绘制轨迹对比图（3D + 2D曲线）
+        print(f"\n[Step 5] 绘制轨迹对比图...")
         
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
+        frame_indices = np.arange(len(predicted_xyz))
         
-        # 绘制真实轨迹（蓝色）
-        ax.plot(
-            true_xyz[:, 0], 
-            true_xyz[:, 1], 
-            true_xyz[:, 2], 
-            'b-', 
-            linewidth=2, 
-            label='Ground Truth',
-            alpha=0.7
-        )
-        ax.scatter(
-            true_xyz[0, 0], 
-            true_xyz[0, 1], 
-            true_xyz[0, 2], 
-            c='blue', 
-            marker='o', 
-            s=100, 
-            label='GT Start'
-        )
-        ax.scatter(
-            true_xyz[-1, 0], 
-            true_xyz[-1, 1], 
-            true_xyz[-1, 2], 
-            c='blue', 
-            marker='s', 
-            s=100, 
-            label='GT End'
-        )
+        # 创建 2x2 子图：左上3D轨迹，右上/下为 x/y/z 随时间曲线
+        fig = plt.figure(figsize=(14, 12))
         
-        # 绘制预测轨迹（红色）
-        ax.plot(
-            predicted_xyz[:, 0], 
-            predicted_xyz[:, 1], 
-            predicted_xyz[:, 2], 
-            'r--', 
-            linewidth=2, 
-            label='Predicted',
-            alpha=0.7
-        )
-        ax.scatter(
-            predicted_xyz[0, 0], 
-            predicted_xyz[0, 1], 
-            predicted_xyz[0, 2], 
-            c='red', 
-            marker='o', 
-            s=100, 
-            label='Pred Start'
-        )
-        ax.scatter(
-            predicted_xyz[-1, 0], 
-            predicted_xyz[-1, 1], 
-            predicted_xyz[-1, 2], 
-            c='red', 
-            marker='s', 
-            s=100, 
-            label='Pred End'
-        )
+        # 3D轨迹图
+        ax_3d = fig.add_subplot(2, 2, 1, projection='3d')
         
-        ax.set_xlabel('X', fontsize=12)
-        ax.set_ylabel('Y', fontsize=12)
-        ax.set_zlabel('Z', fontsize=12)
-        ax.set_title(f'Episode {episode_id} - Action Trajectory Comparison (XYZ)\n'
-                    f'MAE: ({mae[0]:.4f}, {mae[1]:.4f}, {mae[2]:.4f}) | Overall: {mae_overall:.4f}', 
-                    fontsize=14)
-        ax.legend(loc='best')
-        ax.grid(True)
+        # 绘制真实轨迹（蓝色实线）
+        ax_3d.plot(
+            true_xyz[:, 0], true_xyz[:, 1], true_xyz[:, 2],
+            'b-', linewidth=2, label='Ground Truth', alpha=0.8
+        )
+        ax_3d.scatter(true_xyz[0, 0], true_xyz[0, 1], true_xyz[0, 2],
+                      c='blue', marker='o', s=80, label='GT Start')
+        ax_3d.scatter(true_xyz[-1, 0], true_xyz[-1, 1], true_xyz[-1, 2],
+                      c='blue', marker='s', s=80, label='GT End')
         
-        # 设置相等的坐标轴比例
+        # 绘制预测轨迹（红色虚线）
+        ax_3d.plot(
+            predicted_xyz[:, 0], predicted_xyz[:, 1], predicted_xyz[:, 2],
+            'r--', linewidth=2, label='Predicted', alpha=0.8
+        )
+        ax_3d.scatter(predicted_xyz[0, 0], predicted_xyz[0, 1], predicted_xyz[0, 2],
+                      c='red', marker='o', s=80, label='Pred Start')
+        ax_3d.scatter(predicted_xyz[-1, 0], predicted_xyz[-1, 1], predicted_xyz[-1, 2],
+                      c='red', marker='s', s=80, label='Pred End')
+        
+        ax_3d.set_xlabel('X')
+        ax_3d.set_ylabel('Y')
+        ax_3d.set_zlabel('Z')
+        ax_3d.set_title(f'3D Trajectory (MAE: {mae_overall:.4f})')
+        ax_3d.legend(loc='best', fontsize=8)
+        ax_3d.grid(True)
+        
+        # 设置3D坐标轴等比例
+        all_xyz = np.vstack([predicted_xyz, true_xyz])
         max_range = np.array([
-            predicted_xyz[:, 0].max() - predicted_xyz[:, 0].min(),
-            predicted_xyz[:, 1].max() - predicted_xyz[:, 1].min(),
-            predicted_xyz[:, 2].max() - predicted_xyz[:, 2].min(),
-            true_xyz[:, 0].max() - true_xyz[:, 0].min(),
-            true_xyz[:, 1].max() - true_xyz[:, 1].min(),
-            true_xyz[:, 2].max() - true_xyz[:, 2].min()
+            all_xyz[:, 0].max() - all_xyz[:, 0].min(),
+            all_xyz[:, 1].max() - all_xyz[:, 1].min(),
+            all_xyz[:, 2].max() - all_xyz[:, 2].min()
         ]).max() / 2.0
+        mid = all_xyz.mean(axis=0)
+        ax_3d.set_xlim(mid[0] - max_range, mid[0] + max_range)
+        ax_3d.set_ylim(mid[1] - max_range, mid[1] + max_range)
+        ax_3d.set_zlim(mid[2] - max_range, mid[2] + max_range)
         
-        mid_x = (predicted_xyz[:, 0].max() + predicted_xyz[:, 0].min() + 
-                true_xyz[:, 0].max() + true_xyz[:, 0].min()) / 4.0
-        mid_y = (predicted_xyz[:, 1].max() + predicted_xyz[:, 1].min() + 
-                true_xyz[:, 1].max() + true_xyz[:, 1].min()) / 4.0
-        mid_z = (predicted_xyz[:, 2].max() + predicted_xyz[:, 2].min() + 
-                true_xyz[:, 2].max() + true_xyz[:, 2].min()) / 4.0
+        # 2D 曲线：X / Y / Z 随时间变化
+        ax_x = fig.add_subplot(2, 2, 2)
+        ax_x.plot(frame_indices, true_xyz[:, 0], 'b-', linewidth=2, label='GT')
+        ax_x.plot(frame_indices, predicted_xyz[:, 0], 'r--', linewidth=2, label='Pred')
+        ax_x.set_xlabel('Frame')
+        ax_x.set_ylabel('X')
+        ax_x.set_title('X vs Frame')
+        ax_x.legend()
+        ax_x.grid(True)
         
-        ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+        ax_y = fig.add_subplot(2, 2, 3)
+        ax_y.plot(frame_indices, true_xyz[:, 1], 'b-', linewidth=2, label='GT')
+        ax_y.plot(frame_indices, predicted_xyz[:, 1], 'r--', linewidth=2, label='Pred')
+        ax_y.set_xlabel('Frame')
+        ax_y.set_ylabel('Y')
+        ax_y.set_title('Y vs Frame')
+        ax_y.legend()
+        ax_y.grid(True)
         
+        ax_z = fig.add_subplot(2, 2, 4)
+        ax_z.plot(frame_indices, true_xyz[:, 2], 'b-', linewidth=2, label='GT')
+        ax_z.plot(frame_indices, predicted_xyz[:, 2], 'r--', linewidth=2, label='Pred')
+        ax_z.set_xlabel('Frame')
+        ax_z.set_ylabel('Z')
+        ax_z.set_title('Z vs Frame')
+        ax_z.legend()
+        ax_z.grid(True)
+        
+        fig.suptitle(f'Episode {episode_id} - Robot Trajectory Comparison\n'
+                     f'MAE (x,y,z): ({mae[0]:.4f}, {mae[1]:.4f}, {mae[2]:.4f}) | Overall: {mae_overall:.4f}',
+                     fontsize=12)
         plt.tight_layout()
         
         # 保存或显示图像

@@ -777,8 +777,8 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"  Batch size: {batch_size}")
     print(f"  最大训练步数: {max_steps}")
     
-    normalize_action = data_config.get("normalize_action", True)
-    normalize_state = data_config.get("normalize_state", True)
+    normalize_action = data_config.get("normalize_action", False)
+    normalize_state = data_config.get("normalize_state", False)
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
         state_key=state_key,
@@ -789,16 +789,23 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         normalize_state=normalize_state,
     )
     
-    train_loader = DataLoader(
-        lerobot_dataset,
-        batch_size=batch_size,
-        shuffle=dataloader_config.get("shuffle", True),
-        num_workers=dataloader_config.get("num_workers", 0),
-        pin_memory=dataloader_config.get("pin_memory", False),
-        collate_fn=custom_collate_fn
-    )
+    num_workers = dataloader_config.get("num_workers", 0)
+    dataloader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": dataloader_config.get("shuffle", True),
+        "num_workers": num_workers,
+        "pin_memory": dataloader_config.get("pin_memory", False),
+        "collate_fn": custom_collate_fn,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = dataloader_config.get("prefetch_factor", 2)
+    
+    train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
     
     print(f"  数据加载器长度: {len(train_loader)} batches")
+    if num_workers == 0:
+        print(f"  提示: 若每步较慢，可在 config 的 dataset.dataloader 中设置 num_workers=2 或 4 以预取数据（Windows 下若报错可保持 0）")
     
     # 4. 创建模型
     print(f"\n步骤4: 创建模型")
@@ -876,15 +883,8 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                 normalize_action=normalize_action,
                 normalize_state=normalize_state,
             )
-            # 重新创建DataLoader以使用新的collate_fn
-            train_loader = DataLoader(
-                lerobot_dataset,
-                batch_size=batch_size,
-                shuffle=dataloader_config.get("shuffle", True),
-                num_workers=dataloader_config.get("num_workers", 0),
-                pin_memory=dataloader_config.get("pin_memory", False),
-                collate_fn=custom_collate_fn
-            )
+            dataloader_kwargs["collate_fn"] = custom_collate_fn
+            train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
         
         # 使用检查点中保存的实际步数，而不是文件名中的步数
         # 因为检查点中的步数更准确
@@ -906,29 +906,22 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     
     # 创建数据加载器的迭代器，以便循环使用
     loader_iter = iter(train_loader)
-    # 调试：检查第一个batch的状态数据
-    print(f"\n[调试] 检查第一个batch的状态数据...")
-    try:
-        test_batch = next(iter(train_loader))
-        print(f"  Batch中的键: {list(test_batch.keys())}")
-        if "state" in test_batch:
-            state_data = test_batch["state"]
-            print(f"  状态数据形状: {state_data.shape}")
-            print(f"  状态数据类型: {type(state_data)}")
-            if isinstance(state_data, torch.Tensor):
-                print(f"  状态数据范围: [{state_data.min().item():.4f}, {state_data.max().item():.4f}]")
-                print(f"  状态数据均值: {state_data.mean().item():.4f}")
-                print(f"  状态数据前3个样本的前5个值:")
-                for i in range(min(3, state_data.shape[0])):
-                    print(f"    样本{i}: {state_data[i, :min(5, state_data.shape[1])].tolist()}")
-        else:
-            print(f"  ⚠️  警告: batch中没有'state'键！")
-            print(f"  这可能导致模型无法使用状态信息。")
-    except Exception as e:
-        print(f"  ⚠️  无法检查第一个batch: {e}")
-        import traceback
-        traceback.print_exc()
-    
+    # 仅在调试模式下预加载一个 batch 并打印状态（避免正常训练时多一次耗时加载）
+    if os.environ.get("SCRIPTEDVLA_DEBUG"):
+        print(f"\n[调试] 检查第一个batch的状态数据...")
+        try:
+            test_batch = next(iter(train_loader))
+            print(f"  Batch中的键: {list(test_batch.keys())}")
+            if "state" in test_batch:
+                state_data = test_batch["state"]
+                print(f"  状态数据形状: {state_data.shape}")
+                if isinstance(state_data, torch.Tensor):
+                    print(f"  状态数据前2个样本的前5个值: {state_data[:2, :5].tolist()}")
+            else:
+                print(f"  ⚠️  batch中没有'state'键")
+        except Exception as e:
+            print(f"  ⚠️  无法检查第一个batch: {e}")
+
     progress_bar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc="Training")
     
     for step in progress_bar:
@@ -991,17 +984,18 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                   f"Avg Loss = {avg_loss:.4f}, "
                   f"LR = {optimizer.param_groups[0]['lr']:.2e}")
         
-        # 每eval_steps步进行一次验证评估，并在屏幕上显示结果
+        # 每eval_steps步进行一次验证评估，并在屏幕上显示结果（限制评估 batch 数以避免该步耗时暴增）
         if (step + 1) % eval_steps == 0:
+            eval_batches_cap = min(max_eval_batches, 10)
             eval_loss = evaluate(
                 model,
                 train_loader,
                 device,
                 criterion=None,
                 logger=None,
-                max_eval_batches=max_eval_batches,
+                max_eval_batches=eval_batches_cap,
             )
-            progress_bar.write(f"  [Eval] Step {step + 1}: Eval Loss = {eval_loss:.4f}")
+            progress_bar.write(f"  [Eval] Step {step + 1}: Eval Loss = {eval_loss:.4f} (batches={eval_batches_cap})")
         
         # 保存检查点（只在save_steps的倍数时保存，避免重复保存）
         if (step + 1) % save_steps == 0:

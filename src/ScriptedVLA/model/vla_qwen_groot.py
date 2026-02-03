@@ -232,9 +232,9 @@ class QwenGR00TVLAModel(nn.Module):
             # 转换为float32，因为动作头使用float32精度
             last_hidden = last_hidden.to(dtype=torch.float32)
         
-        # Step 3: Action Expert Forward and Loss
+        # Step 3: Action Expert Forward and Loss（提供 actions 时计算 loss，训练与评估均可用）
         with torch.autocast("cuda", dtype=torch.float32):
-            if actions is not None and self.training:
+            if actions is not None:
                 # 提取目标动作：从动作序列末尾提取 future_action_window_size + 1 个时间步
                 # 包括：当前时刻(t=0) + 未来N步(t=1~N)，共 N+1 个动作
                 # 例如：future_action_window_size=10 时，提取最后11个动作
@@ -269,7 +269,7 @@ class QwenGR00TVLAModel(nn.Module):
                 return {"action_loss": action_loss}
             else:
                 raise ValueError(
-                    "forward() 仅用于训练且需提供 inputs['actions']；"
+                    "forward() 仅用于训练/评估且需提供 inputs['actions']；"
                     "推理请使用 predict_action(inputs=inputs)。"
                 )
 

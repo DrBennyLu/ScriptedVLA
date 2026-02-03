@@ -31,7 +31,7 @@ ScriptedVLA/
 ├── pyproject.toml               # Project dependencies (uv)
 ├── train.py                     # Training script (supports LeRobot datasets)
 ├── train_public_datasets.py     # Training script for public datasets
-├── inference.py                 # Inference script
+├── inference.py                 # Inference script (dataset-based, auto-detects latest checkpoint)
 ├── create_dummy_data.py         # Create test data
 ├── dataset_statistics.py        # Dataset statistics and filtering tools
 ├── download_model.py            # Model download script
@@ -45,7 +45,7 @@ ScriptedVLA/
 │   ├── test_lerobot_training.py # LeRobot training tests
 │   ├── test_lerobot_dataset_loader.py # LeRobot dataset loader tests
 │   ├── test_training.py         # Training pipeline tests
-│   ├── test_inference.py        # Inference tests
+│   ├── test_inference.py        # Inference tests (single-frame & episode with 3D viz)
 │   └── evaluate_vlm_capabilities.py # VLM capability evaluation script
 └── src/
     └── ScriptedVLA/            # Python package (uv standard structure)
@@ -118,29 +118,48 @@ Edit `config.yaml` to adjust model and training parameters:
 model:
   vlm:
     model_name: "Qwen/Qwen2-VL-2B-Instruct"  # Recommended model
-    image_size: 448
+    image_size: 224  # Or 448 for better visual understanding
     freeze_vlm: true  # Freeze VLM parameters
+    cache_dir: "./cache/models"  # Local cache path for VLM
+    use_state: false  # Whether VLM uses robot state
   
   action_head:
+    type: "flow_matching"
     hidden_dim: 1536  # Match VLM output dimension
     num_layers: 6
     num_heads: 12
     action_dim: 7  # Action dimension
     action_horizon: 50  # Action sequence length
+    num_inference_timesteps: 10  # Flow Matching inference steps
+    norm_type: "ada_norm"
+  
+  vla:
+    use_state_vlm: false  # Whether VLM uses robot state
+    use_state_action_head: true  # Whether action head uses robot state
+    future_action_window_size: 49  # action_horizon - 1
 
 dataset:
   local_path: "./dataset/libero_object"
   action_horizon: 50
   image_size: 224
   image_keys:
-    - "observation.images.wrist_image"
+    - "observation.images.image"
+    - "observation.images.wrist_image"  # Multi-camera support
   state_key: "observation.state"
   action_dim: 7
 
+data:
+  normalize_action: true  # Normalize action for Flow Matching (recommended)
+  normalize_state: true   # Normalize state input
+  robot_state:
+    state_dim: 8
+    use_state_action_head: true
+
 training:
   batch_size: 8
-  num_epochs: 100
-  learning_rate: 1e-4
+  max_steps: 5000
+  save_steps: 2500
+  eval_steps: 2500
   ...
 ```
 
@@ -156,8 +175,9 @@ python train.py --config config.yaml --dataset_path ./dataset/libero_object
 # Set training steps and save interval
 python train.py --config config.yaml --max_steps 20000 --save_steps 5000
 
-# Resume from checkpoint
-python train.py --config config.yaml --resume ./checkpoints/checkpoint_epoch_50.pt
+# Resume from checkpoint (auto-detects latest checkpoint_step_*.pt)
+python train.py --config config.yaml
+# Checkpoints are saved as checkpoint_step_{step}.pt in save_dir
 ```
 
 #### 5. Download Models
@@ -187,13 +207,20 @@ The evaluation includes:
 
 #### 7. Inference
 
+Inference reads a frame from the dataset, loads the latest checkpoint, and compares predictions with ground truth:
+
 ```bash
-python inference.py \
-    --config config.yaml \
-    --checkpoint ./checkpoints/best_model.pt \
-    --image path/to/image.jpg \
-    --text "Pick up the object"
+# Use default dataset and auto-detect latest checkpoint
+python inference.py --config config.yaml
+
+# Specify dataset path and checkpoint directory
+python inference.py --config config.yaml --dataset ./dataset/libero_object --checkpoint_dir ./checkpoints
+
+# Specify frame index to test
+python inference.py --config config.yaml --frame_idx 100
 ```
+
+**Note:** Checkpoints are saved as `checkpoint_step_{step}.pt` (e.g., `checkpoint_step_5000.pt`). The script automatically finds the latest checkpoint in the checkpoint directory.
 
 ### Model Architecture
 
@@ -219,31 +246,49 @@ python inference.py \
 
 #### Model Configuration
 - `vlm.model_name`: Qwen model name
-- `vlm.image_size`: Input image size (recommended: 448)
+- `vlm.image_size`: Input image size (224 or 448)
 - `vlm.freeze_vlm`: Whether to freeze VLM parameters
+- `vlm.cache_dir`: Local cache path for VLM (null = download from HuggingFace)
+- `vlm.use_state`: Whether VLM uses robot state
 - `action_head.hidden_dim`: Transformer hidden dimension (should match VLM output)
 - `action_head.num_layers`: Number of Transformer layers
 - `action_head.num_heads`: Number of attention heads
 - `action_head.action_dim`: Action dimension (e.g., 7D: x, y, z, roll, pitch, yaw, gripper)
 - `action_head.action_horizon`: Action sequence length (chunk size)
+- `action_head.num_inference_timesteps`: Flow Matching inference steps
+- `action_head.norm_type`: Normalization type (e.g., `ada_norm`)
+- `vla.use_state_vlm`: Whether VLM uses robot state
+- `vla.use_state_action_head`: Whether action head uses robot state
+- `vla.future_action_window_size`: Future action window (action_horizon - 1)
 
 #### Training Configuration
 - `batch_size`: Batch size
 - `learning_rate`: Learning rate
-- `num_epochs`: Number of training epochs
 - `max_steps`: Maximum training steps
-- `optimizer`: Optimizer configuration
-- `scheduler`: Learning rate scheduler configuration
+- `save_steps`: Checkpoint save interval (saved as `checkpoint_step_{step}.pt`)
+- `eval_steps`: Validation evaluation interval
+- `optimizer`: Optimizer configuration (e.g., AdamW)
+- `scheduler`: Learning rate scheduler (e.g., cosine with warmup)
 
 #### Dataset Configuration
 - `dataset.local_path`: Local dataset path (LeRobot format)
 - `dataset.action_horizon`: Action sequence length
-- `dataset.image_size`: Image size
-- `dataset.image_keys`: Image key names from dataset (e.g., `["observation.images.wrist_image"]`)
+- `dataset.image_size`: Image size for dataloader
+- `dataset.image_keys`: Image key names (single or multi-camera, e.g., `["observation.images.image", "observation.images.wrist_image"]`)
 - `dataset.state_key`: State key name from dataset
 - `dataset.action_dim`: Action dimension
 - `dataset.task_description.use_batch_task`: Get task description from batch (recommended)
 - `dataset.task_description.use_tasks_jsonl`: Get task description from tasks.jsonl (fallback)
+
+#### Data Configuration
+- `data.normalize_action`: Normalize action for Flow Matching (strongly recommended)
+- `data.normalize_state`: Normalize state input
+- `data.robot_state.state_dim`: Robot state dimension
+
+#### Inference Configuration
+- `inference.checkpoint_path`: Default checkpoint path
+- `inference.device`: Device for inference (cuda/cpu)
+- `inference.batch_size`: Batch size for inference
 
 ### LeRobot Dataset Support
 
@@ -313,6 +358,21 @@ pytest test/test_training.py
 pytest test/test_inference.py
 ```
 
+#### Test Inference (test_inference.py)
+
+The `test_inference.py` script supports single-frame and full-episode inference with 3D visualization:
+
+```bash
+# Single-frame test: load one frame, run inference, compare with GT
+python test/test_inference.py --mode single --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_5000.pt
+
+# Episode test: run inference on full episode with 3D trajectory visualization
+python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_5000.pt --episode_id 0 --output episode_trajectory.png
+
+# Skip checkpoint validation (faster)
+python test/test_inference.py --mode single --no-validate
+```
+
 ### Common Questions
 
 **Q: How to adjust action dimension?**  
@@ -340,6 +400,8 @@ A:
 **Q: What is the model input format?**  
 A: The project uses a unified dictionary format input:
 ```python
+# Single camera: images = List[PIL.Image]
+# Multi-camera: images = List[List[PIL.Image]] (one list per sample, ordered by image_keys)
 inputs = {
     "images": List[PIL.Image] or List[List[PIL.Image]],
     "instructions": List[str],
@@ -347,6 +409,7 @@ inputs = {
     "actions": Optional[torch.Tensor]  # [B, action_horizon, action_dim]
 }
 ```
+Single vs multi-camera is determined by `dataset.image_keys` in config.yaml.
 
 **Q: How to download and test Qwen2-VL-2B-Instruct model?**  
 A:
@@ -373,6 +436,12 @@ pytest test/test_lerobot_training.py
 
 **Q: What if state dimensions don't match?**  
 A: The project implements automatic state dimension normalization. If you encounter dimension issues, check the normalization utilities in `src/ScriptedVLA/utils/normalization.py`.
+
+**Q: Should I enable normalize_action and normalize_state?**  
+A: Yes. Flow Matching is trained in normalized space [-1, 1]. Enable `data.normalize_action` and `data.normalize_state` in config.yaml. The normalizer is saved in checkpoints and used during inference for denormalization.
+
+**Q: What is the checkpoint format?**  
+A: Checkpoints are saved as `checkpoint_step_{step}.pt` (e.g., `checkpoint_step_5000.pt`). They include `model_state_dict`, `optimizer_state_dict`, `normalizer`, and `global_step`. Inference auto-detects the latest checkpoint in the checkpoint directory.
 
 ### License
 
@@ -416,7 +485,7 @@ ScriptedVLA/
 ├── pyproject.toml               # 项目依赖配置（uv）
 ├── train.py                     # 训练脚本（支持LeRobot数据集）
 ├── train_public_datasets.py     # 公开数据集训练脚本
-├── inference.py                 # 推理脚本
+├── inference.py                 # 推理脚本（基于数据集，自动检测最新 checkpoint）
 ├── create_dummy_data.py         # 创建测试数据
 ├── dataset_statistics.py        # 数据集统计和筛选工具
 ├── download_model.py            # 模型下载脚本
@@ -430,7 +499,7 @@ ScriptedVLA/
 │   ├── test_lerobot_training.py # LeRobot训练测试
 │   ├── test_lerobot_dataset_loader.py # LeRobot数据加载测试
 │   ├── test_training.py         # 训练流程测试
-│   ├── test_inference.py        # 推理测试
+│   ├── test_inference.py        # 推理测试（单帧 & episode 含 3D 可视化）
 │   └── evaluate_vlm_capabilities.py # VLM能力测评脚本
 └── src/
     └── ScriptedVLA/            # Python包（符合uv标准结构）
@@ -503,29 +572,48 @@ python train.py --config config.yaml --dataset_path ./dataset/libero_object
 model:
   vlm:
     model_name: "Qwen/Qwen2-VL-2B-Instruct"  # 推荐模型
-    image_size: 448
+    image_size: 224  # 或 448 以获得更好的视觉理解效果
     freeze_vlm: true  # 冻结VLM参数
+    cache_dir: "./cache/models"  # VLM 本地缓存路径
+    use_state: false  # VLM 是否使用机器人状态
   
   action_head:
+    type: "flow_matching"
     hidden_dim: 1536  # 与VLM输出维度匹配
     num_layers: 6
     num_heads: 12
     action_dim: 7  # 动作维度
     action_horizon: 50  # 动作序列长度
+    num_inference_timesteps: 10  # Flow Matching 推理步数
+    norm_type: "ada_norm"
+  
+  vla:
+    use_state_vlm: false  # VLM 是否使用机器人状态
+    use_state_action_head: true  # 动作头是否使用机器人状态
+    future_action_window_size: 49  # action_horizon - 1
 
 dataset:
   local_path: "./dataset/libero_object"
   action_horizon: 50
   image_size: 224
   image_keys:
-    - "observation.images.wrist_image"
+    - "observation.images.image"
+    - "observation.images.wrist_image"  # 多相机支持
   state_key: "observation.state"
   action_dim: 7
 
+data:
+  normalize_action: true  # 对 action 归一化（Flow Matching 强烈建议开启）
+  normalize_state: true   # 对 state 输入归一化
+  robot_state:
+    state_dim: 8
+    use_state_action_head: true
+
 training:
   batch_size: 8
-  num_epochs: 100
-  learning_rate: 1e-4
+  max_steps: 5000
+  save_steps: 2500
+  eval_steps: 2500
   ...
 ```
 
@@ -541,8 +629,9 @@ python train.py --config config.yaml --dataset_path ./dataset/libero_object
 # 设置训练步数和保存间隔
 python train.py --config config.yaml --max_steps 20000 --save_steps 5000
 
-# 从检查点恢复训练
-python train.py --config config.yaml --resume ./checkpoints/checkpoint_epoch_50.pt
+# 从检查点恢复训练（自动检测最新的 checkpoint_step_*.pt）
+python train.py --config config.yaml
+# Checkpoint 保存格式为 checkpoint_step_{step}.pt，保存在 save_dir
 ```
 
 #### 5. 下载模型
@@ -572,13 +661,20 @@ python test/evaluate_vlm_capabilities.py --config config.yaml
 
 #### 7. 推理
 
+推理脚本从数据集中读取一帧数据，加载最新 checkpoint，进行推理并与真实值（GT）对比：
+
 ```bash
-python inference.py \
-    --config config.yaml \
-    --checkpoint ./checkpoints/best_model.pt \
-    --image path/to/image.jpg \
-    --text "Pick up the object"
+# 使用默认数据集，自动查找最新 checkpoint
+python inference.py --config config.yaml
+
+# 指定数据集路径和 checkpoint 目录
+python inference.py --config config.yaml --dataset ./dataset/libero_object --checkpoint_dir ./checkpoints
+
+# 指定要测试的帧索引
+python inference.py --config config.yaml --frame_idx 100
 ```
+
+**说明：** Checkpoint 保存格式为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`）。脚本会自动在 checkpoint 目录中查找最新的 checkpoint。
 
 ### 模型架构
 
@@ -604,31 +700,49 @@ python inference.py \
 
 #### 模型配置
 - `vlm.model_name`: Qwen模型名称
-- `vlm.image_size`: 输入图像尺寸（推荐：448）
+- `vlm.image_size`: 输入图像尺寸（224 或 448）
 - `vlm.freeze_vlm`: 是否冻结VLM参数
+- `vlm.cache_dir`: VLM 本地缓存路径（null 表示从 HuggingFace 下载）
+- `vlm.use_state`: VLM 是否使用机器人状态
 - `action_head.hidden_dim`: Transformer隐藏层维度（应与VLM输出匹配）
 - `action_head.num_layers`: Transformer层数
 - `action_head.num_heads`: 注意力头数
 - `action_head.action_dim`: 动作维度（如7维：x, y, z, roll, pitch, yaw, gripper）
 - `action_head.action_horizon`: 动作序列长度（chunk大小）
+- `action_head.num_inference_timesteps`: Flow Matching 推理步数
+- `action_head.norm_type`: 归一化类型（如 `ada_norm`）
+- `vla.use_state_vlm`: VLM 是否使用机器人状态
+- `vla.use_state_action_head`: 动作头是否使用机器人状态
+- `vla.future_action_window_size`: 未来动作窗口大小（action_horizon - 1）
 
 #### 训练配置
 - `batch_size`: 批次大小
 - `learning_rate`: 学习率
-- `num_epochs`: 训练轮数
 - `max_steps`: 最大训练步数
-- `optimizer`: 优化器配置
-- `scheduler`: 学习率调度器配置
+- `save_steps`: 保存 checkpoint 的间隔（保存为 `checkpoint_step_{step}.pt`）
+- `eval_steps`: 验证评估间隔
+- `optimizer`: 优化器配置（如 AdamW）
+- `scheduler`: 学习率调度器（如带 warmup 的 cosine）
 
 #### 数据集配置
 - `dataset.local_path`: 本地数据集路径（LeRobot格式）
 - `dataset.action_horizon`: 动作序列长度
-- `dataset.image_size`: 图像尺寸
-- `dataset.image_keys`: 数据集中的图像键名（例如：`["observation.images.wrist_image"]`）
+- `dataset.image_size`: 数据加载器使用的图像尺寸
+- `dataset.image_keys`: 图像键名（单相机或多相机，如 `["observation.images.image", "observation.images.wrist_image"]`）
 - `dataset.state_key`: 数据集中的状态键名
 - `dataset.action_dim`: 动作维度
 - `dataset.task_description.use_batch_task`: 从batch获取任务描述（推荐）
 - `dataset.task_description.use_tasks_jsonl`: 从tasks.jsonl获取任务描述（备选）
+
+#### 数据配置
+- `data.normalize_action`: 对 action 归一化（Flow Matching 强烈建议开启）
+- `data.normalize_state`: 对 state 输入归一化
+- `data.robot_state.state_dim`: 机器人状态维度
+
+#### 推理配置
+- `inference.checkpoint_path`: 默认 checkpoint 路径
+- `inference.device`: 推理设备（cuda/cpu）
+- `inference.batch_size`: 推理批次大小
 
 ### LeRobot数据集支持
 
@@ -698,6 +812,21 @@ pytest test/test_training.py
 pytest test/test_inference.py
 ```
 
+#### 推理测试（test_inference.py）
+
+`test_inference.py` 支持单帧测试和完整 episode 推理（含 3D 可视化）：
+
+```bash
+# 单帧测试：加载一帧数据，运行推理，与 GT 对比
+python test/test_inference.py --mode single --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_5000.pt
+
+# Episode 测试：对完整 episode 运行推理，并生成 3D 轨迹可视化
+python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_5000.pt --episode_id 0 --output episode_trajectory.png
+
+# 跳过 checkpoint 验证（更快）
+python test/test_inference.py --mode single --no-validate
+```
+
 ### 常见问题
 
 **Q: 如何调整动作维度？**  
@@ -725,6 +854,8 @@ A:
 **Q: 模型的输入格式是什么？**  
 A: 项目使用统一的字典格式输入：
 ```python
+# 单相机：images = List[PIL.Image]
+# 多相机：images = List[List[PIL.Image]]（每个样本一个列表，按 image_keys 顺序）
 inputs = {
     "images": List[PIL.Image] or List[List[PIL.Image]],
     "instructions": List[str],
@@ -732,6 +863,7 @@ inputs = {
     "actions": Optional[torch.Tensor]  # [B, action_horizon, action_dim]
 }
 ```
+单相机/多相机由 config.yaml 中的 `dataset.image_keys` 决定。
 
 **Q: 如何下载和测试Qwen2-VL-2B-Instruct模型？**  
 A:
@@ -758,6 +890,12 @@ pytest test/test_lerobot_training.py
 
 **Q: 状态维度不匹配怎么办？**  
 A: 项目已实现自动状态维度规范化。如果遇到维度问题，请查看 `src/ScriptedVLA/utils/normalization.py` 中的归一化工具。
+
+**Q: 是否应该开启 normalize_action 和 normalize_state？**  
+A: 是的。Flow Matching 在归一化空间 [-1, 1] 中训练。请在 config.yaml 中开启 `data.normalize_action` 和 `data.normalize_state`。归一化器会保存在 checkpoint 中，推理时用于反归一化。
+
+**Q: Checkpoint 的保存格式是什么？**  
+A: Checkpoint 保存为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`），包含 `model_state_dict`、`optimizer_state_dict`、`normalizer` 和 `global_step`。推理脚本会自动在 checkpoint 目录中查找最新的 checkpoint。
 
 ## 许可证
 
