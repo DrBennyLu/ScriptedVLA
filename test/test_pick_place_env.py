@@ -123,6 +123,7 @@ def test_get_cube_positions():
 def test_pick_place_with_gui(
     target_frame_rotation_deg: float = 0.0,
     target_frame_offset_xy: tuple = (0.0, 0.0),
+    ee_to_grasp_offset_xyz: tuple = (0.0, 0.0, 0.0),
 ):
     """
     测试机器人抓取并放入盒子（带 GUI）
@@ -133,6 +134,7 @@ def test_pick_place_with_gui(
     若夹爪与方块/盒子位置有偏差，可尝试：
     - target_frame_rotation_deg=90 或 -90（若 XY 轴需要旋转）
     - target_frame_offset_xy=(dx, dy) 微调偏移
+    - ee_to_grasp_offset_xyz=(dx, dy, dz) 补偿 panda_hand 原点与抓取中心的偏移
     """
     print("\n" + "=" * 60)
     print("测试5: 抓取-放置 (GUI, 5 红 + 5 蓝 episode)")
@@ -144,6 +146,7 @@ def test_pick_place_with_gui(
         seed=42,
         target_frame_rotation_deg=target_frame_rotation_deg,
         target_frame_offset_xy=target_frame_offset_xy,
+        ee_to_grasp_offset_xyz=ee_to_grasp_offset_xyz,
     )
     try:
         # 5 episodes: 抓取红色方块
@@ -199,6 +202,7 @@ def run_all_tests(
     skip_gui: bool = True,
     target_frame_rotation_deg: float = 0.0,
     target_frame_offset_xy: tuple = (0.0, 0.0),
+    ee_to_grasp_offset_xyz: tuple = (0.0, 0.0, 0.0),
 ):
     """运行所有测试"""
     print("\n" + "#" * 60)
@@ -214,6 +218,7 @@ def run_all_tests(
         test_pick_place_with_gui(
             target_frame_rotation_deg=target_frame_rotation_deg,
             target_frame_offset_xy=target_frame_offset_xy,
+            ee_to_grasp_offset_xyz=ee_to_grasp_offset_xyz,
         )
         test_env_with_gui()
     else:
@@ -227,18 +232,23 @@ def run_all_tests(
 
 if __name__ == "__main__":
     skip_gui = "--gui" not in sys.argv
-    # 坐标系对齐调试：--rotation 90 或 --offset 0.01,0.02
+    # 坐标系对齐调试：--rotation 90 --offset 0.01,0.02 --ee-offset -0.04,0,0
     rotation_deg = 0.0
     offset_xy = (0.0, 0.0)
+    ee_offset = (0.0, 0.0, 0.0)
     for i, arg in enumerate(sys.argv):
         if arg == "--rotation" and i + 1 < len(sys.argv):
             rotation_deg = float(sys.argv[i + 1])
         elif arg == "--offset" and i + 1 < len(sys.argv):
             parts = sys.argv[i + 1].split(",")
             offset_xy = (float(parts[0]), float(parts[1])) if len(parts) >= 2 else (0.0, 0.0)
+        elif arg == "--ee-offset" and i + 1 < len(sys.argv):
+            parts = sys.argv[i + 1].split(",")
+            ee_offset = (float(parts[0]), float(parts[1]), float(parts[2])) if len(parts) >= 3 else (0.0, 0.0, 0.0)
 
     run_all_tests(
         skip_gui=skip_gui,
         target_frame_rotation_deg=rotation_deg,
         target_frame_offset_xy=offset_xy,
+        ee_to_grasp_offset_xyz=ee_offset,
     )

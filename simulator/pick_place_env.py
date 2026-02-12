@@ -40,6 +40,7 @@ class PickPlaceEnv:
         robot_initial_joints: tuple | None = None,
         target_frame_rotation_deg: float = 0.0,
         target_frame_offset_xy: tuple = (0.0, 0.0),
+        ee_to_grasp_offset_xyz: tuple = (0.0, 0.0, 0.0),
         robot_base_orientation: tuple | None = None,
         seed: int | None = None,
     ):
@@ -61,6 +62,8 @@ class PickPlaceEnv:
             robot_initial_joints: (j0..j6, finger1, finger2) 共9个关节，用于手工调整初始姿态。
             target_frame_rotation_deg: 目标坐标系旋转（绕 Z 轴，度）。用于对齐机器人与方块/盒子坐标系。
             target_frame_offset_xy: (dx, dy) 目标偏移，用于微调夹爪与方块/盒子的对齐。
+            ee_to_grasp_offset_xyz: (dx, dy, dz) 补偿 panda_hand 链接原点与视觉抓取中心的偏移。
+                若夹爪在 XY 上相对方块有固定偏移，可据此微调。例如夹爪在方块右侧 4cm 则用 (-0.04, 0, 0)。
             robot_base_orientation: 机器人 base 四元数 [x,y,z,w]。若机器人朝向与预期不符可设置，如 [0,0,1,0] 表示绕 Z 转 180°。
             seed: Random seed for reproducibility.
         """
@@ -111,6 +114,7 @@ class PickPlaceEnv:
 
         self._target_frame_rotation_deg = float(target_frame_rotation_deg)
         self._target_frame_offset_xy = np.array(target_frame_offset_xy, dtype=np.float64)
+        self._ee_to_grasp_offset_xyz = np.array(ee_to_grasp_offset_xyz, dtype=np.float64)
         self._robot_base_orientation = robot_base_orientation
 
     def reset(self) -> dict:
@@ -372,6 +376,14 @@ class PickPlaceEnv:
             np.array([box_center[0], box_center[1], cube_pos[2] + lift_h])
         )
 
+        # 打印方块位置与夹爪目标位置，用于调试坐标系对齐
+        print(f"[抓取调试] 方块颜色: {cube_color}")
+        print(f"  方块位置 (world):     x={cube_pos[0]:.4f}, y={cube_pos[1]:.4f}, z={cube_pos[2]:.4f}")
+        print(f"  夹爪目标-方块上方:    x={above_cube_safe[0]:.4f}, y={above_cube_safe[1]:.4f}, z={above_cube_safe[2]:.4f}")
+        print(f"  夹爪目标-抓取高度:    x={grasp_pos[0]:.4f}, y={grasp_pos[1]:.4f}, z={grasp_pos[2]:.4f}")
+        print(f"  夹爪目标-盒子上方:    x={above_box[0]:.4f}, y={above_box[1]:.4f}, z={above_box[2]:.4f}")
+        print(f"  盒子中心 (world):     x={box_center[0]:.4f}, y={box_center[1]:.4f}, z={box_center[2]:.4f}")
+
         def _interpolate_and_step(
             start: np.ndarray,
             target: np.ndarray,
@@ -404,10 +416,16 @@ class PickPlaceEnv:
         # 1. 移动到方块正上方（夹爪打开）
         current = self._get_ee_pos()
         _interpolate_and_step(current, above_cube_safe, 0.04, steps_per_phase)
+        actual_ee = self._get_ee_pos()
+        print(f"  [对比] 到达方块上方后 - 目标: ({above_cube_safe[0]:.4f}, {above_cube_safe[1]:.4f}, {above_cube_safe[2]:.4f}), "
+              f"实际 panda_hand 位置: ({actual_ee[0]:.4f}, {actual_ee[1]:.4f}, {actual_ee[2]:.4f})")
 
         # 2. 垂直下降至抓取高度
         current = self._get_ee_pos()
         _interpolate_and_step(current, grasp_pos, 0.04, steps_per_phase)
+        actual_ee = self._get_ee_pos()
+        print(f"  [对比] 到达抓取高度后 - 目标: ({grasp_pos[0]:.4f}, {grasp_pos[1]:.4f}, {grasp_pos[2]:.4f}), "
+              f"实际 panda_hand 位置: ({actual_ee[0]:.4f}, {actual_ee[1]:.4f}, {actual_ee[2]:.4f})")
 
         # 3. 闭合夹爪，保持位姿等待夹紧
         hold_pos = self._get_ee_pos()
@@ -593,10 +611,11 @@ class PickPlaceEnv:
         """
         Apply robot action: [target_x, target_y, target_z, gripper_width].
         Sets motor targets via IK for arm and gripper.
+        应用 ee_to_grasp_offset 补偿 panda_hand 原点与视觉抓取中心的偏移。
         """
         if action is None or len(action) < 4:
             return
-        target_pos = np.array(action[:3], dtype=np.float64)
+        target_pos = np.array(action[:3], dtype=np.float64) + self._ee_to_grasp_offset_xyz
         gripper_width = float(action[3])
         joint_targets = self._get_ik_joint_targets(target_pos)
         cid = self._client_id
