@@ -22,7 +22,8 @@
 #
 # Author: Benny Lu
 """
-VLA模型训练脚本
+VLA模型 LoRA 微调训练脚本
+使用 LoRA 方法微调 QwenVLM，框架结构与 train.py 一致
 """
 
 import os
@@ -75,6 +76,12 @@ from src.ScriptedVLA.utils import (
 )
 
 try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+
+try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     HAS_LEROBOT = True
 
@@ -100,7 +107,7 @@ except ImportError:
 def set_seed(seed: int):
     """
     设置随机种子以确保可重复性
-    
+
     Args:
         seed: 随机种子值
     """
@@ -109,7 +116,6 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 设置PyTorch的确定性模式（可能会影响性能）
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -119,10 +125,10 @@ def load_dataset_info(dataset_path: Path) -> dict:
     info_file = dataset_path / "meta" / "info.json"
     if not info_file.exists():
         raise ValueError(f"无法找到info.json文件: {info_file}")
-    
+
     with open(info_file, 'r', encoding='utf-8') as f:
         info = json.load(f)
-    
+
     return info
 
 
@@ -136,7 +142,7 @@ def load_tasks_from_jsonl(dataset_path: Path) -> dict:
     tasks_file = dataset_path / "meta" / "tasks.jsonl"
     if not tasks_file.exists():
         return {}
-    
+
     tasks = {}
     with open(tasks_file, 'r', encoding='utf-8') as f:
         for line in f:
@@ -145,7 +151,7 @@ def load_tasks_from_jsonl(dataset_path: Path) -> dict:
                 task_idx = task_data["task_index"]
             else:
                 task_idx = len(tasks)
-            
+
             if "task" in task_data:
                 task_desc = task_data["task"]
             elif "description" in task_data:
@@ -155,51 +161,36 @@ def load_tasks_from_jsonl(dataset_path: Path) -> dict:
             else:
                 non_meta_keys = [k for k in task_data.keys() if k != "task_index"]
                 task_desc = str(task_data[non_meta_keys[0]]) if non_meta_keys else ""
-            
+
             tasks[task_idx] = task_desc
-    
+
     return tasks
 
 
 def get_image_keys_from_info(info: dict) -> list:
-    """
-    从info.json的features.observation.images下获取图像键名
-    
-    注意：此函数已弃用，推荐从config.yaml的dataset.image_keys配置中直接读取。
-    保留此函数仅用于向后兼容和测试目的。
-    """
+    """从info.json的features.observation.images下获取图像键名"""
     image_keys = []
     if "features" in info:
         features = info["features"]
         for key in features.keys():
             if key.startswith("observation.images."):
                 image_keys.append(key)
-    
+
     return sorted(image_keys)
 
 
 def get_state_key_from_info(info: dict) -> str:
-    """
-    从info.json的features.observation.state下获取状态键名
-    
-    注意：此函数已弃用，推荐从config.yaml的dataset.state_key配置中直接读取。
-    保留此函数仅用于向后兼容和测试目的。
-    """
+    """从info.json的features.observation.state下获取状态键名"""
     if "features" in info and "observation" in info["features"]:
         obs_features = info["features"]["observation"]
         if "state" in obs_features:
             return "observation.state"
-    
+
     return "observation.state"
 
 
 def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
-    """
-    从info.json的features.observation.state下获取状态维度
-    
-    注意：此函数已弃用，推荐从config.yaml的data.robot_state.state_dim配置中直接读取。
-    保留此函数仅用于向后兼容和测试目的。
-    """
+    """从info.json的features.observation.state下获取状态维度"""
     if "features" in info:
         features = info["features"]
         if "observation.state" in features:
@@ -211,44 +202,33 @@ def get_state_dim_from_info(info: dict, default_state_dim: int = 7) -> int:
             state_shape = obs_features["state"].get("shape", [])
             if state_shape and len(state_shape) > 0:
                 return int(state_shape[0])
-    
+
     return default_state_dim
 
 
 def _tensor_to_pil_image(img_tensor, image_size=None):
-    """
-    将tensor转换为PIL.Image
-    LeRobot数据集返回的图像已经是归一化到0-1的tensor，需要转换为0-255的PIL.Image
-    """
-    # 确保tensor格式为 [C, H, W]
+    """将tensor转换为PIL.Image"""
     if img_tensor.dim() == 4:
-        img_tensor = img_tensor.squeeze(0)  # [1, C, H, W] -> [C, H, W]
+        img_tensor = img_tensor.squeeze(0)
     elif img_tensor.dim() != 3:
         raise ValueError(f"Unexpected tensor shape: {img_tensor.shape}, expected [C, H, W]")
-    
-    # 转换为numpy数组 [H, W, C]
+
     img_tensor = img_tensor.permute(1, 2, 0)
     img_array = img_tensor.cpu().numpy()
-    
-    # LeRobot数据集返回的图像已经是0-1归一化的，需要转换为0-255
-    # 检查是否已经是0-1范围（lerobot数据集通常返回0-1的float tensor）
+
     if img_array.dtype != np.uint8:
         if img_array.max() <= 1.0 and img_array.min() >= 0.0:
-            # 0-1归一化的图像，转换为0-255
             img_array = (img_array * 255).astype(np.uint8)
         elif img_array.max() <= 255.0:
-            # 已经是0-255范围，直接转换类型
             img_array = img_array.astype(np.uint8)
         else:
-            # 其他情况，先clamp到0-255再转换
             img_array = np.clip(img_array, 0, 255).astype(np.uint8)
-    
-    # 确保是RGB格式
+
     if len(img_array.shape) == 2:
         img_array = np.stack([img_array] * 3, axis=-1)
     elif img_array.shape[2] == 1:
         img_array = np.repeat(img_array, 3, axis=2)
-    
+
     img_pil = Image.fromarray(img_array, mode='RGB')
     if image_size and (img_pil.size[0] != image_size or img_pil.size[1] != image_size):
         img_pil = img_pil.resize((image_size, image_size), Image.Resampling.LANCZOS)
@@ -264,79 +244,48 @@ def create_collate_fn(
     normalize_action=True,
     normalize_state=True,
 ):
-    """
-    创建collate函数，处理lerobot返回的batch格式
-    
-    Args:
-        image_keys: 图像键名列表（从config.yaml读取，例如：["observation.images.wrist_image"]）
-        state_key: 状态键名（从config.yaml读取，例如："observation.state"）
-        image_size: 图像尺寸（可选）
-        use_batch_task: 是否使用batch中的task字段
-        normalizer: 归一化器（可选）
-        normalize_action: 是否对 action 做归一化（需 normalizer）
-        normalize_state: 是否对 state 做归一化（需 normalizer）
-    """
+    """创建collate函数，处理lerobot返回的batch格式"""
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
-        
-        # 调试：检查第一个样本的原始格式
+
         if len(batch_list) > 0:
             first_sample = batch_list[0]
             if not isinstance(first_sample, dict):
                 raise ValueError(f"batch_list中的样本应该是字典，但得到: {type(first_sample)}")
-        
+
         batch_dict = default_collate(batch_list)
         batch_size = len(batch_list)
-        
-        # 调试：打印batch_dict中的所有键（仅在第一次调用时）
+
         if not hasattr(collate_fn, '_debug_printed'):
             print(f"[调试] collate_fn - batch_dict中的键: {list(batch_dict.keys())}")
             collate_fn._debug_printed = True
-        
-        # 验证图像键是否存在
+
         missing_keys = [k for k in image_keys if k not in batch_dict]
         if missing_keys:
             raise ValueError(f"配置的图像键不存在于batch中: {missing_keys}, 可用键: {list(batch_dict.keys())}")
-        
-        # 处理图像：根据config.yaml中的image_keys数量判断单相机/多相机
-        # 单相机（len(image_keys)==1）：List[PIL.Image]
-        # 多相机（len(image_keys)>1）：List[List[PIL.Image]]
+
         images_list = []
         for i in range(batch_size):
             if len(image_keys) == 1:
                 img_tensor = batch_dict[image_keys[0]][i]
                 images_list.append(_tensor_to_pil_image(img_tensor, image_size))
             else:
-                camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size) 
+                camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size)
                                 for key in image_keys]
                 images_list.append(camera_images)
-        
-        # 处理 actions：按配置决定是否归一化
+
         actions = batch_dict["action"]
         if normalize_action and normalizer is not None:
             actions = normalizer.normalize_action(actions)
 
-        # 处理 states：按配置决定是否归一化（如果存在）
-        # lerobot数据集的状态数据保存在observation.state键下
         states = None
         if state_key in batch_dict:
             states = batch_dict[state_key]
-            # 调试：打印状态数据信息（仅在第一次调用时）
-            if not hasattr(collate_fn, '_state_debug_printed'):
-                print(f"[调试] collate_fn - 找到状态键 '{state_key}'，形状: {states.shape if isinstance(states, torch.Tensor) else type(states)}")
-                if isinstance(states, torch.Tensor) and states.numel() > 0:
-                    print(f"[调试] collate_fn - 状态数据范围: [{states.min().item():.4f}, {states.max().item():.4f}]")
-                    print(f"[调试] collate_fn - 状态数据均值: {states.mean().item():.4f}")
-                    print(f"[调试] collate_fn - 状态数据前3个样本: {states[:min(3, states.shape[0]), :min(5, states.shape[1])].tolist()}")
-                collate_fn._state_debug_printed = True
-            
-            # 检查状态数据是否有效（不全为0）
             if isinstance(states, torch.Tensor):
                 if states.numel() > 0 and states.abs().sum().item() > 1e-6:
                     if normalize_state and normalizer is not None:
                         states = normalizer.normalize_state(states)
                 else:
-                    # 如果状态全为0，可能是数据问题，打印警告
                     import warnings
                     warnings.warn(f"状态数据全为0，可能数据提取有问题。batch_dict中的键: {list(batch_dict.keys())}")
                     states = None
@@ -344,34 +293,21 @@ def create_collate_fn(
                 if normalize_state and normalizer is not None:
                     states = normalizer.normalize_state(states)
         else:
-            # 如果state_key不在batch_dict中，尝试查找可能的键名
             possible_state_keys = [k for k in batch_dict.keys() if 'state' in k.lower()]
             if possible_state_keys:
                 import warnings
-                warnings.warn(f"配置的状态键 '{state_key}' 不在batch中。可用键: {list(batch_dict.keys())}，可能的状态键: {possible_state_keys}")
-                # 尝试使用第一个可能的状态键
+                warnings.warn(f"配置的状态键 '{state_key}' 不在batch中。可用键: {list(batch_dict.keys())}")
                 if len(possible_state_keys) > 0:
-                    print(f"[警告] 尝试使用可能的状态键: {possible_state_keys[0]}")
                     states = batch_dict[possible_state_keys[0]]
                     if normalize_state and normalizer is not None:
                         states = normalizer.normalize_state(states)
-            else:
-                import warnings
-                warnings.warn(f"配置的状态键 '{state_key}' 不在batch中，且没有找到任何包含'state'的键。可用键: {list(batch_dict.keys())}")
-                # 调试：打印第一个样本的原始键
-                if len(batch_list) > 0:
-                    print(f"[调试] 第一个样本的原始键: {list(batch_list[0].keys())}")
-        
-        # 处理文本任务描述
-        # lerobot数据集中的task字段直接返回字符串列表
+
         if use_batch_task and "task" in batch_dict:
             task_data = batch_dict["task"]
-            # task字段是字符串列表，直接使用
             texts = [str(t) for t in task_data] if isinstance(task_data, list) else [str(task_data)] * batch_size
         else:
             texts = [""] * batch_size
-        
-        # 构建结果
+
         result = {
             "images": images_list,
             "text": texts,
@@ -379,26 +315,82 @@ def create_collate_fn(
         }
         if states is not None:
             result["state"] = states
-        
+
         return result
-    
+
     return collate_fn
+
+
+def apply_lora_to_vlm(vla_model: QwenGR00TVLAModel, lora_config: dict):
+    """
+    对 VLA 模型中的 QwenVLM 应用 LoRA 微调
+
+    Args:
+        vla_model: QwenGR00TVLAModel 实例
+        lora_config: config.training.lora 配置字典
+
+    Returns:
+        应用 LoRA 后的模型（原地修改 vla_model.qwen_vl_interface.model）
+    """
+    if not HAS_PEFT:
+        raise ImportError(
+            "peft library not installed. "
+            "Install with: pip install peft>=0.10.0"
+        )
+
+    if not lora_config.get("enabled", True):
+        raise ValueError("LoRA 未启用，请设置 config.training.lora.enabled: true")
+
+    # 获取 VLM 的底层模型（Qwen2VLForConditionalGeneration 等）
+    base_model = vla_model.qwen_vl_interface.model
+
+    # 如果已经冻结，需要先解冻以便 peft 能正确应用 LoRA
+    for param in base_model.parameters():
+        param.requires_grad = True
+
+    # 构建 LoraConfig
+    target_modules = lora_config.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+    if isinstance(target_modules, str):
+        target_modules = [target_modules]
+
+    peft_config = LoraConfig(
+        r=lora_config.get("r", 8),
+        lora_alpha=lora_config.get("lora_alpha", 16),
+        lora_dropout=lora_config.get("lora_dropout", 0.05),
+        target_modules=target_modules,
+        bias=lora_config.get("bias", "none"),
+        task_type=TaskType.CAUSAL_LM,
+        modules_to_save=lora_config.get("modules_to_save", None),
+        layers_to_transform=lora_config.get("layers_to_transform", None),
+    )
+
+    # 应用 LoRA
+    peft_model = get_peft_model(base_model, peft_config)
+
+    # 替换 VLM 中的模型引用
+    vla_model.qwen_vl_interface.model = peft_model
+
+    # 打印可训练参数统计
+    trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+    all_params = sum(p.numel() for p in peft_model.parameters())
+    print(f"  LoRA 可训练参数: {trainable_params:,} ({100 * trainable_params / all_params:.2f}% of VLM)")
+
+    return vla_model
 
 
 def create_optimizer(model, config):
     """创建优化器"""
     opt_config = config.get("optimizer", {})
     opt_type = opt_config.get("type", "adamw")
-    
-    # 确保学习率和权重衰减是数值类型
+
     learning_rate = config.get("learning_rate", 1e-4)
     if isinstance(learning_rate, str):
         learning_rate = float(learning_rate)
-    
+
     weight_decay = config.get("weight_decay", 0.01)
     if isinstance(weight_decay, str):
         weight_decay = float(weight_decay)
-    
+
     if opt_type.lower() == "adamw":
         return AdamW(
             model.parameters(),
@@ -415,24 +407,22 @@ def create_scheduler(optimizer, config, num_training_steps):
     """创建学习率调度器"""
     sched_config = config.get("scheduler", {})
     sched_type = sched_config.get("type", "cosine")
-    
-    # 确保数值类型正确
+
     warmup_ratio = sched_config.get("warmup_ratio", 0.1)
     if isinstance(warmup_ratio, str):
         warmup_ratio = float(warmup_ratio)
-    
+
     min_lr_ratio = sched_config.get("min_lr_ratio", 0.01)
     if isinstance(min_lr_ratio, str):
         min_lr_ratio = float(min_lr_ratio)
-    
+
     learning_rate = config.get("learning_rate", 1e-4)
     if isinstance(learning_rate, str):
         learning_rate = float(learning_rate)
-    
+
     warmup_steps = int(num_training_steps * warmup_ratio)
-    
+
     if sched_type == "cosine":
-        # Warmup + Cosine
         warmup_scheduler = LinearLR(
             optimizer,
             start_factor=min_lr_ratio,
@@ -461,27 +451,14 @@ def evaluate(
     logger=None,
     max_eval_batches=50,
 ):
-    """
-    评估模型（与 train_with_lerobot_dataset 使用的 batch 格式一致，参考 inference 的数据流：dataloader 迭代得到 batch，前向得到 loss）。
-    
-    Args:
-        model: 模型
-        dataloader: 数据加载器（与训练使用相同的 create_collate_fn 格式：images, text, action, state）
-        device: 设备
-        criterion: 损失函数（未使用，保持兼容性）
-        logger: 日志记录器，若为 None 则在屏幕上打印评估结果
-        max_eval_batches: 最大评估批次数量，用于限制评估时间（默认50）
-        
-    Returns:
-        float: 平均验证 loss
-    """
+    """评估模型"""
     was_training = model.training
     model.eval()
     total_loss = 0.0
     num_batches = 0
     total_batches = len(dataloader)
     eval_batches = min(max_eval_batches, total_batches)
-    
+
     with torch.no_grad():
         progress_bar = tqdm(
             enumerate(dataloader),
@@ -508,10 +485,10 @@ def evaluate(
             total_loss += loss.item()
             num_batches += 1
             progress_bar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
-    
+
     if was_training:
         model.train()
-    
+
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     msg = f"Eval Loss: {avg_loss:.4f} (batches {num_batches}/{total_batches})"
     if logger is not None:
@@ -522,89 +499,60 @@ def evaluate(
 
 
 def find_latest_checkpoint(checkpoint_dir: Path):
-    """
-    查找最新的检查点文件
-    
-    Args:
-        checkpoint_dir: 检查点目录路径
-        
-    Returns:
-        (checkpoint_path, step): 最新检查点路径和对应的步数，如果没有找到则返回(None, 0)
-    """
+    """查找最新的检查点文件"""
     if not checkpoint_dir.exists():
         return None, 0
-    
-    # 查找所有符合格式的检查点文件: checkpoint_step_*.pt
+
     checkpoint_files = list(checkpoint_dir.glob("checkpoint_step_*.pt"))
-    
+
     if not checkpoint_files:
         return None, 0
-    
-    # 从文件名中提取步数
+
     max_step = 0
     latest_checkpoint = None
-    
+
     for checkpoint_file in checkpoint_files:
         try:
-            # 从文件名中提取步数: checkpoint_step_12345.pt -> 12345
-            filename = checkpoint_file.stem  # 去掉扩展名
+            filename = checkpoint_file.stem
             step_str = filename.replace("checkpoint_step_", "")
             step = int(step_str)
-            
+
             if step > max_step:
                 max_step = step
                 latest_checkpoint = checkpoint_file
         except (ValueError, AttributeError):
-            # 如果文件名格式不正确，跳过
             continue
-    
+
     return latest_checkpoint, max_step
 
 
 def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
-    """
-    加载检查点并恢复模型、优化器和调度器状态
-    
-    Args:
-        checkpoint_path: 检查点文件路径
-        model: 模型对象
-        optimizer: 优化器对象
-        scheduler: 调度器对象（可以为None）
-        device: 设备
-        
-    Returns:
-        (start_step, loss, normalizer): 起始步数、损失值和归一化器
-    """
+    """加载检查点并恢复模型、优化器和调度器状态"""
     print(f"  加载检查点: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # 加载模型状态
+
     model.load_state_dict(checkpoint["model_state_dict"])
     print(f"  ✓ 模型状态已加载")
-    
-    # 加载优化器状态
+
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     print(f"  ✓ 优化器状态已加载")
-    
-    # 加载调度器状态（如果存在）
+
     if scheduler and "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         print(f"  ✓ 调度器状态已加载")
-    
-    # 加载归一化器（如果存在）
+
     normalizer = None
     if "normalizer" in checkpoint:
         normalizer = Normalizer.from_dict(checkpoint["normalizer"])
         print(f"  ✓ 归一化器状态已加载")
-    
-    # 获取步数和损失
+
     start_step = checkpoint.get("global_step", 0)
     loss = checkpoint.get("loss", 0.0)
-    
+
     print(f"  ✓ 检查点加载完成")
     print(f"    起始步数: {start_step}")
     print(f"    检查点损失: {loss:.4f}")
-    
+
     return start_step, loss, normalizer
 
 
@@ -622,129 +570,122 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_
         checkpoint["global_step"] = global_step
     if normalizer is not None:
         checkpoint["normalizer"] = normalizer.to_dict()
-    
+
     torch.save(checkpoint, save_path)
     print(f"Checkpoint saved to {save_path}")
 
 
 def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: str = "./dataset/libero_object", max_steps: int = 20000, save_steps: int = 5000):
     """
-    使用LeRobot数据集进行训练
-    
+    使用 LeRobot 数据集进行 LoRA 微调训练
+
     Args:
         config_path: 配置文件路径
-        dataset_path: 数据集路径（默认为 ./dataset/libero_object）
-        max_steps: 最大训练步数（默认20000）
-        save_steps: 保存检查点的间隔步数（默认5000）
+        dataset_path: 数据集路径
+        max_steps: 最大训练步数
+        save_steps: 保存检查点的间隔步数
     """
     print("=" * 60)
-    print("LeRobot数据集训练")
+    print("LeRobot 数据集 LoRA 微调训练")
     print("=" * 60)
-    
+
     if not HAS_LEROBOT:
         raise ImportError(
             "lerobot library not installed. "
             "Install with: pip install lerobot==0.3.3"
         )
-    
+
+    if not HAS_PEFT:
+        raise ImportError(
+            "peft library not installed. "
+            "Install with: pip install peft>=0.10.0"
+        )
+
     # 1. 加载配置
     print(f"\n步骤1: 加载配置文件: {config_path}")
     config = load_config(config_path)
-    
-    # 设置随机种子
+
     seed = config.get("seed", 42)
     print(f"\n步骤0.5: 设置随机种子: {seed}")
     set_seed(seed)
     print(f"  ✓ 随机种子已设置")
-    
-    # 获取模型和训练配置
+
     model_config = get_model_config(config)
     training_config = get_training_config(config)
     data_config = get_data_config(config)
     default_state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
-    
-    # 获取数据集配置
+
+    # 获取 LoRA 配置
+    lora_config = training_config.get("lora", {})
+    if not lora_config.get("enabled", True):
+        raise ValueError("LoRA 未启用。请在 config.training.lora 中设置 enabled: true")
+
     dataset_config = config.get("dataset", {})
     dataloader_config = dataset_config.get("dataloader", {})
     task_description_config = dataset_config.get("task_description", {})
-    
-    # 从dataset配置中获取数据集相关参数
-    # 优先级：命令行参数 > 配置文件 > 默认值
-    if dataset_path == "./dataset/libero_object":  # 如果使用的是默认值，从配置文件读取
+
+    if dataset_path == "./dataset/libero_object":
         local_path = dataset_config.get("local_path", "./dataset/libero_object")
     else:
-        local_path = dataset_path  # 使用命令行传入的路径
-    
+        local_path = dataset_path
+
     action_horizon = dataset_config.get("action_horizon", 50)
-    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
     vlm_config = model_config.get("vlm", {})
     image_size = vlm_config.get("image_size", 224)
-    
-    # 从task_description配置中获取参数
+
     use_batch_task = task_description_config.get("use_batch_task", True)
-    
-    # 使用config.training中的配置
+
     merged_training_config = training_config.copy()
-    
-    # 从config.training中读取batch_size
     batch_size = training_config.get("batch_size", 8)
-    
-    # 从配置文件中读取训练参数
-    # 优先级：命令行参数 > 配置文件 > 默认值
-    # 如果函数参数是默认值，说明用户没有通过命令行指定，则从配置文件读取
-    if max_steps == 20000:  # 如果使用的是默认值，从配置文件读取
+
+    if max_steps == 20000:
         max_steps = training_config.get("max_steps", 20000)
-    
-    if save_steps == 5000:  # 如果使用的是默认值，从配置文件读取
+
+    if save_steps == 5000:
         save_steps = merged_training_config.get("save_steps", 5000)
-    
+
     eval_steps = merged_training_config.get("eval_steps", 5000)
     max_eval_batches = merged_training_config.get("max_eval_batches", 50)
     logging_steps = merged_training_config.get("logging_steps", 100)
-    
-    # 打印训练参数信息
+
     print(f"\n训练参数（从配置文件读取）:")
     print(f"  save_steps: {save_steps}")
     print(f"  eval_steps: {eval_steps}")
     print(f"  max_eval_batches: {max_eval_batches}")
     print(f"  logging_steps: {logging_steps}")
-    
-    # 2. 加载LeRobot数据集
-    print(f"\n步骤2: 加载LeRobot数据集")
+    print(f"  LoRA r: {lora_config.get('r', 8)}, alpha: {lora_config.get('lora_alpha', 16)}")
+
+    # 2. 加载 LeRobot 数据集
+    print(f"\n步骤2: 加载 LeRobot 数据集")
     dataset_path_obj = Path(local_path).resolve()
     if not dataset_path_obj.exists():
         raise ValueError(f"数据集路径不存在: {dataset_path_obj}")
-    
+
     print(f"  数据集路径: {dataset_path_obj}")
-    
-    # 2.5. 从配置文件读取数据集参数
+
     print(f"\n步骤2.5: 从配置文件读取数据集参数")
-    
-    # 从配置读取相机和维度配置
+
     image_keys = dataset_config.get("image_keys", ["observation.images.wrist_image"])
     if not isinstance(image_keys, list):
         raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
     print(f"  图像键名（从配置）: {image_keys}")
-    
+
     state_key = dataset_config.get("state_key", "observation.state")
     print(f"  状态键名（从配置）: {state_key}")
-    
+
     action_dim = dataset_config.get("action_dim", model_config.get("action_head", {}).get("action_dim", 7))
     print(f"  动作维度（从配置）: {action_dim}")
-    
+
     state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
     print(f"  状态维度（从配置）: {state_dim}")
-    
-    # 从info.json获取fps（仅用于创建delta_timestamps）
+
     dataset_info = load_dataset_info(dataset_path_obj)
     fps = dataset_info.get("fps", 10)
     print(f"  数据集FPS（从info.json）: {fps}")
-    
-    # 创建delta_timestamps
+
     delta_timestamps = create_delta_timestamps(action_horizon, fps)
     print(f"  Action horizon: {action_horizon}")
 
-    # 创建LeRobotDataset（需先创建数据集，才能从 meta.episodes_stats 构建归一化器）
     print(f"\n步骤2.6: 创建 LeRobotDataset 与归一化器")
     info_file = dataset_path_obj / "meta" / "info.json"
     if not info_file.exists():
@@ -753,14 +694,10 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     dataset_name = dataset_path_obj.name
     root_path_str = str(dataset_path_obj)
 
-    print(f"  本地数据集路径: {dataset_path_obj}")
-    print(f"  数据集名称 (repo_id): {dataset_name}")
     try:
-        # 只训练一种task
         episode_slice = [0, 22, 25, 28, 30, 41, 47, 59, 63, 73, 91, 116, 119, 172, 206, 234, 236,
         237, 238, 239, 240, 242, 243, 266, 277, 286, 287, 307, 314, 315, 332, 339, 348, 350, 352,
         353, 365, 366, 368, 370, 390, 393, 400, 411, 420]
-        # 使用 LeRobotDatasetSubset 以修复 episodes=subset 时 episode_data_index 索引越界
         lerobot_dataset = LeRobotDatasetSubset(
             repo_id=dataset_name,
             root=root_path_str,
@@ -774,7 +711,6 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         traceback.print_exc()
         raise
 
-    # 从 lerobot_dataset.meta.episodes_stats 创建归一化器（不遍历数据集、不依赖 episodes_stats.jsonl）
     try:
         normalizer = create_normalizer_from_lerobot_meta(
             lerobot_dataset,
@@ -783,9 +719,9 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         )
         print(f"  ✓ 归一化器已从 meta.episodes_stats 创建")
         if normalizer.action_min is not None:
-            print(f"  Action 范围（用于反归一化）: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
+            print(f"  Action 范围: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
         if normalizer.state_min is not None:
-            print(f"  State 范围（用于传入动作头前归一化）: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
+            print(f"  State 范围: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
     except Exception as e:
         print(f"  从 meta.episodes_stats 创建归一化器失败: {e}，尝试从 meta/episodes_stats.jsonl 创建")
         try:
@@ -795,12 +731,12 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             print(f"  ✗ 归一化器创建失败: {e2}")
             print(f"  警告: 将不使用归一化，训练可能不稳定")
             normalizer = None
-    
+
     # 3. 创建数据加载器
     print(f"\n步骤3: 创建数据加载器")
     print(f"  Batch size: {batch_size}")
     print(f"  最大训练步数: {max_steps}")
-    
+
     normalize_action = data_config.get("normalize_action", False)
     normalize_state = data_config.get("normalize_state", False)
     custom_collate_fn = create_collate_fn(
@@ -812,7 +748,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         normalize_action=normalize_action,
         normalize_state=normalize_state,
     )
-    
+
     num_workers = dataloader_config.get("num_workers", 0)
     dataloader_kwargs = {
         "batch_size": batch_size,
@@ -824,26 +760,28 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     if num_workers > 0:
         dataloader_kwargs["persistent_workers"] = True
         dataloader_kwargs["prefetch_factor"] = dataloader_config.get("prefetch_factor", 2)
-    
+
     train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
-    
+
     print(f"  数据加载器长度: {len(train_loader)} batches")
-    if num_workers == 0:
-        print(f"  提示: 若每步较慢，可在 config 的 dataset.dataloader 中设置 num_workers=2 或 4 以预取数据（Windows 下若报错可保持 0）")
-    
-    # 4. 创建模型
-    print(f"\n步骤4: 创建模型")
-    
-    vlm_config = model_config.get("vlm", {})
+
+    # 4. 创建模型（LoRA 微调：VLM 不冻结，后续应用 LoRA）
+    print(f"\n步骤4: 创建模型并应用 LoRA")
+
+    vlm_config = model_config.get("vlm", {}).copy()
+    # LoRA 模式下不冻结 VLM 基座（peft 会冻结基座并添加可训练的 LoRA 适配器）
+    vlm_config["freeze_vlm"] = False
+
     action_head_config = model_config.get("action_head", {}).copy()
     action_head_config["action_horizon"] = action_horizon
-    action_head_config["action_dim"] = action_dim  # 使用从配置读取的action_dim
-    
+    action_head_config["action_dim"] = action_dim
+
     vla_config = model_config.get("vla", {}).copy()
     vla_config["future_action_window_size"] = action_horizon - 1
-    
+
     use_state_vlm = vla_config.get("use_state_vlm", vla_config.get("use_state", True))
     use_state_action_head = vla_config.get("use_state_action_head", vla_config.get("use_state", True))
+
     model = QwenGR00TVLAModel(
         vlm_config=vlm_config,
         action_head_config=action_head_config,
@@ -852,52 +790,51 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         state_dim=state_dim,
         future_action_window_size=action_horizon - 1
     )
-    
+
+    # 应用 LoRA 到 QwenVLM
+    model = apply_lora_to_vlm(model, lora_config)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     print(f"  模型已移动到设备: {device}")
     print(f"  Action horizon: {action_horizon}")
     print(f"  Action dimension: {action_dim}")
     print(f"  State dimension: {state_dim}")
-    
-    # 计算并打印可训练参数数量
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  总参数量: {total_params:,} ({total_params / 1e6:.2f}M)")
     print(f"  可训练参数量: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
-    
+
     # 5. 创建优化器和调度器
     print(f"\n步骤5: 创建优化器和调度器")
-    
+
     optimizer = create_optimizer(model, merged_training_config)
     scheduler = create_scheduler(optimizer, merged_training_config, max_steps)
     print(f"  优化器: {type(optimizer).__name__}")
     print(f"  调度器: {type(scheduler).__name__ if scheduler else 'None'}")
-    
+
     # 6. 创建保存目录
     save_dir = Path(merged_training_config.get("save_dir", "./checkpoints"))
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"  检查点保存目录: {save_dir}")
-    
-    # 6.5. 检查是否有可用的检查点并恢复
+
+    # 6.5. 检查断点续训
     print(f"\n步骤6.5: 检查断点续训")
     latest_checkpoint_path, latest_step_from_filename = find_latest_checkpoint(save_dir)
-    
+
     start_step = 0
     if latest_checkpoint_path is not None:
         print(f"  发现检查点: {latest_checkpoint_path}")
         print(f"  文件名中的步数: {latest_step_from_filename}")
-        
-        # 加载检查点（会返回检查点中保存的实际步数）
+
         start_step, checkpoint_loss, loaded_normalizer = load_checkpoint(
             latest_checkpoint_path, model, optimizer, scheduler, device
         )
-        
-        # 如果检查点中有归一化器，使用它；否则使用新创建的
+
         if loaded_normalizer is not None:
             normalizer = loaded_normalizer
             print(f"  使用检查点中的归一化器")
-            # 重新创建collate_fn以使用新的normalizer
             custom_collate_fn = create_collate_fn(
                 image_keys=image_keys,
                 state_key=state_key,
@@ -909,59 +846,37 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             )
             dataloader_kwargs["collate_fn"] = custom_collate_fn
             train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
-        
-        # 使用检查点中保存的实际步数，而不是文件名中的步数
-        # 因为检查点中的步数更准确
+
         if start_step >= max_steps:
             print(f"  警告: 检查点步数({start_step})已超过或等于最大训练步数({max_steps})")
             print(f"  训练已完成，无需继续训练")
             return model, []
-        
+
         print(f"  将从步数 {start_step} 继续训练到 {max_steps}")
     else:
         print(f"  未找到检查点，将从步数 0 开始训练")
-    
+
     # 7. 训练循环
     remaining_steps = max_steps - start_step
-    print(f"\n步骤7: 开始训练（从步数 {start_step} 继续，剩余 {remaining_steps} 步，每{save_steps}步保存一次检查点）")
+    print(f"\n步骤7: 开始 LoRA 微调训练（从步数 {start_step} 继续，剩余 {remaining_steps} 步）")
     model.train()
-    
-    losses = []
-    
-    # 创建数据加载器的迭代器，以便循环使用
-    loader_iter = iter(train_loader)
-    # 仅在调试模式下预加载一个 batch 并打印状态（避免正常训练时多一次耗时加载）
-    if os.environ.get("SCRIPTEDVLA_DEBUG"):
-        print(f"\n[调试] 检查第一个batch的状态数据...")
-        try:
-            test_batch = next(iter(train_loader))
-            print(f"  Batch中的键: {list(test_batch.keys())}")
-            if "state" in test_batch:
-                state_data = test_batch["state"]
-                print(f"  状态数据形状: {state_data.shape}")
-                if isinstance(state_data, torch.Tensor):
-                    print(f"  状态数据前2个样本的前5个值: {state_data[:2, :5].tolist()}")
-            else:
-                print(f"  ⚠️  batch中没有'state'键")
-        except Exception as e:
-            print(f"  ⚠️  无法检查第一个batch: {e}")
 
-    progress_bar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc="Training")
-    
+    losses = []
+    loader_iter = iter(train_loader)
+
+    progress_bar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc="LoRA Training")
+
     for step in progress_bar:
         try:
             batch = next(loader_iter)
         except StopIteration:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
-        
-        # create_collate_fn已经返回处理好的格式
+
         images = batch["images"]
         texts = batch["text"]
-        # create_collate_fn已经处理好了，actions格式为 [B, action_horizon, action_dim]
         actions = batch["action"].to(device)
-        
-        # 准备模型输入
+
         inputs = {
             "images": images,
             "instructions": texts,
@@ -969,17 +884,12 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         }
         if "state" in batch:
             inputs["states"] = batch["state"].to(device)
-        
-        # 前向传播
+
         outputs = model(inputs=inputs)
-        
-        # 模型在训练模式下固定返回action_loss
         loss = outputs["action_loss"]
-        
-        # 反向传播
+
         loss.backward()
-        
-        # 梯度裁剪和优化器步进
+
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             merged_training_config.get("max_grad_norm", 1.0)
@@ -988,27 +898,23 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         if scheduler:
             scheduler.step()
         optimizer.zero_grad()
-        
-        # 记录损失
+
         loss_value = loss.item()
         losses.append(loss_value)
-        
-        # 更新进度条
+
         avg_loss = sum(losses) / len(losses)
         progress_bar.set_postfix({
             "loss": f"{loss_value:.4f}",
             "avg_loss": f"{avg_loss:.4f}",
             "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
         })
-        
-        # 每logging_steps步打印一次详细损失
+
         if (step + 1) % logging_steps == 0:
             print(f"\n  Step {step + 1}/{max_steps}: "
                   f"Loss = {loss_value:.4f}, "
                   f"Avg Loss = {avg_loss:.4f}, "
                   f"LR = {optimizer.param_groups[0]['lr']:.2e}")
-        
-        # 每eval_steps步进行一次验证评估，并在屏幕上显示结果（限制评估 batch 数以避免该步耗时暴增）
+
         if (step + 1) % eval_steps == 0:
             eval_batches_cap = min(max_eval_batches, 10)
             eval_loss = evaluate(
@@ -1020,36 +926,34 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                 max_eval_batches=eval_batches_cap,
             )
             progress_bar.write(f"  [Eval] Step {step + 1}: Eval Loss = {eval_loss:.4f} (batches={eval_batches_cap})")
-        
-        # 保存检查点（只在save_steps的倍数时保存，避免重复保存）
+
         if (step + 1) % save_steps == 0:
             checkpoint_path = save_dir / f"checkpoint_step_{step + 1}.pt"
             save_checkpoint(
-                model, optimizer, scheduler, 0, loss_value, checkpoint_path, 
+                model, optimizer, scheduler, 0, loss_value, checkpoint_path,
                 global_step=step + 1, normalizer=normalizer
             )
-    
-    # 8. 打印训练总结
+
+    # 8. 训练总结
     print("\n" + "=" * 60)
-    print("训练完成")
+    print("LoRA 微调训练完成")
     print("=" * 60)
     print(f"总步数: {len(losses)}")
     print(f"平均损失: {sum(losses) / len(losses):.4f}")
     print(f"最终损失: {losses[-1]:.4f}")
     print(f"最小损失: {min(losses):.4f}")
     print(f"最大损失: {max(losses):.4f}")
-    
-    # 9. 绘制和保存损失曲线
+
+    # 9. 保存损失曲线
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
         plt.plot(losses, linewidth=1, alpha=0.7)
         plt.xlabel("Step", fontsize=12)
         plt.ylabel("Loss", fontsize=12)
-        plt.title("Training Loss Curve", fontsize=14)
+        plt.title("LoRA Training Loss Curve", fontsize=14)
         plt.grid(True, alpha=0.3)
-        
-        # 添加平滑曲线
+
         if len(losses) > 100:
             window_size = min(100, len(losses) // 20)
             smoothed_losses = []
@@ -1059,26 +963,25 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                 smoothed_losses.append(sum(losses[start_idx:end_idx]) / (end_idx - start_idx))
             plt.plot(smoothed_losses, linewidth=2, label='Smoothed', alpha=0.8)
             plt.legend()
-        
-        save_path = save_dir / "training_loss_curve.png"
+
+        save_path = save_dir / "lora_training_loss_curve.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"\n损失曲线已保存: {save_path}")
-        
-        # 显示图像（如果可能）
+
         try:
             plt.show()
-        except:
+        except Exception:
             print("提示: 无法显示图像，但已保存到文件")
-        
+
         plt.close()
     except ImportError:
         print("\n提示: 安装matplotlib可以绘制损失曲线: pip install matplotlib")
-    
+
     return model, losses
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train VLA Model")
+    parser = argparse.ArgumentParser(description="Train VLA Model with LoRA")
     parser.add_argument(
         "--config",
         type=str,
@@ -1104,8 +1007,7 @@ def main():
         help="Steps interval for saving checkpoints (default: 5000)"
     )
     args = parser.parse_args()
-    
-    # 使用LeRobot数据集训练
+
     try:
         model, losses = train_with_lerobot_dataset(
             config_path=args.config,
@@ -1113,9 +1015,9 @@ def main():
             max_steps=args.max_steps,
             save_steps=args.save_steps
         )
-        print("\n✓ 训练成功完成")
+        print("\n✓ LoRA 微调训练成功完成")
     except Exception as e:
-        print(f"\n✗ LeRobot训练失败: {e}")
+        print(f"\n✗ LoRA 微调训练失败: {e}")
         import traceback
         traceback.print_exc()
         raise
@@ -1123,4 +1025,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

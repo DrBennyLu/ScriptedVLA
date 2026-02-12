@@ -8,7 +8,8 @@ model:
     image_size: 224  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
-    cache_dir: "./cache/models"  # VLM模型本地缓存路径，如果为null则从HuggingFace下载
+    cache_dir: "./cache/models"  # VLM模型本地缓存路径，若指定则优先从缓存加载（完全离线）
+    # local_model_path: null  # 可选：直接指定本地模型目录路径，用于完全离线（如 ./cache/models/models--Qwen--Qwen2-VL-2B-Instruct/snapshots/xxx）
     use_state: false  # VLM是否使用机器人状态（可选，未设置时使用 model.vla.use_state_vlm）
   
   # 动作头配置（Flow Matching）
@@ -68,18 +69,33 @@ training:
   
   # 保存配置
   save_dir: "./checkpoints"
-  save_steps: 2500    #5000
-  eval_steps: 2500    #5000  # 每隔多少步进行一次验证评估
+  save_steps: 50    #5000
+  eval_steps: 50    #5000  # 每隔多少步进行一次验证评估
   max_eval_batches: 1     # 每次评估最多使用的 batch 数
-  logging_steps: 100 #100
+  logging_steps: 1 #100
   
   # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
   # 100 步远远不足，建议至少 5000–20000 步才能学到合理策略
-  max_steps: 5000   #20000
+  max_steps: 100   #20000
   
   # 混合精度训练
   fp16: false
   bf16: false
+  
+  # LoRA 微调配置（用于 lora_train.py）
+  lora:
+    enabled: true
+    r: 8                    # LoRA 秩（rank），越大可训练参数越多
+    lora_alpha: 16          # LoRA 缩放因子，通常设为 r 的 2 倍
+    lora_dropout: 0.05      # LoRA 层的 dropout
+    target_modules:        # 应用 LoRA 的目标模块（Qwen2-VL 的 attention 层）
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+    bias: "none"            # 偏置训练方式: "none" | "all" | "lora_only"
+    # modules_to_save: []   # 额外需要保存为可训练的模块（可选）
+    # layers_to_transform: null  # 指定应用 LoRA 的层索引，null 表示全部层
 
 # 数据集配置（LeRobot格式）
 dataset:

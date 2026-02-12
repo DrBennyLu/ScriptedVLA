@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 ScriptedVLA Contributors
+# Copyright (c) 2026 ScriptedVLA Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -30,12 +30,46 @@ Qwen VLM模型封装
 import torch
 import torch.nn as nn
 import os
+from pathlib import Path
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from typing import Optional, Tuple, Dict, List, Union
 from PIL import Image
 import numpy as np
 
 # 尝试导入Qwen2VL专用类和工具
+
+
+def _resolve_local_model_path(cache_dir: str, model_name: str) -> Optional[str]:
+    """
+    从 cache_dir 解析 HuggingFace 缓存的本地模型路径，用于完全离线加载。
+    避免使用 model_name 时 huggingface_hub 仍尝试联网检查。
+
+    Args:
+        cache_dir: 缓存根目录，如 ./cache/models
+        model_name: 模型名称，如 Qwen/Qwen2-VL-2B-Instruct
+
+    Returns:
+        本地快照路径，如 cache_dir/models--Qwen--Qwen2-VL-2B-Instruct/snapshots/<revision>/
+        若未找到则返回 None
+    """
+    cache_path = Path(cache_dir).resolve()
+    # HuggingFace 缓存格式: models--org--model-name
+    hub_folder = "models--" + model_name.replace("/", "--")
+    repo_path = cache_path / hub_folder / "snapshots"
+    if not repo_path.exists():
+        return None
+    # 获取第一个（通常也是唯一的）revision 目录
+    revisions = list(repo_path.iterdir())
+    if not revisions:
+        return None
+    snapshot_path = revisions[0]
+    if not snapshot_path.is_dir():
+        return None
+    # 验证关键文件存在
+    if not (snapshot_path / "config.json").exists():
+        return None
+    return str(snapshot_path)
+
 try:
     from transformers import Qwen2VLForConditionalGeneration
     HAS_QWEN2VL = True
@@ -83,12 +117,14 @@ class QwenVLM(nn.Module):
         super().__init__()
         
         # 如果提供了配置字典，优先使用配置字典中的值
+        local_model_path = None
         if config is not None:
             model_name = config.get("model_name", model_name)
             image_size = config.get("image_size", image_size)
             max_seq_length = config.get("max_seq_length", max_seq_length)
             freeze = config.get("freeze_vlm", freeze)
             cache_dir = config.get("cache_dir", cache_dir)
+            local_model_path = config.get("local_model_path", None)
             use_state = config.get("use_state", use_state)
             state_dim = config.get("state_dim", state_dim)
         
@@ -99,70 +135,74 @@ class QwenVLM(nn.Module):
         self.use_state = use_state
         self.state_dim = state_dim
         
-        # 如果指定了cache_dir，设置环境变量强制离线模式，防止联网
-        # 必须在调用 from_pretrained 之前设置
-        if cache_dir:
-            # 设置环境变量强制离线模式
+        # 解析本地路径以实现完全离线加载（避免 huggingface_hub 联网）
+        load_path = model_name
+        if cache_dir or local_model_path:
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
             os.environ["HF_HUB_OFFLINE"] = "1"
-            print(f"Loading Qwen VLM model from cache: {model_name} (cache: {cache_dir})")
-            print("  Offline mode enabled: TRANSFORMERS_OFFLINE=1, HF_HUB_OFFLINE=1")
+            if local_model_path and Path(local_model_path).exists():
+                load_path = str(Path(local_model_path).resolve())
+                print(f"Loading Qwen VLM from local_model_path (offline): {load_path}")
+            elif cache_dir:
+                resolved = _resolve_local_model_path(cache_dir, model_name)
+                if resolved:
+                    load_path = resolved
+                    print(f"Loading Qwen VLM from local cache (offline): {load_path}")
+            else:
+                print(f"Loading Qwen VLM model from cache: {model_name} (cache: {cache_dir})")
+                print("  Offline mode: local_files_only=True")
         else:
             print(f"Loading Qwen VLM model: {model_name}")
-        
+
         try:
-            # 尝试加载processor（Qwen2-VL使用AutoProcessor）
-            processor_kwargs = {
-                "cache_dir": cache_dir,
-                "trust_remote_code": True
-            }
-            # 如果指定了cache_dir，强制只使用本地文件，不联网
-            if cache_dir:
-                processor_kwargs["local_files_only"] = True
-            self.processor = AutoProcessor.from_pretrained(
-                model_name,
-                **processor_kwargs
-            )
+            processor_kwargs = {"trust_remote_code": True}
+            if load_path != model_name:
+                # 使用本地路径，直接加载，无需联网
+                self.processor = AutoProcessor.from_pretrained(load_path, trust_remote_code=True)
+            else:
+                processor_kwargs = {
+                    "cache_dir": cache_dir,
+                    "trust_remote_code": True
+                }
+                if cache_dir:
+                    processor_kwargs["local_files_only"] = True
+                self.processor = AutoProcessor.from_pretrained(model_name, **processor_kwargs)
         except Exception as e:
-            # 如果没有processor，使用tokenizer
             print(f"Warning: Failed to load processor, trying tokenizer: {e}")
-            tokenizer_kwargs = {
-                "cache_dir": cache_dir,
-                "trust_remote_code": True
-            }
-            # 如果指定了cache_dir，强制只使用本地文件，不联网
-            if cache_dir:
-                tokenizer_kwargs["local_files_only"] = True
-            self.processor = AutoTokenizer.from_pretrained(
-                model_name,
-                **tokenizer_kwargs
-            )
+            tokenizer_kwargs = {"trust_remote_code": True}
+            if load_path != model_name:
+                self.processor = AutoTokenizer.from_pretrained(load_path, trust_remote_code=True)
+            else:
+                tokenizer_kwargs = {"cache_dir": cache_dir, "trust_remote_code": True}
+                if cache_dir:
+                    tokenizer_kwargs["local_files_only"] = True
+                self.processor = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
         
         # 加载模型（优先使用Qwen2VLForConditionalGeneration）
         if HAS_QWEN2VL and "Qwen2-VL" in model_name:
             try:
-                # 使用Qwen2VL专用类（推荐方式）
-                # 注意：如果指定了cache_dir，不使用device_map="auto"，以便后续手动控制设备
-                load_kwargs = {
-                    "cache_dir": cache_dir,
-                    "torch_dtype": "auto",
-                    "trust_remote_code": True
-                }
-                # 如果指定了cache_dir，强制只使用本地文件，不联网
-                if cache_dir:
-                    load_kwargs["local_files_only"] = True
-                # 只有在没有指定cache_dir时才使用device_map="auto"
-                # 因为device_map="auto"可能与手动设备控制冲突
-                if cache_dir is None:
-                    load_kwargs["device_map"] = "auto"
-                    self._use_device_map = True
-                else:
+                if load_path != model_name:
+                    # 使用本地路径，完全离线加载
                     self._use_device_map = False
-                
-                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    model_name,
-                    **load_kwargs
-                )
+                    self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                        load_path,
+                        torch_dtype="auto",
+                        trust_remote_code=True
+                    )
+                else:
+                    load_kwargs = {
+                        "cache_dir": cache_dir,
+                        "torch_dtype": "auto",
+                        "trust_remote_code": True
+                    }
+                    if cache_dir:
+                        load_kwargs["local_files_only"] = True
+                    if cache_dir is None:
+                        load_kwargs["device_map"] = "auto"
+                        self._use_device_map = True
+                    else:
+                        self._use_device_map = False
+                    self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_name, **load_kwargs)
                 print(f"✓ 成功加载模型为 Qwen2VLForConditionalGeneration")
                 if self._use_device_map:
                     print(f"  使用 device_map='auto'，模型已自动分配到设备")
@@ -172,20 +212,26 @@ class QwenVLM(nn.Module):
                 print(f"✗ Qwen2VLForConditionalGeneration 加载失败: {e}")
                 print("尝试使用 AutoModelForCausalLM...")
                 self._use_device_map = False
-                # 回退到AutoModelForCausalLM
                 try:
                     from transformers import AutoModelForCausalLM
-                    fallback_kwargs = {
-                        "cache_dir": cache_dir,
-                        "torch_dtype": torch.float32,
-                        "trust_remote_code": True
-                    }
-                    if cache_dir:
-                        fallback_kwargs["local_files_only"] = True
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_name,
-                        **fallback_kwargs
-                    )
+                    if load_path != model_name:
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            load_path,
+                            torch_dtype=torch.float32,
+                            trust_remote_code=True
+                        )
+                    else:
+                        fallback_kwargs = {
+                            "cache_dir": cache_dir,
+                            "torch_dtype": torch.float32,
+                            "trust_remote_code": True
+                        }
+                        if cache_dir:
+                            fallback_kwargs["local_files_only"] = True
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            model_name,
+                            **fallback_kwargs
+                        )
                     print(f"✓ 使用 AutoModelForCausalLM 加载")
                 except Exception as e2:
                     raise RuntimeError(
@@ -193,36 +239,48 @@ class QwenVLM(nn.Module):
                         f"AutoModelForCausalLM 也失败 ({e2})"
                     )
         else:
-            # 对于非Qwen2-VL模型，使用AutoModelForCausalLM
             try:
                 from transformers import AutoModelForCausalLM
-                model_kwargs = {
-                    "cache_dir": cache_dir,
-                    "torch_dtype": torch.float32,
-                    "trust_remote_code": True
-                }
-                if cache_dir:
-                    model_kwargs["local_files_only"] = True
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    **model_kwargs
-                )
+                if load_path != model_name:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        load_path,
+                        torch_dtype=torch.float32,
+                        trust_remote_code=True
+                    )
+                else:
+                    model_kwargs = {
+                        "cache_dir": cache_dir,
+                        "torch_dtype": torch.float32,
+                        "trust_remote_code": True
+                    }
+                    if cache_dir:
+                        model_kwargs["local_files_only"] = True
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        **model_kwargs
+                    )
                 print(f"✓ 使用 AutoModelForCausalLM 加载")
                 self._use_device_map = False
             except Exception as e:
                 print(f"✗ AutoModelForCausalLM 加载失败: {e}")
-                # 最后尝试AutoModel
-                automodel_kwargs = {
-                    "cache_dir": cache_dir,
-                    "torch_dtype": torch.float32,
-                    "trust_remote_code": True
-                }
-                if cache_dir:
-                    automodel_kwargs["local_files_only"] = True
-                self.model = AutoModel.from_pretrained(
-                    model_name,
-                    **automodel_kwargs
-                )
+                if load_path != model_name:
+                    self.model = AutoModel.from_pretrained(
+                        load_path,
+                        torch_dtype=torch.float32,
+                        trust_remote_code=True
+                    )
+                else:
+                    automodel_kwargs = {
+                        "cache_dir": cache_dir,
+                        "torch_dtype": torch.float32,
+                        "trust_remote_code": True
+                    }
+                    if cache_dir:
+                        automodel_kwargs["local_files_only"] = True
+                    self.model = AutoModel.from_pretrained(
+                        model_name,
+                        **automodel_kwargs
+                    )
                 print(f"⚠ 使用 AutoModel 加载，可能不支持 generate 方法")
                 self._use_device_map = False
         

@@ -26,6 +26,31 @@ VLA模型推理脚本
 从dataset/libero_object读取一帧数据，加载最新checkpoint，进行推理并对比GT
 """
 
+import os
+import sys
+
+
+def _maybe_enable_offline():
+    """若配置了 cache_dir 或 local_model_path，在 import transformers 之前设置离线模式"""
+    import yaml
+    from pathlib import Path
+    config_path = "config.yaml"
+    for i, arg in enumerate(sys.argv):
+        if arg == "--config" and i + 1 < len(sys.argv):
+            config_path = sys.argv[i + 1]
+            break
+    path = Path(config_path)
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        vlm = cfg.get("model", {}).get("vlm", {})
+        if vlm.get("cache_dir") or vlm.get("local_model_path"):
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE"] = "1"
+
+
+_maybe_enable_offline()
+
 import torch
 import numpy as np
 from pathlib import Path
