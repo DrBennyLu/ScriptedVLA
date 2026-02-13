@@ -42,6 +42,8 @@ class PickPlaceEnv:
         target_frame_offset_xy: tuple = (0.0, 0.0),
         ee_to_grasp_offset_xyz: tuple = (0.0, 0.0, 0.0),
         robot_base_orientation: tuple | None = None,
+        arm_position_gain: float = 0.3,
+        arm_velocity_gain: float = 1.0,
         seed: int | None = None,
     ):
         """
@@ -65,6 +67,8 @@ class PickPlaceEnv:
             ee_to_grasp_offset_xyz: (dx, dy, dz) 补偿 panda_hand 链接原点与视觉抓取中心的偏移。
                 若夹爪在 XY 上相对方块有固定偏移，可据此微调。例如夹爪在方块右侧 4cm 则用 (-0.04, 0, 0)。
             robot_base_orientation: 机器人 base 四元数 [x,y,z,w]。若机器人朝向与预期不符可设置，如 [0,0,1,0] 表示绕 Z 转 180°。
+            arm_position_gain: 手臂位置控制 positionGain，越大收敛越快（原 0.05 偏小）。
+            arm_velocity_gain: 手臂位置控制 velocityGain。
             seed: Random seed for reproducibility.
         """
         self.render = render
@@ -116,6 +120,8 @@ class PickPlaceEnv:
         self._target_frame_offset_xy = np.array(target_frame_offset_xy, dtype=np.float64)
         self._ee_to_grasp_offset_xyz = np.array(ee_to_grasp_offset_xyz, dtype=np.float64)
         self._robot_base_orientation = robot_base_orientation
+        self._arm_position_gain = float(arm_position_gain)
+        self._arm_velocity_gain = float(arm_velocity_gain)
 
     def reset(self) -> dict:
         """
@@ -289,7 +295,7 @@ class PickPlaceEnv:
                         p.setJointMotorControl2(
                             self._robot_id, i, p.POSITION_CONTROL,
                             targetPosition=joint_poses[i], targetVelocity=0,
-                            force=300, positionGain=0.05, velocityGain=0.5,
+                            force=300, positionGain=self._arm_position_gain, velocityGain=self._arm_velocity_gain,
                             physicsClientId=cid,
                         )
                     if gripper_width is not None:
@@ -351,11 +357,15 @@ class PickPlaceEnv:
         steps_per_phase: int = 80,
         step_delay: float = 0.012,
         sim_steps_per_call: int = 1,
+        position_tolerance: float = 0.005,
+        max_wait_steps: int = 500,
     ) -> tuple[bool, float, bool]:
         """
         执行抓取-放置：方块上方 -> 垂直下降 -> 夹取 -> 垂直上抬 -> 平移到盒子上方 -> 松手.
         全部通过 step(action) 控制，不直接调用 _move_ee_to 或 _step_simulation。
         调用前需先执行 reset()，由 reset 负责机器人重置。
+        position_tolerance: 末端到位误差阈值（米），达到后才进入下一步。默认 5mm。
+        max_wait_steps: 等待到位的最大步数，超时后强制进入下一步。
         返回 (success, reward, done): 方块入盒则 reward=1, done=True.
         """
         cube_id = self._red_cube_id if cube_color == "red" else self._blue_cube_id
@@ -390,8 +400,9 @@ class PickPlaceEnv:
             gripper: float,
             steps: int,
         ) -> dict:
-            """沿直线插值并调用 step(action) 若干次，返回最后一次 obs."""
+            """沿直线插值并调用 step(action)，到位后等待直到 EE 在 position_tolerance 内或超时。"""
             obs = {}
+            action_target = np.array([*target, gripper])
             for k in range(1, steps + 1):
                 t = k / steps
                 interp = start + t * (target - start)
@@ -401,6 +412,17 @@ class PickPlaceEnv:
                     sim_steps_per_call=sim_steps_per_call,
                     step_delay=step_delay,
                 )
+            # 到达目标后，保持目标动作直到 EE 在 tolerance 内或超时
+            target_for_ee = target + self._ee_to_grasp_offset_xyz  # step 内部会对 action 加 offset
+            for _ in range(max_wait_steps):
+                obs, _, _, _ = self.step(
+                    action_target,
+                    sim_steps_per_call=sim_steps_per_call,
+                    step_delay=step_delay,
+                )
+                ee_pos = self._get_ee_pos()
+                if np.linalg.norm(ee_pos - target_for_ee) < position_tolerance:
+                    break
             return obs
 
         # 假设 reset() 已调用，机器人在初始位姿；用 step 保持位姿一段时间
@@ -558,7 +580,7 @@ class PickPlaceEnv:
             p.setJointMotorControl2(
                 self._robot_id, i, p.POSITION_CONTROL,
                 targetPosition=j[i], targetVelocity=0,
-                force=300, positionGain=0.05, velocityGain=0.5,
+                force=300, positionGain=self._arm_position_gain, velocityGain=self._arm_velocity_gain,
                 physicsClientId=cid,
             )
         for idx, ji in enumerate(self._finger_joints):
@@ -584,7 +606,11 @@ class PickPlaceEnv:
         target_pos: np.ndarray,
         target_orn: np.ndarray | None = None,
     ) -> list[float]:
-        """Solve IK and return joint targets (no state change). Used for motor control."""
+        """
+        Solve IK and return joint targets (no state change). Used for motor control.
+        PyBullet calculateInverseKinematics 的 targetPosition 使用世界坐标系 (world frame)，
+        与 getBasePositionAndOrientation/getLinkState 返回的坐标系一致。
+        """
         cid = self._client_id
         if target_orn is None:
             ls = p.getLinkState(
@@ -623,7 +649,7 @@ class PickPlaceEnv:
             p.setJointMotorControl2(
                 self._robot_id, i, p.POSITION_CONTROL,
                 targetPosition=joint_targets[i], targetVelocity=0,
-                force=300, positionGain=0.05, velocityGain=0.5,
+                force=300, positionGain=self._arm_position_gain, velocityGain=self._arm_velocity_gain,
                 physicsClientId=cid,
             )
         self._set_gripper(gripper_width)
