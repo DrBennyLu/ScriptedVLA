@@ -110,7 +110,7 @@ class PickPlaceEnv:
         # 参考姿态：0.98, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32, 0.04, 0.04,
         if robot_initial_joints is None:
             self._robot_initial_joints = [
-                -0.60, 0.458, 0.31, -2.24, -0.30, 2.66, 3.89,
+                -0.60, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32,
                 0.04, 0.04,
             ]
         else:
@@ -213,10 +213,10 @@ class PickPlaceEnv:
         # Set camera view (look at table center)
         if self.render and self.use_gui:
             p.resetDebugVisualizerCamera(
-                cameraDistance=1.8,
-                cameraYaw=45,
+                cameraDistance=0.8,
+                cameraYaw=0,
                 cameraPitch=-35,
-                cameraTargetPosition=[0.1, 0, self.table_height + 0.1],
+                cameraTargetPosition=[0.0, 0, self.table_height + 0.1],
                 physicsClientId=cid,
             )
 
