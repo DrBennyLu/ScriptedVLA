@@ -199,7 +199,7 @@ class PickPlaceEnv:
             **load_kw,
         )
         # Franka Panda: ee link 9 (panda_hand), arm 0-6, finger 9-10
-        self._ee_link = 9
+        self._ee_link = 8
         self._num_arm_joints = 7
         self._finger_joints = [9, 10]
         self._ik_joint_limits = (
@@ -229,11 +229,12 @@ class PickPlaceEnv:
     ) -> list[float]:
         """Solve IK，target_orn 为 None 时保持当前末端姿态."""
         cid = self._client_id
-        if target_orn is None:
-            ls = p.getLinkState(
-                self._robot_id, self._ee_link, physicsClientId=cid
-            )
-            target_orn = ls[5]
+        # if target_orn is None:
+        #     ls = p.getLinkState(
+        #         self._robot_id, self._ee_link, physicsClientId=cid
+        #     )
+        #     target_orn = ls[5]
+        target_orn = p.getQuaternionFromEuler([3.1415, 0, 0])
         if rest_poses is None:
             rest_poses = self._robot_initial_joints[:7]
         ll, ul = self._ik_joint_limits
@@ -313,6 +314,7 @@ class PickPlaceEnv:
                 targetPosition=width, targetVelocity=0,
                 force=20, positionGain=0.1, velocityGain=0.5,
                 physicsClientId=cid,
+                maxVelocity=0.05
             )
 
     def _open_gripper(self) -> None:
@@ -329,12 +331,12 @@ class PickPlaceEnv:
         用于对齐机器人与方块/盒子的坐标系（旋转 + 偏移）。
         """
         x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
-        angle = np.radians(self._target_frame_rotation_deg)
-        if abs(angle) > 1e-6:
-            c, s = np.cos(angle), np.sin(angle)
-            x, y = x * c - y * s, x * s + y * c
-        x += self._target_frame_offset_xy[0]
-        y += self._target_frame_offset_xy[1]
+        # angle = np.radians(self._target_frame_rotation_deg)
+        # if abs(angle) > 1e-6:
+        #     c, s = np.cos(angle), np.sin(angle)
+        #     x, y = x * c - y * s, x * s + y * c
+        # x += self._target_frame_offset_xy[0]
+        # y += self._target_frame_offset_xy[1]
         return np.array([x, y, z])
 
     def _is_cube_in_box(self, cube_id: int) -> bool:
@@ -368,6 +370,22 @@ class PickPlaceEnv:
         max_wait_steps: 等待到位的最大步数，超时后强制进入下一步。
         返回 (success, reward, done): 方块入盒则 reward=1, done=True.
         """
+        class SyncTimer:
+            def __init__(self, frequency):
+                self.dt = 1.0 / frequency
+                self.last_time = time.perf_counter()
+
+            def wait(self):
+                current_time = time.perf_counter()
+                elapsed = current_time - self.last_time
+                sleep_time = self.dt - elapsed
+
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+                self.last_time = time.perf_counter()
+
+        timer = SyncTimer(control_frequency)
         cube_id = self._red_cube_id if cube_color == "red" else self._blue_cube_id
         if cube_id is None:
             return False, 0.0, False
@@ -376,10 +394,10 @@ class PickPlaceEnv:
         pos, _ = p.getBasePositionAndOrientation(cube_id, physicsClientId=cid)
         cube_pos = np.array(pos)
         box_center = self.box_position.copy()
-        safe_height = 0.15
-        lift_h = 0.20
+        safe_height = 0.25
+        lift_h = 0.30
         # 应用坐标变换，使目标位姿与机器人坐标系对齐
-        grasp_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, 0.05]))
+        grasp_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, 0.11]))
         above_cube_safe = self._transform_world_to_target(cube_pos + np.array([0, 0, safe_height]))
         lift_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, lift_h]))
         above_box = self._transform_world_to_target(
@@ -412,28 +430,43 @@ class PickPlaceEnv:
                     sim_steps_per_call=sim_steps_per_call,
                     step_delay=step_delay,
                 )
-            # 到达目标后，保持目标动作直到 EE 在 tolerance 内或超时
-            target_for_ee = target + self._ee_to_grasp_offset_xyz  # step 内部会对 action 加 offset
+                timer.wait()
+            max_wait_steps = 50
             for _ in range(max_wait_steps):
-                obs, _, _, _ = self.step(
-                    action_target,
-                    sim_steps_per_call=sim_steps_per_call,
-                    step_delay=step_delay,
-                )
-                ee_pos = self._get_ee_pos()
-                if np.linalg.norm(ee_pos - target_for_ee) < position_tolerance:
+                current_ee = self._get_ee_pos()
+                error = np.linalg.norm(current_ee - target)
+
+                if error < 0.001:
                     break
+
+                self.step(np.array([*target, gripper]), sim_steps_per_call=sim_steps_per_call)
+                timer.wait()
             return obs
+
+        def _stabilize(target_pos, gripper, duration_steps=40):
+            """在目标位置悬停一段时间，消除物理惯性和 PID 滞后"""
+            action = np.array([*target_pos, gripper])
+            for _ in range(duration_steps):
+                self.step(action, sim_steps_per_call=sim_steps_per_call)
+                timer.wait()
+
+            # 调试：打印稳定后的实际误差
+            actual_pos = self._get_ee_pos()
+            diff = np.linalg.norm(actual_pos[:2] - target_pos[:2])  # 只看 XY 平面
+            if diff > 0.005:  # 如果误差大于 5mm
+                print(f"  [警告] 稳定后 XY 偏差仍有: {diff * 1000:.2f}mm (可能需要增加 P gain 或迭代次数)")
 
         # 假设 reset() 已调用，机器人在初始位姿；用 step 保持位姿一段时间
         init_pos = self._get_ee_pos()
         hold_action = np.array([*init_pos, 0.04])
-        for _ in range(30):
-            obs, _, _, _ = self.step(
-                hold_action,
-                sim_steps_per_call=sim_steps_per_call,
-                step_delay=step_delay,
-            )
+        # for _ in range(30):
+        #     obs, _, _, _ = self.step(
+        #         hold_action,
+        #         sim_steps_per_call=sim_steps_per_call,
+        #         step_delay=step_delay,
+        #     )
+        
+        _stabilize(init_pos, 0.04, duration_steps=30)    
 
         # 1. 移动到方块正上方（夹爪打开）
         current = self._get_ee_pos()
@@ -470,13 +503,16 @@ class PickPlaceEnv:
         # 6. 松开夹爪
         hold_pos = self._get_ee_pos()
         hold_action = np.array([*hold_pos, 0.04])
-        for _ in range(100):
-            obs, _, _, _ = self.step(
-                hold_action,
-                sim_steps_per_call=sim_steps_per_call,
-                step_delay=step_delay,
-            )
-
+        # for _ in range(100):
+        #     obs, _, _, _ = self.step(
+        #         hold_action,
+        #         sim_steps_per_call=sim_steps_per_call,
+        #         step_delay=step_delay,
+        #     )
+        for _ in range(60):
+            self.step(hold_action, sim_steps_per_call=sim_steps_per_call)
+            timer.wait()
+        
         in_box = self._is_cube_in_box(cube_id)
         reward = 1.0 if in_box else 0.0
         done = in_box
