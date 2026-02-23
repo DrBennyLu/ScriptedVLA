@@ -361,6 +361,7 @@ class PickPlaceEnv:
         sim_steps_per_call: int = 1,
         position_tolerance: float = 0.005,
         max_wait_steps: int = 500,
+        control_frequency: float = 40.0,
     ) -> tuple[bool, float, bool]:
         """
         执行抓取-放置：方块上方 -> 垂直下降 -> 夹取 -> 垂直上抬 -> 平移到盒子上方 -> 松手.
@@ -784,7 +785,11 @@ class PickPlaceEnv:
     def close(self) -> None:
         """Disconnect from PyBullet and clean up."""
         if self._client_id is not None:
-            p.disconnect(physicsClientId=self._client_id)
+            try:
+                p.disconnect(physicsClientId=self._client_id)
+            except p.error:
+                # 如果物理服务器已经断开连接，忽略错误
+                pass
             self._client_id = None
         self._robot_id = None
         self._table_id = None
