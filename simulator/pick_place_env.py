@@ -33,7 +33,7 @@ class PickPlaceEnv:
         cube_size: float = 0.015,
         cube_mass: float = 0.02,
         box_position: tuple | None = None,
-        cube_spawn_range_x: tuple = (-0.28, 0.0),
+        cube_spawn_range_x: tuple = (-0.1, 0.1),
         cube_spawn_range_y: tuple = (-0.12, 0.12),
         robot_base_xy: tuple = (-0.45, 0.0),
         robot_base_z_offset: float = 0.0,
@@ -211,12 +211,17 @@ class PickPlaceEnv:
         self._box_id = self._create_open_container(cid)
 
         # Set camera view (look at table center)
+        # 与 _get_camera_view_params / render_camera_image 使用相同参数
+        self._camera_distance = 0.8
+        self._camera_yaw_deg = 180
+        self._camera_pitch_deg = -35
+        self._camera_target = [0.0, 0, self.table_height + 0.1]
         if self.render and self.use_gui:
             p.resetDebugVisualizerCamera(
-                cameraDistance=0.8,
-                cameraYaw=0,
-                cameraPitch=-35,
-                cameraTargetPosition=[0.0, 0, self.table_height + 0.1],
+                cameraDistance=self._camera_distance,
+                cameraYaw=self._camera_yaw_deg,
+                cameraPitch=self._camera_pitch_deg,
+                cameraTargetPosition=self._camera_target,
                 physicsClientId=cid,
             )
 
@@ -398,7 +403,7 @@ class PickPlaceEnv:
         safe_height = 0.25
         lift_h = 0.30
         # 应用坐标变换，使目标位姿与机器人坐标系对齐
-        grasp_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, 0.11]))
+        grasp_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, 0.10]))
         above_cube_safe = self._transform_world_to_target(cube_pos + np.array([0, 0, safe_height]))
         lift_pos = self._transform_world_to_target(cube_pos + np.array([0, 0, lift_h]))
         above_box = self._transform_world_to_target(
@@ -716,6 +721,203 @@ class PickPlaceEnv:
             obs["ee_pos"] = self._get_ee_pos()
 
         return obs
+
+    # -------------------------------------------------------------------------
+    # 数据采集：固定频率采集图像、关节位置、action（供 LeRobot 等使用）
+    # -------------------------------------------------------------------------
+
+    def get_joint_positions(self) -> np.ndarray:
+        """
+        返回当前机器人关节位置，用于数据采集。
+        顺序: [j0..j6 (7 个臂关节), finger1, finger2]，共 9 维。
+        """
+        if self._robot_id is None:
+            return np.zeros(9, dtype=np.float64)
+        cid = self._client_id
+        positions = []
+        for i in range(self._num_arm_joints):
+            positions.append(
+                p.getJointState(self._robot_id, i, physicsClientId=cid)[0]
+            )
+        for ji in self._finger_joints:
+            positions.append(p.getJointState(self._robot_id, ji, physicsClientId=cid)[0])
+        return np.array(positions, dtype=np.float64)
+
+    def _get_camera_view_params(self, camera_type: str) -> tuple[list, list, list]:
+        """
+        返回 (eye, target, up) 用于 computeViewMatrix。
+        固定相机：球坐标约定与 computeViewMatrixFromYawPitchRoll 一致，
+        相机位于目标上方俯视（pitch 负值 → 相机 z 高于 target）。
+        """
+        cid = self._client_id
+        if camera_type == "fixed":
+            target = list(self._camera_target)
+            dist = self._camera_distance
+            yaw_rad = np.radians(self._camera_yaw_deg)
+            pitch_rad = np.radians(self._camera_pitch_deg)
+            dx = dist * np.cos(pitch_rad) * np.cos(yaw_rad)
+            dy = dist * np.cos(pitch_rad) * np.sin(yaw_rad)
+            dz = -dist * np.sin(pitch_rad)
+            eye = [
+                target[0] + dx,
+                target[1] + dy,
+                target[2] + dz,
+            ]
+            up = [0.0, 0.0, 1.0]
+            return eye, target, up
+        elif camera_type == "gripper":
+            # 腕部相机：位于夹爪横向约 0.04m，向下观看；旋转对齐世界 Y 轴（up=Y）
+            ls = p.getLinkState(
+                self._robot_id,
+                self._ee_link,
+                physicsClientId=cid,
+            )
+            ee_pos = np.array(ls[4])
+            ee_orn = np.array(ls[5])
+            R = np.array(p.getMatrixFromQuaternion(ee_orn)).reshape(3, 3)
+            forward = R @ np.array([1.0, 0.0, 0.0])
+            forward = forward / (np.linalg.norm(forward) + 1e-8)
+            lateral = R @ np.array([0.0, 1.0, 0.0])
+            lateral = lateral / (np.linalg.norm(lateral) + 1e-8)
+            lateral_offset = 0.04
+            look_down = 0.12
+            eye = (ee_pos + lateral_offset * lateral).tolist()
+            target = (ee_pos - look_down * np.array([0.0, 0.0, 1.0])).tolist()
+            up = [0.0, 1.0, 0.0]  # 相机 up 对齐世界 Y 轴
+            return eye, target, up
+        raise ValueError(
+            f"camera_type 必须是 'fixed' 或 'gripper'，得到: {camera_type}"
+        )
+
+    def get_camera_eye_target(self, camera_type: str) -> tuple[list, list]:
+        """返回 (eye, target) 世界坐标 [x,y,z]，用于确认相机位置。固定相机在 GUI 下为调试窗口当前视角。"""
+        if camera_type == "fixed" and self.use_gui:
+            cam = p.getDebugVisualizerCamera(physicsClientId=self._client_id)
+            if len(cam) >= 12:
+                # cam[10]=distance, cam[11]=target; cam[8,9]=yaw,pitch (度)
+                dist, target = cam[10], list(cam[11])
+                yaw, pitch = cam[8], cam[9]
+                pitch_rad = np.radians(pitch)
+                yaw_rad = np.radians(yaw)
+                dx = dist * np.cos(pitch_rad) * np.cos(yaw_rad)
+                dy = dist * np.cos(pitch_rad) * np.sin(yaw_rad)
+                dz = -dist * np.sin(pitch_rad)
+                eye = [target[0] + dx, target[1] + dy, target[2] + dz]
+                return eye, target
+        eye, target, _ = self._get_camera_view_params(camera_type)
+        return eye, target
+
+    def render_camera_image(
+        self,
+        camera_type: str = "fixed",
+        width: int = 224,
+        height: int = 224,
+        fov: float = 60.0,
+        near: float = 0.02,
+        far: float = 5.0,
+    ) -> np.ndarray:
+        """
+        渲染指定相机的 RGB 图像。
+
+        Args:
+            camera_type: "fixed" = 固定场景视角（类似当前 debug 相机），
+                        "gripper" = 安装在夹爪上的相机，随末端一起移动。
+            width, height: 图像分辨率。
+            fov: 垂直方向视场角（度），默认 60 与 debug 视图一致。
+            near, far: 近/远裁剪面（米）。
+
+        Returns:
+            RGB 图像 (height, width, 3)，dtype uint8，取值 0-255。
+        """
+        cid = self._client_id
+        aspect = width / float(height)
+        fov_rad = np.radians(fov)
+        projection_matrix = p.computeProjectionMatrixFOV(
+            fov_rad, aspect, near, far
+        )
+
+        # 固定相机：使用 computeViewMatrixFromYawPitchRoll 与 resetDebugVisualizerCamera 一致
+        # 注意：yaw/pitch 传入角度（度），与 Bullet debug 相机相同
+        if camera_type == "fixed":
+            view_matrix = p.computeViewMatrixFromYawPitchRoll(
+                cameraTargetPosition=self._camera_target,
+                distance=self._camera_distance,
+                yaw=self._camera_yaw_deg,
+                pitch=self._camera_pitch_deg,
+                roll=0,
+                upAxisIndex=2,
+            )
+        else:
+            eye, target, up = self._get_camera_view_params(camera_type)
+            view_matrix = p.computeViewMatrix(eye, target, up)
+
+        # GUI 下用 OpenGL 与窗口一致；DIRECT 下用 Tiny 软件渲染
+        renderer = (
+            p.ER_BULLET_HARDWARE_OPENGL
+            if self.use_gui
+            else p.ER_TINY_RENDERER
+        )
+        result = p.getCameraImage(
+            width,
+            height,
+            view_matrix,
+            projection_matrix,
+            shadow=True,
+            renderer=renderer,
+            physicsClientId=cid,
+        )
+        # result: (width, height, rgb, depth, seg)；rgb 可能为扁平 (height*width*4,)
+        rgb = np.array(result[2], dtype=np.uint8)
+        if rgb.ndim == 1:
+            rgb = np.reshape(rgb, (height, width, 4))
+        if rgb.shape[-1] == 4:
+            rgb = rgb[:, :, :3]
+        assert rgb.shape == (height, width, 3), rgb.shape
+        return rgb
+
+    def collect_snapshot(
+        self,
+        action: np.ndarray | None,
+        image_width: int = 224,
+        image_height: int = 224,
+    ) -> dict:
+        """
+        采集当前时刻的一帧数据：固定视角图像、夹爪视角图像、关节位置、以及本步的 action。
+        用于固定频率采集：在每步 step() 之后调用，传入该步的 action。
+
+        Returns:
+            dict:
+                - "observation.images.top": (H,W,3) uint8，固定场景相机
+                - "observation.images.wrist": (H,W,3) uint8，夹爪相机
+                - "observation.state": (9,) float64，关节位置
+                - "action": (4,) float64，[x,y,z,gripper]，若 action 为 None 则为 zeros
+        """
+        img_fixed = self.render_camera_image(
+            "fixed", width=image_width, height=image_height
+        )
+        img_gripper = self.render_camera_image(
+            "gripper", width=image_width, height=image_height
+        )
+        joint_pos = self.get_joint_positions()
+        action_arr = (
+            np.asarray(action, dtype=np.float64)
+            if action is not None and len(action) >= 4
+            else np.zeros(4, dtype=np.float64)
+        )
+        if action_arr.shape[0] > 4:
+            action_arr = action_arr[:4]
+        eye_top, tgt_top = self.get_camera_eye_target("fixed")
+        eye_wrist, tgt_wrist = self.get_camera_eye_target("gripper")
+        return {
+            "observation.images.top": img_fixed,
+            "observation.images.wrist": img_gripper,
+            "observation.state": joint_pos,
+            "action": action_arr,
+            "camera_top_eye": eye_top,
+            "camera_top_target": tgt_top,
+            "camera_wrist_eye": eye_wrist,
+            "camera_wrist_target": tgt_wrist,
+        }
 
     def step(
         self,

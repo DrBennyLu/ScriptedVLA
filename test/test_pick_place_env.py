@@ -1,6 +1,7 @@
 """
 测试 PickPlaceEnv 仿真环境
-验证仿真环境能否正常工作：加载场景、生成方块、reset、step 等
+验证仿真环境能否正常工作：加载场景、生成方块、reset、step 等。
+包含数据采集测试：固定频率采集图像（固定视角 + 夹爪相机）、关节位置、action。
 """
 
 import sys
@@ -198,6 +199,108 @@ def test_env_with_gui():
         print("  在本地有显示的机器上可单独运行此测试")
 
 
+def test_data_collection_snapshot(
+    num_steps: int = 5,
+    use_gui: bool = False,
+    output_dir: Path | None = None,
+    image_size: int = 224,
+):
+    """
+    数据采集测试（第一步验证）：仿真运行若干步，每步采集
+    - 固定视角图像 (top)
+    - 夹爪相机图像 (wrist)
+    - 关节位置 (9 维)
+    - 本步 action (4 维: x,y,z,gripper)
+    采集完成后将图像保存到 output_dir，并在控制台打印关节与 action，便于确认无误。
+
+    运行方式:
+      python test/test_pick_place_env.py --data-collection        # 无 GUI，5 步，输出到 test_output/data_collection_test/
+      python test/test_pick_place_env.py --data-collection --gui  # 带 GUI，便于观察
+    """
+    print("\n" + "=" * 60)
+    print("测试: 数据采集 (固定频率) — 图像 / 关节 / action")
+    print("=" * 60)
+
+    if output_dir is None:
+        output_dir = project_root / "test_output" / "data_collection_test"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  输出目录: {output_dir}")
+
+    env = PickPlaceEnv(render=True, use_gui=use_gui, seed=42)
+    try:
+        obs = env.reset()
+        # 初始末端位置与夹爪开度，作为前几步的保持动作
+        ee_pos = env._get_ee_pos()
+        action = np.array([*ee_pos, 0.04], dtype=np.float64)
+
+        collected = []
+        for step in range(num_steps):
+            # 每步：先 step(action)，再采集当前状态（图像+关节）+ 本步 action
+            obs, reward, done, info = env.step(action, sim_steps_per_call=24)
+            snapshot = env.collect_snapshot(
+                action,
+                image_width=image_size,
+                image_height=image_size,
+            )
+            collected.append(snapshot)
+            # 下一步动作：可保持或略微移动（这里保持，便于观察关节/图像是否随仿真变化）
+            action = np.array([*env._get_ee_pos(), 0.04], dtype=np.float64)
+
+        # 展示：保存图像 + 打印关节与 action
+        try:
+            import cv2
+            has_cv2 = True
+        except ImportError:
+            has_cv2 = False
+        if not has_cv2:
+            try:
+                from PIL import Image
+            except ImportError:
+                Image = None
+        else:
+            Image = None
+
+        def save_image(arr: np.ndarray, path: Path) -> None:
+            if has_cv2:
+                # OpenCV 使用 BGR
+                bgr = np.asarray(arr[:, :, ::-1])
+                cv2.imwrite(str(path), bgr)
+            elif Image is not None:
+                Image.fromarray(arr).save(path)
+            else:
+                np.save(path.with_suffix(".npy"), arr)
+
+        for step, snap in enumerate(collected):
+            step_dir = output_dir / f"step_{step:03d}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            save_image(snap["observation.images.top"], step_dir / "top.png")
+            save_image(snap["observation.images.wrist"], step_dir / "wrist.png")
+            print(f"\n  Step {step}:")
+            print(f"    joint_positions (9): {snap['observation.state']}")
+            print(f"    action (x,y,z,gripper): {snap['action']}")
+            print(f"    camera top:  eye={snap['camera_top_eye']}, target={snap['camera_top_target']}")
+            print(f"    camera wrist: eye={[round(x, 4) for x in snap['camera_wrist_eye']]}, target={[round(x, 4) for x in snap['camera_wrist_target']]}")
+
+        # 汇总信息写入文本，便于核对（含相机位置）
+        summary_path = output_dir / "summary.txt"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(f"num_steps={num_steps}\n")
+            f.write(f"image_size={image_size}\n")
+            for step, snap in enumerate(collected):
+                f.write(f"\n--- step {step} ---\n")
+                f.write(f"joint_positions: {snap['observation.state'].tolist()}\n")
+                f.write(f"action: {snap['action'].tolist()}\n")
+                f.write(f"camera_top  eye={snap['camera_top_eye']} target={snap['camera_top_target']}\n")
+                f.write(f"camera_wrist eye={[round(x, 4) for x in snap['camera_wrist_eye']]} target={[round(x, 4) for x in snap['camera_wrist_target']]}\n")
+        print(f"\n  汇总已写入: {summary_path}")
+        print("✓ 数据采集测试完成（请查看输出目录中的图像与 summary.txt 确认）")
+        env.close()
+    except Exception as e:
+        env.close()
+        raise RuntimeError(f"数据采集测试失败: {e}") from e
+
+
 def run_all_tests(
     skip_gui: bool = True,
     target_frame_rotation_deg: float = 0.0,
@@ -213,6 +316,8 @@ def run_all_tests(
     test_env_reset_randomness()
     test_env_step()
     test_get_cube_positions()
+    # 数据采集测试：若干步后保存图像 + 关节 + action，用于确认采集无误
+    test_data_collection_snapshot(num_steps=3, use_gui=False)
 
     if not skip_gui:
         test_pick_place_with_gui(
@@ -231,6 +336,16 @@ def run_all_tests(
 
 
 if __name__ == "__main__":
+    # 仅运行数据采集测试（第一步验证）：图像 + 关节 + action 保存到 test_output/data_collection_test/
+    if "--data-collection" in sys.argv:
+        use_gui = "--gui" in sys.argv
+        test_data_collection_snapshot(
+            num_steps=5,
+            use_gui=use_gui,
+            image_size=224,
+        )
+        sys.exit(0)
+
     skip_gui = "--gui" not in sys.argv
     # 坐标系对齐调试：--rotation 90 --offset 0.01,0.02 --ee-offset -0.04,0,0
     rotation_deg = 0.0
