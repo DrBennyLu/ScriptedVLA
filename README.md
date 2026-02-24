@@ -22,6 +22,7 @@ A clear and easy-to-understand VLA (Vision-Language-Action) training and inferen
 - 🤖 **LeRobot Support**: Native support for LeRobot dataset format (v2.1 and v3.0), compatible with HuggingFace open-source datasets
 - 🔄 **Unified Interface**: Unified dictionary format input, automatic state dimension handling, simplified usage
 - 🧪 **Complete Testing**: Includes comprehensive test suite to ensure code quality
+- 🎮 **Simulation**: PyBullet-based pick-and-place simulation environment for imitation learning and data collection
 
 ### Project Structure
 
@@ -46,7 +47,12 @@ ScriptedVLA/
 │   ├── test_lerobot_dataset_loader.py # LeRobot dataset loader tests
 │   ├── test_training.py         # Training pipeline tests
 │   ├── test_inference.py        # Inference tests (single-frame & episode with 3D viz)
+│   ├── test_pick_place_env.py   # Pick-and-place simulation env tests & data collection
+│   ├── test_image_save.py       # Simulation image capture (top/wrist cameras)
 │   └── evaluate_vlm_capabilities.py # VLM capability evaluation script
+├── simulator/                   # Simulation (PyBullet)
+│   ├── __init__.py
+│   └── pick_place_env.py        # Pick-and-place env (Franka, cubes, box)
 └── src/
     └── ScriptedVLA/            # Python package (uv standard structure)
         ├── __init__.py
@@ -205,7 +211,32 @@ The evaluation includes:
 - **Spatial Perception**: Understand positional relationships, distances, directions
 - **Causal Reasoning**: Action-result reasoning, scene understanding, logical reasoning
 
-#### 7. Inference
+#### 7. Simulation (Pick-and-Place)
+
+The project includes a PyBullet-based pick-and-place simulation environment for data collection and testing:
+
+```bash
+# Run simulation tests (no GUI)
+pytest test/test_pick_place_env.py -v
+
+# Run with GUI for visual inspection
+python test/test_pick_place_env.py --gui
+
+# Data collection mode (saves top/wrist images and metadata to test_output/data_collection_test/)
+python test/test_pick_place_env.py --data-collection
+python test/test_pick_place_env.py --data-collection --gui
+
+# Save a single frame (top + wrist camera images)
+python test/test_image_save.py
+python test/test_image_save.py --gui
+```
+
+The simulator (`simulator/pick_place_env.py`) provides:
+- **PickPlaceEnv**: Franka Panda arm on a table, red/blue cubes, and a box
+- Configurable table, cube spawn range, camera views (top, wrist)
+- `execute_pick_place("red"|"blue")` for scripted pick-and-place, and image/state APIs for data collection
+
+#### 8. Inference
 
 Inference reads a frame from the dataset, loads the latest checkpoint, and compares predictions with ground truth:
 
@@ -328,7 +359,8 @@ This project uses a standard Python package structure, compatible with uv and mo
 #### Adding New Features
 1. **Model Extensions**: Add new modules in `src/ScriptedVLA/model/`
 2. **Data Processing**: Add data augmentation or new datasets in `src/ScriptedVLA/data/`
-3. **Utilities**: Add helper functions in `src/ScriptedVLA/utils/`
+3. **Simulation**: Extend or add environments in `simulator/` (e.g. new tasks or robots)
+4. **Utilities**: Add helper functions in `src/ScriptedVLA/utils/`
 
 #### Import Style
 All script files use the following import style:
@@ -356,6 +388,7 @@ pytest test/test_vla_qwen_groot.py
 pytest test/test_lerobot_training.py
 pytest test/test_training.py
 pytest test/test_inference.py
+pytest test/test_pick_place_env.py   # Simulation env tests
 ```
 
 #### Test Inference (test_inference.py)
@@ -434,6 +467,9 @@ pytest test/test_vla_qwen_groot.py
 pytest test/test_lerobot_training.py
 ```
 
+**Q: How do I use the simulation environment?**  
+A: The `simulator` module provides `PickPlaceEnv` (PyBullet) for pick-and-place with Franka Panda, cubes, and a box. Run `pytest test/test_pick_place_env.py -v` for tests, or `python test/test_pick_place_env.py --data-collection` to collect top/wrist images and metadata. Requires `pybullet` (in project dependencies).
+
 **Q: What if state dimensions don't match?**  
 A: The project implements automatic state dimension normalization. If you encounter dimension issues, check the normalization utilities in `src/ScriptedVLA/utils/normalization.py`.
 
@@ -461,6 +497,7 @@ Issues and Pull Requests are welcome!
 - [Transformers](https://github.com/huggingface/transformers) - Model Library
 - [LeRobot](https://github.com/huggingface/lerobot) - Robot Learning Dataset Format
 - [Flow Matching](https://arxiv.org/abs/2210.02747) - Flow Matching Architecture Inspiration
+- [PyBullet](https://pybullet.org/) - Physics simulation for pick-and-place environment
 
 ---
 
@@ -476,6 +513,7 @@ Issues and Pull Requests are welcome!
 - 🤖 **LeRobot支持**：原生支持LeRobot数据集格式（v2.1和v3.0），兼容HuggingFace开源数据集
 - 🔄 **统一接口**：统一的字典格式输入，自动处理状态维度，简化使用流程
 - 🧪 **完整测试**：包含完整的测试套件，确保代码质量
+- 🎮 **仿真环境**：基于 PyBullet 的抓取-放置仿真环境，用于模仿学习与数据采集
 
 ### 项目结构
 
@@ -500,7 +538,12 @@ ScriptedVLA/
 │   ├── test_lerobot_dataset_loader.py # LeRobot数据加载测试
 │   ├── test_training.py         # 训练流程测试
 │   ├── test_inference.py        # 推理测试（单帧 & episode 含 3D 可视化）
+│   ├── test_pick_place_env.py   # 抓取-放置仿真环境测试与数据采集
+│   ├── test_image_save.py       # 仿真图像采集（顶视/腕部相机）
 │   └── evaluate_vlm_capabilities.py # VLM能力测评脚本
+├── simulator/                   # 仿真模块（PyBullet）
+│   ├── __init__.py
+│   └── pick_place_env.py        # 抓取-放置环境（Franka、方块、盒子）
 └── src/
     └── ScriptedVLA/            # Python包（符合uv标准结构）
         ├── __init__.py
@@ -659,7 +702,32 @@ python test/evaluate_vlm_capabilities.py --config config.yaml
 - **空间感知能力**：理解物体的位置关系、距离、方向等
 - **因果推理能力**：根据图文进行动作-结果推理、场景理解、逻辑推理等
 
-#### 7. 推理
+#### 7. 仿真（抓取-放置）
+
+项目包含基于 PyBullet 的抓取-放置仿真环境，用于数据采集与测试：
+
+```bash
+# 运行仿真测试（无 GUI）
+pytest test/test_pick_place_env.py -v
+
+# 带 GUI 运行，便于观察
+python test/test_pick_place_env.py --gui
+
+# 数据采集模式（将顶视/腕部图像与元数据保存到 test_output/data_collection_test/）
+python test/test_pick_place_env.py --data-collection
+python test/test_pick_place_env.py --data-collection --gui
+
+# 保存单帧图像（顶视 + 腕部相机）
+python test/test_image_save.py
+python test/test_image_save.py --gui
+```
+
+仿真器（`simulator/pick_place_env.py`）提供：
+- **PickPlaceEnv**：桌面上的 Franka Panda 机械臂、红/蓝方块与盒子
+- 可配置桌面、方块生成范围、相机视角（顶视、腕部）
+- `execute_pick_place("red"|"blue")` 用于脚本化抓取-放置，以及图像/状态接口用于数据采集
+
+#### 8. 推理
 
 推理脚本从数据集中读取一帧数据，加载最新 checkpoint，进行推理并与真实值（GT）对比：
 
@@ -782,7 +850,8 @@ python train.py --config config.yaml --dataset_path ./dataset/libero_object
 #### 添加新功能
 1. **模型扩展**：在 `src/ScriptedVLA/model/` 中添加新模块
 2. **数据处理**：在 `src/ScriptedVLA/data/` 中添加数据增强或新数据集
-3. **工具函数**：在 `src/ScriptedVLA/utils/` 中添加辅助功能
+3. **仿真环境**：在 `simulator/` 中扩展或新增环境（如新任务、新机器人）
+4. **工具函数**：在 `src/ScriptedVLA/utils/` 中添加辅助功能
 
 #### 导入说明
 所有脚本文件使用以下导入方式：
@@ -810,6 +879,7 @@ pytest test/test_vla_qwen_groot.py
 pytest test/test_lerobot_training.py
 pytest test/test_training.py
 pytest test/test_inference.py
+pytest test/test_pick_place_env.py   # 仿真环境测试
 ```
 
 #### 推理测试（test_inference.py）
@@ -888,6 +958,9 @@ pytest test/test_vla_qwen_groot.py
 pytest test/test_lerobot_training.py
 ```
 
+**Q: 如何使用仿真环境？**  
+A: `simulator` 模块提供基于 PyBullet 的 `PickPlaceEnv`，用于 Franka Panda 抓取方块放入盒子。运行 `pytest test/test_pick_place_env.py -v` 进行测试，或 `python test/test_pick_place_env.py --data-collection` 采集顶视/腕部图像与元数据。需安装 `pybullet`（已列入项目依赖）。
+
 **Q: 状态维度不匹配怎么办？**  
 A: 项目已实现自动状态维度规范化。如果遇到维度问题，请查看 `src/ScriptedVLA/utils/normalization.py` 中的归一化工具。
 
@@ -915,4 +988,5 @@ A: Checkpoint 保存为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.
 - [Transformers](https://github.com/huggingface/transformers) - 模型库
 - [LeRobot](https://github.com/huggingface/lerobot) - 机器人学习数据集格式
 - [Flow Matching](https://arxiv.org/abs/2210.02747) - Flow Matching架构灵感
+- [PyBullet](https://pybullet.org/) - 抓取-放置仿真环境所用物理引擎
 
