@@ -105,7 +105,7 @@ def capture_wrist_direct(
     腕部相机使用更大视场角以看清被抓物体。
     """
     cid = env._client_id
-    fov_deg = 105.0  # 视野调大，便于清晰看见被抓物体
+    fov_deg = 160.0  # 视野调大，便于清晰看见被抓物体
 
     eye, target, up = env._get_camera_view_params("gripper")
     view_matrix = p.computeViewMatrix(eye, target, up)
