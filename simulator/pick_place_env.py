@@ -766,7 +766,7 @@ class PickPlaceEnv:
             up = [0.0, 0.0, 1.0]
             return eye, target, up
         elif camera_type == "gripper":
-            # 腕部相机：位于夹爪横向约 0.04m，向下观看；旋转对齐世界 Y 轴（up=Y）
+            # 腕部相机
             ls = p.getLinkState(
                 self._robot_id,
                 self._ee_link,
@@ -779,11 +779,15 @@ class PickPlaceEnv:
             forward = forward / (np.linalg.norm(forward) + 1e-8)
             lateral = R @ np.array([0.0, 1.0, 0.0])
             lateral = lateral / (np.linalg.norm(lateral) + 1e-8)
-            lateral_offset = 0.04
-            look_down = 0.12
-            eye = (ee_pos + lateral_offset * lateral).tolist()
+            height = R @ np.array([0.0, 0.0, 1.0])
+            height = height / (np.linalg.norm(height) + 1e-8)
+            lateral_offset = 0.0
+            forward_offset = 2.5
+            height_offset = -1.5
+            look_down = 0.15
+            eye = (ee_pos + lateral_offset * lateral + forward_offset * forward + height_offset * height).tolist()
             target = (ee_pos - look_down * np.array([0.0, 0.0, 1.0])).tolist()
-            up = [0.0, 1.0, 0.0]  # 相机 up 对齐世界 Y 轴
+            up = [0.0, 0.0, 1.0]  
             return eye, target, up
         raise ValueError(
             f"camera_type 必须是 'fixed' 或 'gripper'，得到: {camera_type}"
