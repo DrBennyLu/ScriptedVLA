@@ -818,64 +818,100 @@ class PickPlaceEnv:
         height: int = 224,
         fov: float = 60.0,
         near: float = 0.02,
-        far: float = 5.0,
+        far: float = 10.0,
     ) -> np.ndarray:
         """
-        渲染指定相机的 RGB 图像。
+        渲染指定相机的 RGB 图像。与 test_image_save 中可正确保存的 pipeline 一致：
+        第三视角在 GUI 下用 resetDebugVisualizerCamera + getDebugVisualizerCamera；
+        腕部相机用 _get_camera_view_params + computeViewMatrix，腕部 FOV 更大。
 
         Args:
-            camera_type: "fixed" = 固定场景视角（类似当前 debug 相机），
-                        "gripper" = 安装在夹爪上的相机，随末端一起移动。
+            camera_type: "fixed" = 第三视角， "gripper" = 腕部相机。
             width, height: 图像分辨率。
-            fov: 垂直方向视场角（度），默认 60 与 debug 视图一致。
+            fov: 第三视角 FOV（度）；腕部相机内部使用更大 FOV。
             near, far: 近/远裁剪面（米）。
 
         Returns:
             RGB 图像 (height, width, 3)，dtype uint8，取值 0-255。
         """
         cid = self._client_id
-        aspect = width / float(height)
-        fov_rad = np.radians(fov)
-        projection_matrix = p.computeProjectionMatrixFOV(
-            fov_rad, aspect, near, far
-        )
+        fov_fixed = 60.0
+        fov_gripper = 105.0
 
-        # 固定相机：使用 computeViewMatrixFromYawPitchRoll 与 resetDebugVisualizerCamera 一致
-        # 注意：yaw/pitch 传入角度（度），与 Bullet debug 相机相同
         if camera_type == "fixed":
-            view_matrix = p.computeViewMatrixFromYawPitchRoll(
-                cameraTargetPosition=self._camera_target,
-                distance=self._camera_distance,
-                yaw=self._camera_yaw_deg,
-                pitch=self._camera_pitch_deg,
-                roll=0,
-                upAxisIndex=2,
-            )
+            cam_target = list(self._camera_target)
+            cam_distance = self._camera_distance
+            cam_yaw = float(self._camera_yaw_deg)
+            cam_pitch = float(self._camera_pitch_deg)
+            if self.use_gui:
+                p.resetDebugVisualizerCamera(
+                    cameraDistance=cam_distance,
+                    cameraYaw=cam_yaw,
+                    cameraPitch=cam_pitch,
+                    cameraTargetPosition=cam_target,
+                    physicsClientId=cid,
+                )
+                p.stepSimulation(physicsClientId=cid)
+                cam = p.getDebugVisualizerCamera(physicsClientId=cid)
+                view_matrix = cam[2]
+                projection_matrix = cam[3]
+                cap_width = int(cam[0])
+                cap_height = int(cam[1])
+            else:
+                eye, target, up = self._get_camera_view_params("fixed")
+                view_matrix = p.computeViewMatrix(eye, target, up)
+                aspect = width / float(height)
+                projection_matrix = p.computeProjectionMatrixFOV(
+                    np.radians(fov_fixed), aspect, near, far
+                )
+                cap_width = width
+                cap_height = height
         else:
-            eye, target, up = self._get_camera_view_params(camera_type)
+            eye, target, up = self._get_camera_view_params("gripper")
             view_matrix = p.computeViewMatrix(eye, target, up)
+            if self.use_gui:
+                cam = p.getDebugVisualizerCamera(physicsClientId=cid)
+                cap_width = int(cam[0])
+                cap_height = int(cam[1])
+                aspect = cap_width / float(cap_height)
+                projection_matrix = p.computeProjectionMatrixFOV(
+                    np.radians(fov_gripper), aspect, near, far
+                )
+            else:
+                aspect = width / float(height)
+                projection_matrix = p.computeProjectionMatrixFOV(
+                    np.radians(fov_gripper), aspect, near, far
+                )
+                cap_width = width
+                cap_height = height
 
-        # GUI 下用 OpenGL 与窗口一致；DIRECT 下用 Tiny 软件渲染
+        p.stepSimulation(physicsClientId=cid)
         renderer = (
             p.ER_BULLET_HARDWARE_OPENGL
             if self.use_gui
             else p.ER_TINY_RENDERER
         )
         result = p.getCameraImage(
-            width,
-            height,
+            cap_width,
+            cap_height,
             view_matrix,
             projection_matrix,
-            shadow=True,
+            shadow=False,
             renderer=renderer,
             physicsClientId=cid,
         )
-        # result: (width, height, rgb, depth, seg)；rgb 可能为扁平 (height*width*4,)
+        w_actual, h_actual = int(result[0]), int(result[1])
         rgb = np.array(result[2], dtype=np.uint8)
-        if rgb.ndim == 1:
-            rgb = np.reshape(rgb, (height, width, 4))
-        if rgb.shape[-1] == 4:
-            rgb = rgb[:, :, :3]
+        rgb = rgb.reshape((h_actual, w_actual, 4))[:, :, :3]
+
+        if self.use_gui and (w_actual != width or h_actual != height):
+            try:
+                import cv2
+                rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+            except ImportError:
+                from PIL import Image
+                rgb = np.array(Image.fromarray(rgb).resize((width, height)))
+
         assert rgb.shape == (height, width, 3), rgb.shape
         return rgb
 

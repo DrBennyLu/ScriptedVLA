@@ -230,13 +230,12 @@ def test_data_collection_snapshot(
     env = PickPlaceEnv(render=True, use_gui=use_gui, seed=42)
     try:
         obs = env.reset()
-        # 初始末端位置与夹爪开度，作为前几步的保持动作
         ee_pos = env._get_ee_pos()
         action = np.array([*ee_pos, 0.04], dtype=np.float64)
+        rng = np.random.default_rng(42)
 
         collected = []
         for step in range(num_steps):
-            # 每步：先 step(action)，再采集当前状态（图像+关节）+ 本步 action
             obs, reward, done, info = env.step(action, sim_steps_per_call=24)
             snapshot = env.collect_snapshot(
                 action,
@@ -244,8 +243,14 @@ def test_data_collection_snapshot(
                 image_height=image_size,
             )
             collected.append(snapshot)
-            # 下一步动作：可保持或略微移动（这里保持，便于观察关节/图像是否随仿真变化）
-            action = np.array([*env._get_ee_pos(), 0.04], dtype=np.float64)
+            # 下一步动作：当前末端位置 + 小随机偏移，便于观察相机图像是否随运动正确变化
+            ee_pos = env._get_ee_pos()
+            delta_xy = rng.uniform(-0.03, 0.03, size=2)
+            delta_z = rng.uniform(-0.01, 0.02, size=1)
+            action = np.array(
+                [ee_pos[0] + delta_xy[0], ee_pos[1] + delta_xy[1], ee_pos[2] + float(delta_z[0]), 0.04],
+                dtype=np.float64,
+            )
 
         # 展示：保存图像 + 打印关节与 action
         try:
