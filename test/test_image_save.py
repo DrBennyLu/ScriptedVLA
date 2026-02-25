@@ -10,7 +10,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import numpy as np
-import pybullet as p
 from simulator.pick_place_env import PickPlaceEnv
 
 
@@ -20,79 +19,9 @@ def capture_full_scene_direct(
     height: int = 640,
 ) -> np.ndarray:
     """
-    第三视角相机：与 pick_place_env 的 resetDebugVisualizerCamera 保持一致。
-    GUI 模式：reset 后取 debug 的 view 和 projection；DIRECT 模式：computeViewMatrix。
+    第三视角相机：委托到 env._capture_fixed_camera，与 collect_snapshot 使用同一套渲染逻辑。
     """
-    cid = env._client_id
-    table_height = env.table_height
-
-    cam_target = [0.0, 0.0, table_height + 0.1]
-    cam_distance = 0.8
-    cam_yaw = 180.0
-    cam_pitch = -35.0
-    fov_deg = 60.0
-
-    if env.use_gui:
-        p.resetDebugVisualizerCamera(
-            cameraDistance=cam_distance,
-            cameraYaw=cam_yaw,
-            cameraPitch=cam_pitch,
-            cameraTargetPosition=cam_target,
-            physicsClientId=cid,
-        )
-        p.stepSimulation(physicsClientId=cid)
-        cam = p.getDebugVisualizerCamera(physicsClientId=cid)
-        view_matrix = cam[2]
-        projection_matrix = cam[3]
-        cap_width = int(cam[0])
-        cap_height = int(cam[1])
-    else:
-        yaw_rad = np.radians(cam_yaw)
-        pitch_rad = np.radians(cam_pitch)
-        dx = cam_distance * np.cos(pitch_rad) * np.cos(yaw_rad)
-        dy = cam_distance * np.cos(pitch_rad) * np.sin(yaw_rad)
-        dz = -cam_distance * np.sin(pitch_rad)
-        eye = [
-            cam_target[0] + dx,
-            cam_target[1] + dy,
-            cam_target[2] + dz,
-        ]
-        view_matrix = p.computeViewMatrix(eye, cam_target, [0, 0, 1])
-        aspect = width / float(height)
-        projection_matrix = p.computeProjectionMatrixFOV(
-            np.radians(fov_deg), aspect, 0.02, 10.0
-        )
-        cap_width = width
-        cap_height = height
-
-    p.stepSimulation(physicsClientId=cid)
-
-    renderer = (
-        p.ER_BULLET_HARDWARE_OPENGL if env.use_gui else p.ER_TINY_RENDERER
-    )
-    result = p.getCameraImage(
-        cap_width,
-        cap_height,
-        view_matrix,
-        projection_matrix,
-        shadow=False,
-        renderer=renderer,
-        physicsClientId=cid,
-    )
-
-    w_actual, h_actual = int(result[0]), int(result[1])
-    rgb = np.array(result[2], dtype=np.uint8)
-    rgb = rgb.reshape((h_actual, w_actual, 4))[:, :, :3]
-
-    if env.use_gui and (w_actual != width or h_actual != height):
-        try:
-            import cv2
-            rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
-        except ImportError:
-            from PIL import Image
-            rgb = np.array(Image.fromarray(rgb).resize((width, height)))
-
-    return rgb
+    return env._capture_fixed_camera(width, height)
 
 
 def capture_wrist_direct(
@@ -101,59 +30,9 @@ def capture_wrist_direct(
     height: int = 640,
 ) -> np.ndarray:
     """
-    腕部/夹爪相机：与手指朝向一致，位于夹爪横向约 0.04m（由 env._get_camera_view_params 决定）。
-    腕部相机使用更大视场角以看清被抓物体。
+    腕部/夹爪相机：委托到 env._capture_wrist_camera，与 collect_snapshot 使用同一套渲染逻辑。
     """
-    cid = env._client_id
-    fov_deg = 160.0  # 视野调大，便于清晰看见被抓物体
-
-    eye, target, up = env._get_camera_view_params("gripper")
-    view_matrix = p.computeViewMatrix(eye, target, up)
-
-    if env.use_gui:
-        cam = p.getDebugVisualizerCamera(physicsClientId=cid)
-        cap_width = int(cam[0])
-        cap_height = int(cam[1])
-        aspect = cap_width / float(cap_height)
-        projection_matrix = p.computeProjectionMatrixFOV(
-            np.radians(fov_deg), aspect, 0.02, 10.0
-        )
-    else:
-        aspect = width / float(height)
-        projection_matrix = p.computeProjectionMatrixFOV(
-            np.radians(fov_deg), aspect, 0.02, 10.0
-        )
-        cap_width = width
-        cap_height = height
-
-    p.stepSimulation(physicsClientId=cid)
-
-    renderer = (
-        p.ER_BULLET_HARDWARE_OPENGL if env.use_gui else p.ER_TINY_RENDERER
-    )
-    result = p.getCameraImage(
-        cap_width,
-        cap_height,
-        view_matrix,
-        projection_matrix,
-        shadow=False,
-        renderer=renderer,
-        physicsClientId=cid,
-    )
-
-    w_actual, h_actual = int(result[0]), int(result[1])
-    rgb = np.array(result[2], dtype=np.uint8)
-    rgb = rgb.reshape((h_actual, w_actual, 4))[:, :, :3]
-
-    if env.use_gui and (w_actual != width or h_actual != height):
-        try:
-            import cv2
-            rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
-        except ImportError:
-            from PIL import Image
-            rgb = np.array(Image.fromarray(rgb).resize((width, height)))
-
-    return rgb
+    return env._capture_wrist_camera(width, height)
 
 
 def save_image(arr: np.ndarray, path: Path) -> None:
@@ -196,13 +75,14 @@ def test_image_save(
     try:
         obs = env.reset()
 
-        img_fixed = capture_full_scene_direct(env, width=image_size, height=image_size)
+        # 与 collect_snapshot 一致：使用 env 内置的 _capture_fixed_camera / _capture_wrist_camera
+        img_fixed = env._capture_fixed_camera(image_size, image_size)
         path_fixed = output_dir / "env_frame_fixed.png"
         save_image(img_fixed, path_fixed)
         print(f"  ✓ 第三视角已保存: {path_fixed}")
 
         if include_wrist:
-            img_wrist = capture_wrist_direct(env, width=image_size, height=image_size)
+            img_wrist = env._capture_wrist_camera(image_size, image_size)
             path_wrist = output_dir / "env_frame_wrist.png"
             save_image(img_wrist, path_wrist)
             print(f"  ✓ 腕部视角已保存: {path_wrist}")

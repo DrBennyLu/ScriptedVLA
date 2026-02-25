@@ -10,6 +10,7 @@ Environment setup:
 """
 
 import time
+from typing import Callable
 
 import numpy as np
 import pybullet as p
@@ -367,6 +368,8 @@ class PickPlaceEnv:
         position_tolerance: float = 0.005,
         max_wait_steps: int = 500,
         control_frequency: float = 40.0,
+        on_before_step: Callable[[np.ndarray], None] | None = None,
+        use_real_time: bool = True,
     ) -> tuple[bool, float, bool]:
         """
         执行抓取-放置：方块上方 -> 垂直下降 -> 夹取 -> 垂直上抬 -> 平移到盒子上方 -> 松手.
@@ -374,6 +377,8 @@ class PickPlaceEnv:
         调用前需先执行 reset()，由 reset 负责机器人重置。
         position_tolerance: 末端到位误差阈值（米），达到后才进入下一步。默认 5mm。
         max_wait_steps: 等待到位的最大步数，超时后强制进入下一步。
+        on_before_step: 可选；在每次 step(action) 前调用 on_before_step(action)，用于按固定频率采集数据。
+        use_real_time: 若 True，按 control_frequency 限速（适合观看）；若 False，不等待，仿真尽快跑完（适合数据采集）。
         返回 (success, reward, done): 方块入盒则 reward=1, done=True.
         """
         class SyncTimer:
@@ -431,13 +436,17 @@ class PickPlaceEnv:
                 t = k / steps
                 interp = start + t * (target - start)
                 action = np.array([*interp, gripper])
+                if on_before_step is not None:
+                    on_before_step(action)
                 obs, _, _, _ = self.step(
                     action,
                     sim_steps_per_call=sim_steps_per_call,
                     step_delay=step_delay,
                 )
-                timer.wait()
+                if use_real_time:
+                    timer.wait()
             max_wait_steps = 50
+            wait_action = np.array([*target, gripper])
             for _ in range(max_wait_steps):
                 current_ee = self._get_ee_pos()
                 error = np.linalg.norm(current_ee - target)
@@ -445,16 +454,22 @@ class PickPlaceEnv:
                 if error < 0.001:
                     break
 
-                self.step(np.array([*target, gripper]), sim_steps_per_call=sim_steps_per_call)
-                timer.wait()
+                if on_before_step is not None:
+                    on_before_step(wait_action)
+                self.step(wait_action, sim_steps_per_call=sim_steps_per_call)
+                if use_real_time:
+                    timer.wait()
             return obs
 
         def _stabilize(target_pos, gripper, duration_steps=40):
             """在目标位置悬停一段时间，消除物理惯性和 PID 滞后"""
             action = np.array([*target_pos, gripper])
             for _ in range(duration_steps):
+                if on_before_step is not None:
+                    on_before_step(action)
                 self.step(action, sim_steps_per_call=sim_steps_per_call)
-                timer.wait()
+                if use_real_time:
+                    timer.wait()
 
             # 调试：打印稳定后的实际误差
             actual_pos = self._get_ee_pos()
@@ -492,11 +507,15 @@ class PickPlaceEnv:
         hold_pos = self._get_ee_pos()
         hold_action = np.array([*hold_pos, 0.01])
         for _ in range(150):
+            if on_before_step is not None:
+                on_before_step(hold_action)
             obs, _, _, _ = self.step(
                 hold_action,
                 sim_steps_per_call=sim_steps_per_call,
                 step_delay=step_delay,
             )
+            if use_real_time:
+                timer.wait()
 
         # 4. 垂直上抬
         current = self._get_ee_pos()
@@ -516,8 +535,11 @@ class PickPlaceEnv:
         #         step_delay=step_delay,
         #     )
         for _ in range(60):
+            if on_before_step is not None:
+                on_before_step(hold_action)
             self.step(hold_action, sim_steps_per_call=sim_steps_per_call)
-            timer.wait()
+            if use_real_time:
+                timer.wait()
         
         in_box = self._is_cube_in_box(cube_id)
         reward = 1.0 if in_box else 0.0
@@ -858,11 +880,26 @@ class PickPlaceEnv:
                 cap_width = int(cam[0])
                 cap_height = int(cam[1])
             else:
-                eye, target, up = self._get_camera_view_params("fixed")
-                view_matrix = p.computeViewMatrix(eye, target, up)
+                # 与 test_image_save.capture_full_scene_direct 的 DIRECT 分支完全一致，保证第三视角一致
+                cam_target = [0.0, 0.0, self.table_height + 0.1]
+                cam_distance = 0.8
+                cam_yaw = 180.0
+                cam_pitch = -35.0
+                fov_deg = 60.0
+                yaw_rad = np.radians(cam_yaw)
+                pitch_rad = np.radians(cam_pitch)
+                dx = cam_distance * np.cos(pitch_rad) * np.cos(yaw_rad)
+                dy = cam_distance * np.cos(pitch_rad) * np.sin(yaw_rad)
+                dz = -cam_distance * np.sin(pitch_rad)
+                eye = [
+                    cam_target[0] + dx,
+                    cam_target[1] + dy,
+                    cam_target[2] + dz,
+                ]
+                view_matrix = p.computeViewMatrix(eye, cam_target, [0.0, 0.0, 1.0])
                 aspect = width / float(height)
                 projection_matrix = p.computeProjectionMatrixFOV(
-                    np.radians(fov_fixed), aspect, near, far
+                    np.radians(fov_deg), aspect, 0.02, 10.0
                 )
                 cap_width = width
                 cap_height = height
@@ -915,6 +952,140 @@ class PickPlaceEnv:
         assert rgb.shape == (height, width, 3), rgb.shape
         return rgb
 
+    def _capture_fixed_camera(self, width: int, height: int) -> np.ndarray:
+        """
+        第三视角相机：与 test_image_save.capture_full_scene_direct 逻辑一致。
+        GUI：resetDebugVisualizerCamera + getDebugVisualizerCamera；DIRECT：computeViewMatrix。
+        返回 RGB (height, width, 3) uint8。
+        """
+        cid = self._client_id
+        cam_target = [0.0, 0.0, self.table_height + 0.1]
+        cam_distance = 0.8
+        cam_yaw = 180.0
+        cam_pitch = -35.0
+        fov_deg = 60.0
+
+        if self.use_gui:
+            p.resetDebugVisualizerCamera(
+                cameraDistance=cam_distance,
+                cameraYaw=cam_yaw,
+                cameraPitch=cam_pitch,
+                cameraTargetPosition=cam_target,
+                physicsClientId=cid,
+            )
+            p.stepSimulation(physicsClientId=cid)
+            cam = p.getDebugVisualizerCamera(physicsClientId=cid)
+            view_matrix = cam[2]
+            projection_matrix = cam[3]
+            cap_width = int(cam[0])
+            cap_height = int(cam[1])
+        else:
+            # DIRECT 模式：按 Bullet debug 相机约定反推 eye，再 computeViewMatrix。
+            # 约定：disp = target - eye（相机指向目标），|disp|=distance；
+            # yaw = arctan2(-disp[0], disp[1])，pitch = arctan2(disp[2], sqrt(disp[0]^2+disp[1]^2))。
+            # 反推：disp = (-d*cos(pitch)*sin(yaw), d*cos(pitch)*cos(yaw), d*sin(pitch))，eye = target - disp。
+            yaw_rad = np.radians(cam_yaw)
+            pitch_rad = np.radians(cam_pitch)
+            d = cam_distance
+            dx = d * np.cos(pitch_rad) * np.sin(yaw_rad)
+            dy = -d * np.cos(pitch_rad) * np.cos(yaw_rad)
+            dz = -d * np.sin(pitch_rad)
+            eye = [
+                cam_target[0] + dx,
+                cam_target[1] + dy,
+                cam_target[2] + dz,
+            ]
+            view_matrix = p.computeViewMatrix(
+                eye, cam_target, [0.0, 0.0, 1.0]
+            )
+            aspect = width / float(height)
+            projection_matrix = p.computeProjectionMatrixFOV(
+                np.radians(fov_deg), aspect, 0.02, 10.0
+            )
+            cap_width = width
+            cap_height = height
+
+        p.stepSimulation(physicsClientId=cid)
+        renderer = (
+            p.ER_BULLET_HARDWARE_OPENGL if self.use_gui else p.ER_TINY_RENDERER
+        )
+        result = p.getCameraImage(
+            cap_width,
+            cap_height,
+            view_matrix,
+            projection_matrix,
+            shadow=False,
+            renderer=renderer,
+            physicsClientId=cid,
+        )
+        w_actual, h_actual = int(result[0]), int(result[1])
+        rgb = np.array(result[2], dtype=np.uint8)
+        rgb = rgb.reshape((h_actual, w_actual, 4))[:, :, :3]
+
+        if self.use_gui and (w_actual != width or h_actual != height):
+            try:
+                import cv2
+                rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+            except ImportError:
+                from PIL import Image
+                rgb = np.array(Image.fromarray(rgb).resize((width, height)))
+
+        return rgb
+
+    def _capture_wrist_camera(self, width: int, height: int) -> np.ndarray:
+        """
+        腕部/夹爪相机：与 test_image_save.capture_wrist_direct 逻辑一致。
+        使用 _get_camera_view_params("gripper") 与更大 FOV。返回 RGB (height, width, 3) uint8。
+        """
+        cid = self._client_id
+        fov_deg = 160.0
+
+        eye, target, up = self._get_camera_view_params("gripper")
+        view_matrix = p.computeViewMatrix(eye, target, up)
+
+        if self.use_gui:
+            cam = p.getDebugVisualizerCamera(physicsClientId=cid)
+            cap_width = int(cam[0])
+            cap_height = int(cam[1])
+            aspect = cap_width / float(cap_height)
+            projection_matrix = p.computeProjectionMatrixFOV(
+                np.radians(fov_deg), aspect, 0.02, 10.0
+            )
+        else:
+            aspect = width / float(height)
+            projection_matrix = p.computeProjectionMatrixFOV(
+                np.radians(fov_deg), aspect, 0.02, 10.0
+            )
+            cap_width = width
+            cap_height = height
+
+        p.stepSimulation(physicsClientId=cid)
+        renderer = (
+            p.ER_BULLET_HARDWARE_OPENGL if self.use_gui else p.ER_TINY_RENDERER
+        )
+        result = p.getCameraImage(
+            cap_width,
+            cap_height,
+            view_matrix,
+            projection_matrix,
+            shadow=False,
+            renderer=renderer,
+            physicsClientId=cid,
+        )
+        w_actual, h_actual = int(result[0]), int(result[1])
+        rgb = np.array(result[2], dtype=np.uint8)
+        rgb = rgb.reshape((h_actual, w_actual, 4))[:, :, :3]
+
+        if self.use_gui and (w_actual != width or h_actual != height):
+            try:
+                import cv2
+                rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+            except ImportError:
+                from PIL import Image
+                rgb = np.array(Image.fromarray(rgb).resize((width, height)))
+
+        return rgb
+
     def collect_snapshot(
         self,
         action: np.ndarray | None,
@@ -923,7 +1094,8 @@ class PickPlaceEnv:
     ) -> dict:
         """
         采集当前时刻的一帧数据：固定视角图像、夹爪视角图像、关节位置、以及本步的 action。
-        用于固定频率采集：在每步 step() 之后调用，传入该步的 action。
+        与 test_image_save 中 capture_full_scene_direct / capture_wrist_direct 的渲染逻辑一致，
+        保证第三视角与腕部相机图像正确。
 
         Returns:
             dict:
@@ -932,12 +1104,8 @@ class PickPlaceEnv:
                 - "observation.state": (9,) float64，关节位置
                 - "action": (4,) float64，[x,y,z,gripper]，若 action 为 None 则为 zeros
         """
-        img_fixed = self.render_camera_image(
-            "fixed", width=image_width, height=image_height
-        )
-        img_gripper = self.render_camera_image(
-            "gripper", width=image_width, height=image_height
-        )
+        img_fixed = self._capture_fixed_camera(image_width, image_height)
+        img_gripper = self._capture_wrist_camera(image_width, image_height)
         joint_pos = self.get_joint_positions()
         action_arr = (
             np.asarray(action, dtype=np.float64)
