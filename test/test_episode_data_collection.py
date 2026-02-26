@@ -1,6 +1,9 @@
 """
 测试一个 episode 的数据采集与保存：执行完整的抓取红色方块并放入盒子流程，
 在流程中按固定频率（默认 10Hz）记录双相机图像、机器人关节状态、末端目标 action，并保存到目录。
+
+另含 test_lerobot_dataset_episode_collection：多 episode 采集，通过 LeRobotDataset.create /
+new_episode / add_frame / save_episode / save 写入 LeRobot 数据集格式。
 """
 
 import sys
@@ -12,6 +15,15 @@ sys.path.insert(0, str(project_root))
 
 import numpy as np
 from simulator.pick_place_env import PickPlaceEnv
+
+# LeRobotDataset：优先 lerobot.common.datasets（主流 2024–2025 创建/录制 API），否则回退 lerobot.datasets
+try:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset  # type: ignore[import-untyped]
+except ImportError:
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    except ImportError:
+        LeRobotDataset = None
 
 
 def _get_image_saver():
@@ -138,7 +150,132 @@ def test_episode_data_collection(
         raise RuntimeError(f"Episode 数据采集测试失败: {e}") from e
 
 
+def test_lerobot_dataset_episode_collection(
+    num_episodes: int = 10,
+    output_dir: Path | None = None,
+    use_gui: bool = True,
+    collect_frequency_hz: float = 10.0,
+    image_size: int = 224,
+    seed: int = 42,
+    steps_per_phase: int = 80,
+    task_description: str = "Pick the red cube and place it in the box.",
+):
+    """
+    在带 GUI 的仿真下运行多个 episode（抓取红色方块），按固定频率采集每帧数据，
+    通过 LeRobotDataset.create / new_episode / add_frame / save_episode / save 写入 LeRobot 格式。
+
+    字段对应：
+    - 双相机：observation.images.top_image, observation.images.wrist_image
+    - 关节状态：observation.state
+    - 动作：action
+    - timestamp, frame_index, episode_index, index, task_index 由 LeRobotDataset 维护
+
+    运行示例:
+      python test/test_episode_data_collection.py --lerobot
+      python test/test_episode_data_collection.py --lerobot --no-gui
+    """
+    if LeRobotDataset is None:
+        raise ImportError(
+            "LeRobotDataset 未找到。请安装: pip install lerobot\n"
+            "并确认存在 lerobot.common.datasets.lerobot_dataset 或 lerobot.datasets.lerobot_dataset"
+        )
+
+    if output_dir is None:
+        output_dir = project_root / "test_output" / "lerobot_pick_red_dataset"
+    root = Path(output_dir)
+    # 不在此处 mkdir：LeRobotDataset.create() 会自行创建 root，且要求目录不存在 (exist_ok=False)
+    repo_id = "pick_red_lerobot_dataset"
+
+    print("=" * 60)
+    print("测试: LeRobot 格式多 Episode 数据采集 (LeRobotDataset.create / add_frame / save)")
+    print("=" * 60)
+    print(f"  输出目录: {root}")
+    print(f"  repo_id: {repo_id}")
+    print(f"  Episode 数: {num_episodes}")
+    print(f"  GUI: {use_gui}")
+    print(f"  采集频率: {collect_frequency_hz} Hz")
+    print(f"  图像尺寸: {image_size}x{image_size}")
+
+    control_hz = 40.0
+    collect_interval = max(1, int(control_hz / collect_frequency_hz))
+    fps = collect_frequency_hz
+
+    # ---------- 1. 创建数据集（明确 features + fps，便于 VLA/π0 训练） ----------
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=int(fps),
+        features={
+            "observation.state": {"dtype": "float32", "shape": (9,)},
+            "observation.images.top_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+            "observation.images.wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+            "action": {"dtype": "float32", "shape": (4,)},
+        },
+        root=root,
+    )
+
+    env = PickPlaceEnv(render=True, use_gui=use_gui, seed=seed)
+    total_frames = 0
+
+    try:
+        for ep in range(num_episodes):
+            obs = env.reset()
+            collected: list[dict] = []
+            step_count = [0]
+
+            def on_before_step(action: np.ndarray) -> None:
+                step_count[0] += 1
+                if step_count[0] % collect_interval == 0:
+                    snap = env.collect_snapshot(
+                        action,
+                        image_width=image_size,
+                        image_height=image_size,
+                    )
+                    collected.append(snap)
+
+            success, reward, done = env.execute_pick_place(
+                "red",
+                steps_per_phase=steps_per_phase,
+                on_before_step=on_before_step,
+                use_real_time=False,
+            )
+
+            # ---------- 2. 逐帧 add_frame（frame=全量特征 dict，task=任务描述）；无 new_episode，由 save_episode 后自动重置 buffer ----------
+            for fi, snap in enumerate(collected):
+                t = total_frames / fps
+                frame = {
+                    "observation.state": snap["observation.state"].astype(np.float32),
+                    "observation.images.top_image": snap["observation.images.top"],
+                    "observation.images.wrist_image": snap["observation.images.wrist"],
+                    "action": snap["action"].astype(np.float32),
+                }
+                dataset.add_frame(frame=frame, task=task_description, timestamp=t)
+                total_frames += 1
+
+            # ---------- 3. 保存当前 episode（并自动为下一 episode 创建新 buffer） ----------
+            dataset.save_episode()
+
+            print(f"  Episode {ep + 1}/{num_episodes}: {len(collected)} 帧, success={success}, reward={reward}")
+
+        print(f"\n  总帧数: {total_frames}")
+        print(f"  已写入 LeRobot 格式: {root}")
+        print("✓ LeRobot 数据集采集测试完成")
+        env.close()
+    except Exception as e:
+        env.close()
+        raise RuntimeError(f"LeRobot 数据集采集测试失败: {e}") from e
+
+
 if __name__ == "__main__":
+    if "--lerobot" in sys.argv:
+        use_gui = "--no-gui" not in sys.argv
+        test_lerobot_dataset_episode_collection(
+            num_episodes=10,
+            use_gui=use_gui,
+            collect_frequency_hz=10.0,
+            image_size=224,
+        )
+        sys.exit(0)
+
     use_gui = "--gui" in sys.argv
     test_episode_data_collection(
         use_gui=use_gui,
