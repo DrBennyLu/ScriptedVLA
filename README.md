@@ -33,6 +33,7 @@ ScriptedVLA/
 ├── train.py                     # Training script (supports LeRobot datasets)
 ├── train_public_datasets.py     # Training script for public datasets
 ├── inference.py                 # Inference script (dataset-based, auto-detects latest checkpoint)
+├── online_simulation_inference.py  # Online sim inference (VLA in loop until task done)
 ├── create_dummy_data.py         # Create test data
 ├── dataset_statistics.py        # Dataset statistics and filtering tools
 ├── download_model.py            # Model download script
@@ -49,6 +50,7 @@ ScriptedVLA/
 │   ├── test_inference.py        # Inference tests (single-frame & episode with 3D viz)
 │   ├── test_pick_place_env.py   # Pick-and-place simulation env tests & data collection
 │   ├── test_image_save.py       # Simulation image capture (top/wrist cameras)
+│   ├── test_episode_data_collection.py  # Episode collection (LeRobot format or step folders)
 │   └── evaluate_vlm_capabilities.py # VLM capability evaluation script
 ├── simulator/                   # Simulation (PyBullet)
 │   ├── __init__.py
@@ -226,6 +228,10 @@ python test/test_pick_place_env.py --gui
 python test/test_pick_place_env.py --data-collection
 python test/test_pick_place_env.py --data-collection --gui
 
+# Episode data collection: full pick-place episode → step folders or LeRobot dataset format
+python test/test_episode_data_collection.py
+python test/test_episode_data_collection.py --gui
+
 # Save a single frame (top + wrist camera images)
 python test/test_image_save.py
 python test/test_image_save.py --gui
@@ -238,7 +244,7 @@ The simulator (`simulator/pick_place_env.py`) provides:
 
 #### 8. Inference
 
-Inference reads a frame from the dataset, loads the latest checkpoint, and compares predictions with ground truth:
+**Dataset-based inference** (`inference.py`): read a frame from a dataset, run the model, compare with ground truth.
 
 ```bash
 # Use default dataset and auto-detect latest checkpoint
@@ -251,7 +257,20 @@ python inference.py --config config.yaml --dataset ./dataset/libero_object --che
 python inference.py --config config.yaml --frame_idx 100
 ```
 
-**Note:** Checkpoints are saved as `checkpoint_step_{step}.pt` (e.g., `checkpoint_step_5000.pt`). The script automatically finds the latest checkpoint in the checkpoint directory.
+**Online simulation inference** (`online_simulation_inference.py`): run the trained VLA in the pick-place sim in a closed loop until the red cube is in the box (observation → model → action chunk → step sim → repeat).
+
+```bash
+# Run with GUI (default)
+python online_simulation_inference.py --config config.yaml --checkpoint_dir ./checkpoints
+
+# Headless (DIRECT mode)
+python online_simulation_inference.py --config config.yaml --no_gui
+
+# Custom instruction and limits
+python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box." --max_rounds 50 --step_delay 0.02
+```
+
+**Note:** Checkpoints are saved as `checkpoint_step_{step}.pt` (e.g., `checkpoint_step_5000.pt`). Scripts auto-detect the latest checkpoint in the given directory.
 
 ### Model Architecture
 
@@ -389,6 +408,7 @@ pytest test/test_lerobot_training.py
 pytest test/test_training.py
 pytest test/test_inference.py
 pytest test/test_pick_place_env.py   # Simulation env tests
+pytest test/test_episode_data_collection.py  # Episode / LeRobot-style collection
 ```
 
 #### Test Inference (test_inference.py)
@@ -468,7 +488,7 @@ pytest test/test_lerobot_training.py
 ```
 
 **Q: How do I use the simulation environment?**  
-A: The `simulator` module provides `PickPlaceEnv` (PyBullet) for pick-and-place with Franka Panda, cubes, and a box. Run `pytest test/test_pick_place_env.py -v` for tests, or `python test/test_pick_place_env.py --data-collection` to collect top/wrist images and metadata. Requires `pybullet` (in project dependencies).
+A: The `simulator` module provides `PickPlaceEnv` (PyBullet) for pick-and-place with Franka Panda, cubes, and a box. Run `pytest test/test_pick_place_env.py -v` for tests; `python test/test_pick_place_env.py --data-collection` to collect top/wrist images and metadata; `python test/test_episode_data_collection.py` for full-episode collection (LeRobot format or step folders). For **online closed-loop inference** in sim, use `python online_simulation_inference.py --config config.yaml` (loads checkpoint, runs VLA in loop until red cube in box). Requires `pybullet` (in project dependencies).
 
 **Q: What if state dimensions don't match?**  
 A: The project implements automatic state dimension normalization. If you encounter dimension issues, check the normalization utilities in `src/ScriptedVLA/utils/normalization.py`.
@@ -524,6 +544,7 @@ ScriptedVLA/
 ├── train.py                     # 训练脚本（支持LeRobot数据集）
 ├── train_public_datasets.py     # 公开数据集训练脚本
 ├── inference.py                 # 推理脚本（基于数据集，自动检测最新 checkpoint）
+├── online_simulation_inference.py  # 在线仿真推理（VLA 闭环直到任务完成）
 ├── create_dummy_data.py         # 创建测试数据
 ├── dataset_statistics.py        # 数据集统计和筛选工具
 ├── download_model.py            # 模型下载脚本
@@ -540,6 +561,7 @@ ScriptedVLA/
 │   ├── test_inference.py        # 推理测试（单帧 & episode 含 3D 可视化）
 │   ├── test_pick_place_env.py   # 抓取-放置仿真环境测试与数据采集
 │   ├── test_image_save.py       # 仿真图像采集（顶视/腕部相机）
+│   ├── test_episode_data_collection.py  # Episode 采集（LeRobot 格式或按步保存）
 │   └── evaluate_vlm_capabilities.py # VLM能力测评脚本
 ├── simulator/                   # 仿真模块（PyBullet）
 │   ├── __init__.py
@@ -717,6 +739,10 @@ python test/test_pick_place_env.py --gui
 python test/test_pick_place_env.py --data-collection
 python test/test_pick_place_env.py --data-collection --gui
 
+# Episode 数据采集：完整抓取-放置流程 → 按步保存或 LeRobot 数据集格式
+python test/test_episode_data_collection.py
+python test/test_episode_data_collection.py --gui
+
 # 保存单帧图像（顶视 + 腕部相机）
 python test/test_image_save.py
 python test/test_image_save.py --gui
@@ -729,7 +755,7 @@ python test/test_image_save.py --gui
 
 #### 8. 推理
 
-推理脚本从数据集中读取一帧数据，加载最新 checkpoint，进行推理并与真实值（GT）对比：
+**基于数据集的推理**（`inference.py`）：从数据集中读取一帧，运行模型，与真实值（GT）对比。
 
 ```bash
 # 使用默认数据集，自动查找最新 checkpoint
@@ -742,7 +768,20 @@ python inference.py --config config.yaml --dataset ./dataset/libero_object --che
 python inference.py --config config.yaml --frame_idx 100
 ```
 
-**说明：** Checkpoint 保存格式为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`）。脚本会自动在 checkpoint 目录中查找最新的 checkpoint。
+**在线仿真推理**（`online_simulation_inference.py`）：在抓取-放置仿真中闭环运行训练好的 VLA，直到红色方块被放入盒子（观测 → 模型 → action chunk → 仿真步进 → 重复）。
+
+```bash
+# 带 GUI 运行（默认）
+python online_simulation_inference.py --config config.yaml --checkpoint_dir ./checkpoints
+
+# 无界面（DIRECT 模式）
+python online_simulation_inference.py --config config.yaml --no_gui
+
+# 自定义指令与上限
+python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box." --max_rounds 50 --step_delay 0.02
+```
+
+**说明：** Checkpoint 保存格式为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`）。脚本会在给定目录中自动查找最新 checkpoint。
 
 ### 模型架构
 
@@ -880,6 +919,7 @@ pytest test/test_lerobot_training.py
 pytest test/test_training.py
 pytest test/test_inference.py
 pytest test/test_pick_place_env.py   # 仿真环境测试
+pytest test/test_episode_data_collection.py  # Episode / LeRobot 格式采集测试
 ```
 
 #### 推理测试（test_inference.py）
@@ -959,7 +999,7 @@ pytest test/test_lerobot_training.py
 ```
 
 **Q: 如何使用仿真环境？**  
-A: `simulator` 模块提供基于 PyBullet 的 `PickPlaceEnv`，用于 Franka Panda 抓取方块放入盒子。运行 `pytest test/test_pick_place_env.py -v` 进行测试，或 `python test/test_pick_place_env.py --data-collection` 采集顶视/腕部图像与元数据。需安装 `pybullet`（已列入项目依赖）。
+A: `simulator` 模块提供基于 PyBullet 的 `PickPlaceEnv`，用于 Franka Panda 抓取方块放入盒子。运行 `pytest test/test_pick_place_env.py -v` 进行测试；`python test/test_pick_place_env.py --data-collection` 采集顶视/腕部图像与元数据；`python test/test_episode_data_collection.py` 进行完整 episode 采集（LeRobot 格式或按步保存）。若要在仿真中**在线闭环推理**，使用 `python online_simulation_inference.py --config config.yaml`（加载 checkpoint，在仿真中循环运行 VLA 直到红色方块入盒）。需安装 `pybullet`（已列入项目依赖）。
 
 **Q: 状态维度不匹配怎么办？**  
 A: 项目已实现自动状态维度规范化。如果遇到维度问题，请查看 `src/ScriptedVLA/utils/normalization.py` 中的归一化工具。

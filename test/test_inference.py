@@ -808,11 +808,13 @@ def test_inference_from_dataset(
             print(f"  警告: 无法获取chat内容: {e}")
             print(f"  使用原始指令: {instruction}")
         
-        # 5. 运行推理（从 config 读取是否对 action/state 做归一化）
+        # 5. 运行推理（从 config 读取是否使用 normalizer 及 action/state 归一化）
         config = load_config(test_config_path)
         data_config = get_data_config(config)
-        normalize_action = data_config.get("normalize_action", True)
-        normalize_state = data_config.get("normalize_state", True)
+        use_normalizer = data_config.get("use_normalizer", True)
+        normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
+        normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+        normalizer_to_use = normalizer if use_normalizer else None
         print("\n[Step 5] 运行推理...")
         predicted_actions = run_inference(
             model=model,
@@ -820,7 +822,7 @@ def test_inference_from_dataset(
             instruction=instruction,
             image_keys=image_keys,
             states=states,
-            normalizer=normalizer,
+            normalizer=normalizer_to_use,
             image_size=image_size,
             normalize_action=normalize_action,
             normalize_state=normalize_state,
@@ -1015,10 +1017,12 @@ def test_episode_inference_with_3d_visualization(
         result["num_frames"] = len(episode_frames)
         print(f"  ✓ Episode包含 {len(episode_frames)} 帧")
         
-        # 4. 对每一帧进行推理（从 config 读取是否对 action/state 做归一化）
+        # 4. 对每一帧进行推理（从 config 读取是否使用 normalizer 及 action/state 归一化）
         data_config = get_data_config(config)
-        normalize_action = data_config.get("normalize_action", True)
-        normalize_state = data_config.get("normalize_state", True)
+        use_normalizer = data_config.get("use_normalizer", True)
+        normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
+        normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+        normalizer_to_use = normalizer if use_normalizer else None
         print(f"\n[Step 4] 对每一帧进行推理...")
         predicted_xyz_list = []
         true_xyz_list = []
@@ -1194,7 +1198,7 @@ def test_episode_inference_with_3d_visualization(
                     instruction=instruction,
                     image_keys=image_keys,
                     states=states,
-                    normalizer=normalizer,
+                    normalizer=normalizer_to_use,
                     image_size=image_size,
                     normalize_action=normalize_action,
                     normalize_state=normalize_state,

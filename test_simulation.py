@@ -558,23 +558,38 @@ def main():
         print("  4. 参考LIBERO官方文档：https://github.com/Lifelong-Robot-Learning/LIBERO")
         return
     
-    # 4. 运行episodes
+    # 4. 运行episodes（从 config 读取是否使用 normalizer）
+    use_normalizer = True
+    normalize_action = True
+    normalize_state = True
+    try:
+        config = load_config(args.config)
+        data_config = get_data_config(config)
+        use_normalizer = data_config.get("use_normalizer", True)
+        normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
+        normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+    except Exception:
+        pass
+    normalizer_to_use = normalizer if use_normalizer else None
+
     print("\n[Step 4] 运行仿真episodes...")
     results = []
-    
+
     for episode_idx in range(args.num_episodes):
         print(f"\n{'=' * 60}")
         print(f"Episode {episode_idx + 1}/{args.num_episodes}")
         print(f"{'=' * 60}")
-        
+
         try:
             episode_info = run_episode_in_simulation(
                 model=model,
                 env=env,
                 task=task,
-                normalizer=normalizer,
+                normalizer=normalizer_to_use,
                 max_steps=args.max_steps,
-                render=not args.headless
+                render=not args.headless,
+                normalize_action=normalize_action,
+                normalize_state=normalize_state,
             )
             results.append(episode_info)
             

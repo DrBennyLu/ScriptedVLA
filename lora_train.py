@@ -737,8 +737,11 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"  Batch size: {batch_size}")
     print(f"  最大训练步数: {max_steps}")
 
-    normalize_action = data_config.get("normalize_action", False)
-    normalize_state = data_config.get("normalize_state", False)
+    use_normalizer = data_config.get("use_normalizer", True)
+    if not use_normalizer:
+        normalizer = None
+    normalize_action = data_config.get("normalize_action", False) if use_normalizer else False
+    normalize_state = data_config.get("normalize_state", False) if use_normalizer else False
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
         state_key=state_key,
@@ -832,7 +835,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
             latest_checkpoint_path, model, optimizer, scheduler, device
         )
 
-        if loaded_normalizer is not None:
+        if loaded_normalizer is not None and use_normalizer:
             normalizer = loaded_normalizer
             print(f"  使用检查点中的归一化器")
             custom_collate_fn = create_collate_fn(

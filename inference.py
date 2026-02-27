@@ -623,10 +623,12 @@ def main():
     if states is not None and isinstance(states, torch.Tensor):
         states = states.numpy()
     
-    # 5. 运行推理（从 config 读取是否对 action/state 做归一化）
+    # 5. 运行推理（从 config 读取是否使用 normalizer 及 action/state 归一化）
     data_config = get_data_config(config)
-    normalize_action = data_config.get("normalize_action", True)
-    normalize_state = data_config.get("normalize_state", True)
+    use_normalizer = data_config.get("use_normalizer", True)
+    normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
+    normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+    normalizer_to_use = normalizer if use_normalizer else None
     print("\n[Step 4] 运行推理...")
     predicted_actions = run_inference(
         model=model,
@@ -634,7 +636,7 @@ def main():
         instruction=instruction,
         image_keys=image_keys,
         states=states,
-        normalizer=normalizer,
+        normalizer=normalizer_to_use,
         image_size=image_size,
         normalize_action=normalize_action,
         normalize_state=normalize_state,

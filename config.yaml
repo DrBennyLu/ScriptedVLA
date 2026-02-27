@@ -20,7 +20,7 @@ model:
     num_layers: 6
     num_heads: 12
     mlp_ratio: 4.0
-    action_dim: 7  # 动作维度（例如：x, y, z, roll, pitch, yaw, gripper）
+    action_dim: 4  # 动作维度（x, y, z, gripper），与仿真器一致
     # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
     # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
     # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
@@ -117,7 +117,7 @@ dataset:
   state_key: "observation.state"
   
   # 动作维度（从配置中直接指定，不再从数据集自动获取）
-  action_dim: 7  # 例如：x, y, z, roll, pitch, yaw, gripper
+  action_dim: 4  # x, y, z, gripper，与仿真器一致
   
   # 数据加载器配置
   dataloader:
@@ -134,15 +134,17 @@ dataset:
 
 # 数据配置（用于获取默认状态维度等）
 data:
-  # 是否对 action/state 进行归一化（训练时归一化输入，推理时按配置反归一化输出或归一化输入 state）
+  # 归一化器总开关：关闭后不使用 normalizer，normalize_action / normalize_state 不生效
+  use_normalizer: true
+  # 是否对 action/state 进行归一化（需 use_normalizer=true 才生效）
   # 重要：Flow Matching 应在归一化空间 [-1,1] 训练，否则各维度尺度差异大、符号易错、难以收敛
-  normalize_action: true   # 训练时对 action 归一化，推理时对模型输出反归一化（强烈建议开启）
+  normalize_action: true   # 训练时对 action 归一化，推理时对模型输出反归一化
   normalize_state: true   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
   
   # 机器人状态配置
   robot_state:
-    # 状态维度（从配置中直接指定，不再从数据集自动获取）
-    state_dim: 8
+    # 状态维度（从配置中直接指定，与仿真器关节+夹爪一致）
+    state_dim: 9  # 7 臂关节 + 2 夹爪
     # 是否使用状态信息（VLM 与动作头独立配置，若未设置则从 model.vla 读取）
     use_state_vlm: false          # VLM 是否使用状态
     use_state_action_head: true  # 动作头是否使用状态
@@ -177,16 +179,16 @@ test:
       hidden_dim: 1536
       num_layers: 6  # 测试时使用较少的层数
       num_heads: 12
-      action_dim: 7
+      action_dim: 4
       action_horizon: 50
       num_inference_timesteps: 10
       norm_type: "ada_norm"
     
-    # VLA模型配置
+    # VLA模型配置（与主配置一致：VLM 不用 state，action head 用 state）
     vla:
-      use_state_vlm: true
+      use_state_vlm: false
       use_state_action_head: true
-      state_dim: 8
+      state_dim: 9
       future_action_window_size: 49
   
   # 测试训练配置
