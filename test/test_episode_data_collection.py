@@ -150,6 +150,13 @@ def test_episode_data_collection(
         raise RuntimeError(f"Episode 数据采集测试失败: {e}") from e
 
 
+# 红蓝方块任务映射（用于语言遵从数据采集）
+TASKS = [
+    ("red", "Pick up the red cube and place it in the box."),
+    ("blue", "Pick up the blue cube and place it in the box."),
+]
+
+
 def test_lerobot_dataset_episode_collection(
     num_episodes: int = 10,
     output_dir: Path | None = None,
@@ -159,10 +166,14 @@ def test_lerobot_dataset_episode_collection(
     seed: int = 42,
     steps_per_phase: int = 80,
     task_description: str = "Pick the red cube and place it in the box.",
+    seed_strategy: str = "fixed",
+    task_mode: str = "red_only",
+    red_blue_ratio: float = 0.5,
+    repo_id: str = "pick_red_lerobot_dataset",
 ):
     """
-    在带 GUI 的仿真下运行多个 episode（抓取红色方块），按固定频率采集每帧数据，
-    通过 LeRobotDataset.create / new_episode / add_frame / save_episode / save 写入 LeRobot 格式。
+    在带 GUI 的仿真下运行多个 episode（抓取红色/蓝色方块），按固定频率采集每帧数据，
+    通过 LeRobotDataset.create / add_frame / save_episode / save 写入 LeRobot 格式。
 
     字段对应：
     - 双相机：observation.images.top_image, observation.images.wrist_image
@@ -170,9 +181,14 @@ def test_lerobot_dataset_episode_collection(
     - 动作：action
     - timestamp, frame_index, episode_index, index, task_index 由 LeRobotDataset 维护
 
+    参数：
+    - seed_strategy: "fixed" 共用同一 seed，"varying" 每 episode 使用 base_seed+ep 以扩大泛化
+    - task_mode: "red_only" | "blue_only" | "red_blue_alternate" | "red_blue_ratio"
+    - red_blue_ratio: 当 task_mode="red_blue_ratio" 时，red 任务占比 (0~1)
+
     运行示例:
       python test/test_episode_data_collection.py --lerobot
-      python test/test_episode_data_collection.py --lerobot --no-gui
+      python test/test_episode_data_collection.py --lerobot --task-mode red_blue_alternate --seed-strategy varying
     """
     if LeRobotDataset is None:
         raise ImportError(
@@ -184,7 +200,6 @@ def test_lerobot_dataset_episode_collection(
         output_dir = project_root / "test_output" / "lerobot_pick_red_dataset"
     root = Path(output_dir)
     # 不在此处 mkdir：LeRobotDataset.create() 会自行创建 root，且要求目录不存在 (exist_ok=False)
-    repo_id = "pick_red_lerobot_dataset"
 
     print("=" * 60)
     print("测试: LeRobot 格式多 Episode 数据采集 (LeRobotDataset.create / add_frame / save)")
@@ -192,6 +207,10 @@ def test_lerobot_dataset_episode_collection(
     print(f"  输出目录: {root}")
     print(f"  repo_id: {repo_id}")
     print(f"  Episode 数: {num_episodes}")
+    print(f"  seed_strategy: {seed_strategy}")
+    print(f"  task_mode: {task_mode}")
+    if task_mode == "red_blue_ratio":
+        print(f"  red_blue_ratio: {red_blue_ratio}")
     print(f"  GUI: {use_gui}")
     print(f"  采集频率: {collect_frequency_hz} Hz")
     print(f"  图像尺寸: {image_size}x{image_size}")
@@ -218,9 +237,29 @@ def test_lerobot_dataset_episode_collection(
 
     try:
         for ep in range(num_episodes):
+            # 抓取泛化：每个 episode 使用不同 seed 以增加方块位置多样性
+            if seed_strategy == "varying":
+                np.random.seed(seed + ep)
+
             obs = env.reset()
             collected: list[dict] = []
             step_count = [0]
+
+            # 语言遵从：根据 task_mode 选择本 episode 抓取红/蓝方块及任务描述
+            if task_mode == "red_only":
+                color, ep_task_desc = TASKS[0]
+            elif task_mode == "blue_only":
+                color, ep_task_desc = TASKS[1]
+            elif task_mode == "red_blue_alternate":
+                color, ep_task_desc = TASKS[ep % 2]
+            elif task_mode == "red_blue_ratio":
+                n_red = int(num_episodes * red_blue_ratio)
+                if ep < n_red:
+                    color, ep_task_desc = TASKS[0]
+                else:
+                    color, ep_task_desc = TASKS[1]
+            else:
+                color, ep_task_desc = TASKS[0]
 
             def on_before_step(action: np.ndarray) -> None:
                 step_count[0] += 1
@@ -233,7 +272,7 @@ def test_lerobot_dataset_episode_collection(
                     collected.append(snap)
 
             success, reward, done = env.execute_pick_place(
-                "red",
+                color,
                 steps_per_phase=steps_per_phase,
                 on_before_step=on_before_step,
                 use_real_time=False,
@@ -248,13 +287,13 @@ def test_lerobot_dataset_episode_collection(
                     "observation.images.wrist_image": snap["observation.images.wrist"],
                     "action": snap["action"].astype(np.float32),
                 }
-                dataset.add_frame(frame=frame, task=task_description, timestamp=t)
+                dataset.add_frame(frame=frame, task=ep_task_desc, timestamp=t)
                 total_frames += 1
 
             # ---------- 3. 保存当前 episode（并自动为下一 episode 创建新 buffer） ----------
             dataset.save_episode()
 
-            print(f"  Episode {ep + 1}/{num_episodes}: {len(collected)} 帧, success={success}, reward={reward}")
+            print(f"  Episode {ep + 1}/{num_episodes}: color={color}, {len(collected)} 帧, success={success}, reward={reward}")
 
         print(f"\n  总帧数: {total_frames}")
         print(f"  已写入 LeRobot 格式: {root}")
@@ -265,14 +304,44 @@ def test_lerobot_dataset_episode_collection(
         raise RuntimeError(f"LeRobot 数据集采集测试失败: {e}") from e
 
 
+def _parse_lerobot_args():
+    """解析 LeRobot 采集命令行参数"""
+    import argparse
+    ap = argparse.ArgumentParser(description="LeRobot 格式多 episode 数据采集")
+    ap.add_argument("--lerobot", action="store_true", help="使用 LeRobot 格式采集")
+    ap.add_argument("--no-gui", action="store_true", help="禁用 GUI（DIRECT 仿真）")
+    ap.add_argument("--num-episodes", type=int, default=10, help="Episode 数量")
+    ap.add_argument("--task-mode", type=str, default="red_only",
+                    choices=["red_only", "blue_only", "red_blue_alternate", "red_blue_ratio"],
+                    help="任务模式：red_only/blue_only/red_blue_alternate/red_blue_ratio")
+    ap.add_argument("--red-blue-ratio", type=float, default=0.5,
+                    help="当 task_mode=red_blue_ratio 时 red 任务占比 (0~1)")
+    ap.add_argument("--seed-strategy", type=str, default="fixed",
+                    choices=["fixed", "varying"],
+                    help="seed 策略：fixed 共用同一 seed，varying 每 episode 使用 base_seed+ep")
+    ap.add_argument("--repo-id", type=str, default="pick_red_lerobot_dataset",
+                    help="LeRobot 数据集 repo_id（红蓝任务建议 pick_red_blue_lerobot_dataset）")
+    ap.add_argument("--output-dir", type=str, default=None, help="输出目录")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
-    if "--lerobot" in sys.argv:
-        use_gui = "--no-gui" not in sys.argv
+    args = _parse_lerobot_args()
+    if args.lerobot:
+        use_gui = not args.no_gui
+        out_dir = Path(args.output_dir) if args.output_dir else None
+        if out_dir is None and args.task_mode in ("red_blue_alternate", "red_blue_ratio"):
+            out_dir = project_root / "test_output" / "lerobot_pick_red_blue_dataset"
         test_lerobot_dataset_episode_collection(
-            num_episodes=10,
+            num_episodes=args.num_episodes,
+            output_dir=out_dir,
             use_gui=use_gui,
             collect_frequency_hz=10.0,
             image_size=224,
+            task_mode=args.task_mode,
+            red_blue_ratio=args.red_blue_ratio,
+            seed_strategy=args.seed_strategy,
+            repo_id=args.repo_id,
         )
         sys.exit(0)
 

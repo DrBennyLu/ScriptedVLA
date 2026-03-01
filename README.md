@@ -95,7 +95,7 @@ uv pip install -e .
 
 #### 2. Prepare Data
 
-The project primarily supports **LeRobot dataset format** (v2.1 and v3.0), which is the default and recommended approach.
+The project primarily supports **LeRobot dataset format** (v2.1 and v3.0), which is the default and recommended approach. You can also generate data from the simulation environment using [test/test_episode_data_collection.py](test/test_episode_data_collection.py) (full pick-place episode → LeRobot format or step folders).
 
 **Using LeRobot Datasets:**
 
@@ -232,6 +232,9 @@ python test/test_pick_place_env.py --data-collection --gui
 python test/test_episode_data_collection.py
 python test/test_episode_data_collection.py --gui
 
+# LeRobot format: red+blue alternating with varying seeds (for grasping generalization & language compliance)
+python test/test_episode_data_collection.py --lerobot --task-mode red_blue_alternate --seed-strategy varying --num-episodes 100
+
 # Save a single frame (top + wrist camera images)
 python test/test_image_save.py
 python test/test_image_save.py --gui
@@ -268,6 +271,19 @@ python online_simulation_inference.py --config config.yaml --no_gui
 
 # Custom instruction and limits
 python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box." --max_rounds 50 --step_delay 0.02
+```
+
+**Usage examples for grasping generalization and red/blue language compliance:**
+
+```bash
+# Collect red+blue alternating data with varying seeds (improves generalization)
+python test/test_episode_data_collection.py --lerobot --task-mode red_blue_alternate --seed-strategy varying --num-episodes 100
+
+# Inference with red cube instruction
+python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box."
+
+# Inference with blue cube instruction
+python online_simulation_inference.py --instruction "Pick up the blue cube and place it in the box."
 ```
 
 **Note:** Checkpoints are saved as `checkpoint_step_{step}.pt` (e.g., `checkpoint_step_5000.pt`). Scripts auto-detect the latest checkpoint in the given directory.
@@ -606,7 +622,7 @@ uv pip install -e .
 
 #### 2. 准备数据
 
-项目主要支持 **LeRobot数据集格式**（v2.1和v3.0），这是默认和推荐的方式。
+项目主要支持 **LeRobot数据集格式**（v2.1和v3.0），这是默认和推荐的方式。也可使用 [test/test_episode_data_collection.py](test/test_episode_data_collection.py) 通过仿真环境生成数据（完整抓取-放置 episode → LeRobot 格式或按步保存）。
 
 **使用LeRobot数据集：**
 
@@ -743,6 +759,9 @@ python test/test_pick_place_env.py --data-collection --gui
 python test/test_episode_data_collection.py
 python test/test_episode_data_collection.py --gui
 
+# LeRobot 格式：红蓝交替 + varying seed（用于抓取泛化与语言遵从）
+python test/test_episode_data_collection.py --lerobot --task-mode red_blue_alternate --seed-strategy varying --num-episodes 100
+
 # 保存单帧图像（顶视 + 腕部相机）
 python test/test_image_save.py
 python test/test_image_save.py --gui
@@ -779,6 +798,19 @@ python online_simulation_inference.py --config config.yaml --no_gui
 
 # 自定义指令与上限
 python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box." --max_rounds 50 --step_delay 0.02
+```
+
+**抓取泛化与红蓝语言遵从使用示例：**
+
+```bash
+# 采集红蓝交替数据，使用 varying seed 提升泛化
+python test/test_episode_data_collection.py --lerobot --task-mode red_blue_alternate --seed-strategy varying --num-episodes 100
+
+# 推理红方块任务
+python online_simulation_inference.py --instruction "Pick up the red cube and place it in the box."
+
+# 推理蓝方块任务
+python online_simulation_inference.py --instruction "Pick up the blue cube and place it in the box."
 ```
 
 **说明：** Checkpoint 保存格式为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`）。脚本会在给定目录中自动查找最新 checkpoint。

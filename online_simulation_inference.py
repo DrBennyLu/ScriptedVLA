@@ -189,9 +189,12 @@ def run_online_simulation(
                     step_delay=step_delay,
                 )
 
-            # 检查红色方块是否已入盒
-            if env._red_cube_id is not None and env._is_cube_in_box(env._red_cube_id):
-                print("Red cube is in the box. Task success.")
+            # 根据 instruction 推断目标颜色，检查对应红/蓝方块是否已入盒
+            target_cube_id = (
+                env._blue_cube_id if "blue" in instruction.lower() else env._red_cube_id
+            )
+            if target_cube_id is not None and env._is_cube_in_box(target_cube_id):
+                print("Target cube is in the box. Task success.")
                 done = True
                 break
 

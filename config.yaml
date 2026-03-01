@@ -132,6 +132,9 @@ dataset:
     # 方式2: 从tasks.jsonl文件查询（如果use_batch_task为false或batch中没有task字段）
     use_tasks_jsonl: true  # 作为备选方案
 
+  # episode_slice: 指定使用的 episode 索引列表；null 表示使用全部 episode
+  episode_slice: null
+
 # 数据配置（用于获取默认状态维度等）
 data:
   # 归一化器总开关：关闭后不使用 normalizer，normalize_action / normalize_state 不生效
@@ -141,6 +144,16 @@ data:
   normalize_action: true   # 训练时对 action 归一化，推理时对模型输出反归一化
   normalize_state: true   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
   
+  # 图像数据增强（抓取泛化）
+  augmentation:
+    enabled: false
+    color_jitter_brightness: 0.1
+    color_jitter_contrast: 0.1
+    color_jitter_saturation: 0.1
+    random_affine_translate: 0.05
+    random_affine_scale: [0.95, 1.05]
+    random_apply_p: 0.5
+
   # 机器人状态配置
   robot_state:
     # 状态维度（从配置中直接指定，与仿真器关节+夹爪一致）

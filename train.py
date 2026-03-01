@@ -263,6 +263,7 @@ def create_collate_fn(
     normalizer=None,
     normalize_action=True,
     normalize_state=True,
+    augmentation_config=None,
 ):
     """
     创建collate函数，处理lerobot返回的batch格式
@@ -275,7 +276,25 @@ def create_collate_fn(
         normalizer: 归一化器（可选）
         normalize_action: 是否对 action 做归一化（需 normalizer）
         normalize_state: 是否对 state 做归一化（需 normalizer）
+        augmentation_config: 数据增强配置（可选），enabled=true 时对图像应用 ColorJitter + RandomAffine
     """
+    # 构建图像增强变换（抓取泛化）
+    aug_transform = None
+    if augmentation_config and augmentation_config.get("enabled"):
+        from torchvision import transforms
+        b = augmentation_config.get("color_jitter_brightness", 0.1)
+        c = augmentation_config.get("color_jitter_contrast", 0.1)
+        s = augmentation_config.get("color_jitter_saturation", 0.1)
+        t = augmentation_config.get("random_affine_translate", 0.05)
+        scale = augmentation_config.get("random_affine_scale", [0.95, 1.05])
+        p = augmentation_config.get("random_apply_p", 0.5)
+        aug_transform = transforms.Compose([
+            transforms.RandomApply([
+                transforms.ColorJitter(brightness=b, contrast=c, saturation=s),
+                transforms.RandomAffine(degrees=0, translate=(t, t), scale=scale),
+            ], p=p),
+        ])
+
     def collate_fn(batch_list):
         from torch.utils.data._utils.collate import default_collate
         
@@ -305,12 +324,23 @@ def create_collate_fn(
         for i in range(batch_size):
             if len(image_keys) == 1:
                 img_tensor = batch_dict[image_keys[0]][i]
-                images_list.append(_tensor_to_pil_image(img_tensor, image_size))
+                img = _tensor_to_pil_image(img_tensor, image_size)
+                images_list.append(img)
             else:
-                camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size) 
+                camera_images = [_tensor_to_pil_image(batch_dict[key][i], image_size)
                                 for key in image_keys]
                 images_list.append(camera_images)
-        
+
+        # 图像数据增强（抓取泛化）
+        if aug_transform is not None:
+            aug_images = []
+            for item in images_list:
+                if isinstance(item, list):
+                    aug_images.append([aug_transform(im) for im in item])
+                else:
+                    aug_images.append(aug_transform(item))
+            images_list = aug_images
+
         # 处理 actions：按配置决定是否归一化
         actions = batch_dict["action"]
         if normalize_action and normalizer is not None:
@@ -755,17 +785,23 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
 
     print(f"  本地数据集路径: {dataset_path_obj}")
     print(f"  数据集名称 (repo_id): {dataset_name}")
+
+    # episode_slice: 从配置读取；null 或空则使用全部 episode
+    episode_slice = dataset_config.get("episode_slice")
+    episodes_kw = {}
+    if episode_slice is not None and len(episode_slice) > 0:
+        episodes_kw["episodes"] = episode_slice
+        print(f"  使用 episode_slice: {episode_slice[:10]}..." if len(episode_slice) > 10 else f"  使用 episode_slice: {episode_slice}")
+    else:
+        print(f"  使用全部 episode (episode_slice=null)")
+
     try:
-        # 只训练一种task
-        episode_slice = [0, 22, 25, 28, 30, 41, 47, 59, 63, 73, 91, 116, 119, 172, 206, 234, 236,
-        237, 238, 239, 240, 242, 243, 266, 277, 286, 287, 307, 314, 315, 332, 339, 348, 350, 352,
-        353, 365, 366, 368, 370, 390, 393, 400, 411, 420]
         # 使用 LeRobotDatasetSubset 以修复 episodes=subset 时 episode_data_index 索引越界
         lerobot_dataset = LeRobotDatasetSubset(
             repo_id=dataset_name,
             root=root_path_str,
             delta_timestamps=delta_timestamps,
-            episodes=episode_slice
+            **episodes_kw
         )
         print(f"  ✓ LeRobotDataset 创建成功: repo_id={dataset_name}, root={root_path_str}")
     except Exception as e:
@@ -806,6 +842,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         normalizer = None
     normalize_action = data_config.get("normalize_action", False) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", False) if use_normalizer else False
+    augmentation_config = data_config.get("augmentation")
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
         state_key=state_key,
@@ -814,6 +851,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
         normalizer=normalizer,
         normalize_action=normalize_action,
         normalize_state=normalize_state,
+        augmentation_config=augmentation_config,
     )
     
     num_workers = dataloader_config.get("num_workers", 0)
@@ -909,6 +947,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
                 normalizer=normalizer,
                 normalize_action=normalize_action,
                 normalize_state=normalize_state,
+                augmentation_config=augmentation_config,
             )
             dataloader_kwargs["collate_fn"] = custom_collate_fn
             train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
