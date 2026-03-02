@@ -297,7 +297,7 @@ class QwenVLM(nn.Module):
             self.hidden_dim = self.model.config.d_model
         else:
             # 默认值
-            self.hidden_dim = 768
+            self.hidden_dim = 1536
             print(f"Warning: Could not determine hidden_dim, using default: {self.hidden_dim}")
     
     @classmethod
