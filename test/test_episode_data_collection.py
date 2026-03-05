@@ -53,6 +53,47 @@ def _get_image_saver():
     return save_image
 
 
+def _add_trajectory_noise(
+    state: np.ndarray,
+    action: np.ndarray,
+    frame_idx: int,
+    total_frames: int,
+    state_sigma: float,
+    action_pos_sigma: float,
+    action_gripper_sigma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    对 trajectory 中间帧的 state 和 action 添加高斯噪声，首尾帧保持原样。
+    用于减轻 VLA 过拟合，同时保证起点和终点精确以维持成功率。
+
+    Args:
+        state: 关节状态 (9,)
+        action: 动作 [x,y,z,gripper] (4,)
+        frame_idx: 当前帧索引
+        total_frames: 总帧数
+        state_sigma: state 噪声标准差 (rad)，0 表示不加噪
+        action_pos_sigma: action x,y,z 噪声标准差 (m)，0 表示不加噪
+        action_gripper_sigma: action gripper 噪声标准差，0 表示不加噪
+
+    Returns:
+        (state_noisy, action_noisy)
+    """
+    if frame_idx == 0 or frame_idx == total_frames - 1:
+        return state.copy(), action.copy()
+
+    state_out = state.astype(np.float32).copy()
+    action_out = action.astype(np.float32).copy()
+
+    if state_sigma > 0:
+        state_out += np.random.normal(0, state_sigma, state_out.shape).astype(np.float32)
+    if action_pos_sigma > 0 and action_out.shape[0] >= 3:
+        action_out[:3] += np.random.normal(0, action_pos_sigma, 3).astype(np.float32)
+    if action_gripper_sigma > 0 and action_out.shape[0] >= 4:
+        action_out[3] += np.random.normal(0, action_gripper_sigma).astype(np.float32)
+
+    return state_out, action_out
+
+
 def test_episode_data_collection(
     use_gui: bool = False,
     output_dir: Path | None = None,
@@ -170,6 +211,10 @@ def test_lerobot_dataset_episode_collection(
     task_mode: str = "red_only",
     red_blue_ratio: float = 0.5,
     repo_id: str = "pick_red_lerobot_dataset",
+    use_videos: bool = True,
+    state_noise_sigma: float = 0.0,
+    action_pos_noise_sigma: float = 0.0,
+    action_gripper_noise_sigma: float = 0.0,
 ):
     """
     在带 GUI 的仿真下运行多个 episode（抓取红色/蓝色方块），按固定频率采集每帧数据，
@@ -214,23 +259,52 @@ def test_lerobot_dataset_episode_collection(
     print(f"  GUI: {use_gui}")
     print(f"  采集频率: {collect_frequency_hz} Hz")
     print(f"  图像尺寸: {image_size}x{image_size}")
+    print(f"  MP4 存储: {use_videos}")
+    if state_noise_sigma > 0 or action_pos_noise_sigma > 0 or action_gripper_noise_sigma > 0:
+        print(f"  轨迹噪声: state_sigma={state_noise_sigma}, action_pos_sigma={action_pos_noise_sigma}, action_gripper_sigma={action_gripper_noise_sigma}")
 
     control_hz = 40.0
     collect_interval = max(1, int(control_hz / collect_frequency_hz))
     fps = collect_frequency_hz
 
     # ---------- 1. 创建数据集（明确 features + fps，便于 VLA/π0 训练） ----------
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=int(fps),
-        features={
-            "observation.state": {"dtype": "float32", "shape": (9,)},
-            "observation.images.top_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
-            "observation.images.wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
-            "action": {"dtype": "float32", "shape": (4,)},
-        },
-        root=root,
-    )
+    if use_videos:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=int(fps),
+            features={
+                "observation.state": {"dtype": "float32", "shape": (9,)},
+                "observation.images.top_image": {
+                    "dtype": "video",
+                    "shape": (3, image_size, image_size),
+                    "names": ["color"],
+                    "video_codec": "libx264",
+                    "fps": int(fps),
+                },
+                "observation.images.wrist_image": {
+                    "dtype": "video",
+                    "shape": (3, image_size, image_size),
+                    "names": ["color"],
+                    "video_codec": "libx264",
+                    "fps": int(fps),
+                },
+                "action": {"dtype": "float32", "shape": (4,)},
+            },
+            use_videos=True,
+            root=root,
+        )
+    else:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=int(fps),
+            features={
+                "observation.state": {"dtype": "float32", "shape": (9,)},
+                "observation.images.top_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+                "observation.images.wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+                "action": {"dtype": "float32", "shape": (4,)},
+            },
+            root=root,
+        )
 
     env = PickPlaceEnv(render=True, use_gui=use_gui, seed=seed)
     total_frames = 0
@@ -279,13 +353,32 @@ def test_lerobot_dataset_episode_collection(
             )
 
             # ---------- 2. 逐帧 add_frame（frame=全量特征 dict，task=任务描述）；无 new_episode，由 save_episode 后自动重置 buffer ----------
+            # 对 trajectory 中间帧添加噪声（首尾帧不加噪以保证成功率）；video 格式需 (C, H, W)
             for fi, snap in enumerate(collected):
-                t = total_frames / fps
+                t = float(total_frames) / fps
+
+                # 确保图片从 (H, W, C) 转换为 (C, H, W)（video 格式要求）
+                top_img = snap["observation.images.top"]
+                if top_img.ndim == 3 and top_img.shape[-1] == 3:
+                    top_img = top_img.transpose(2, 0, 1)
+                wrist_img = snap["observation.images.wrist"]
+                if wrist_img.ndim == 3 and wrist_img.shape[-1] == 3:
+                    wrist_img = wrist_img.transpose(2, 0, 1)
+
+                state, action = _add_trajectory_noise(
+                    snap["observation.state"],
+                    snap["action"],
+                    frame_idx=fi,
+                    total_frames=len(collected),
+                    state_sigma=state_noise_sigma,
+                    action_pos_sigma=action_pos_noise_sigma,
+                    action_gripper_sigma=action_gripper_noise_sigma,
+                )
                 frame = {
-                    "observation.state": snap["observation.state"].astype(np.float32),
-                    "observation.images.top_image": snap["observation.images.top"],
-                    "observation.images.wrist_image": snap["observation.images.wrist"],
-                    "action": snap["action"].astype(np.float32),
+                    "observation.state": state.astype(np.float32) if state.dtype != np.float32 else state,
+                    "observation.images.top_image": top_img,
+                    "observation.images.wrist_image": wrist_img,
+                    "action": action.astype(np.float32) if action.dtype != np.float32 else action,
                 }
                 dataset.add_frame(frame=frame, task=ep_task_desc, timestamp=t)
                 total_frames += 1
@@ -322,6 +415,16 @@ def _parse_lerobot_args():
     ap.add_argument("--repo-id", type=str, default="pick_red_lerobot_dataset",
                     help="LeRobot 数据集 repo_id（红蓝任务建议 pick_red_blue_lerobot_dataset）")
     ap.add_argument("--output-dir", type=str, default=None, help="输出目录")
+    ap.add_argument("--use-videos", action="store_true", default=True,
+                    help="以 MP4 格式存储图像（默认开启）")
+    ap.add_argument("--no-use-videos", action="store_false", dest="use_videos",
+                    help="使用图像格式存储（不启用 MP4）")
+    ap.add_argument("--noise-state", type=float, default=0.0,
+                    help="state 噪声标准差 (rad)，0 表示不加噪")
+    ap.add_argument("--noise-action-pos", type=float, default=0.0,
+                    help="action x,y,z 噪声标准差 (m)，0 表示不加噪")
+    ap.add_argument("--noise-action-gripper", type=float, default=0.0,
+                    help="action gripper 噪声标准差，0 表示不加噪")
     return ap.parse_args()
 
 
@@ -342,6 +445,10 @@ if __name__ == "__main__":
             red_blue_ratio=args.red_blue_ratio,
             seed_strategy=args.seed_strategy,
             repo_id=args.repo_id,
+            use_videos=args.use_videos,
+            state_noise_sigma=args.noise_state,
+            action_pos_noise_sigma=args.noise_action_pos,
+            action_gripper_noise_sigma=args.noise_action_gripper,
         )
         sys.exit(0)
 

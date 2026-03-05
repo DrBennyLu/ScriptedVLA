@@ -329,10 +329,11 @@ class FlowMatchingActionHead(nn.Module):
         norm_elementwise_affine: bool = False,
         norm_eps: float = 1e-5,
         compute_dtype=torch.float32,
+        first_step_loss_weight: float = 0.0,
     ):
         """
         初始化Flow Matching动作头
-        
+
         Args:
             hidden_dim: Transformer隐藏层维度
             num_layers: Transformer层数
@@ -360,12 +361,14 @@ class FlowMatchingActionHead(nn.Module):
             norm_elementwise_affine: 是否使用元素级仿射变换
             norm_eps: 归一化的epsilon值
             compute_dtype: 计算数据类型
+            first_step_loss_weight: 第一步动作的辅助损失权重；>0 时在 velocity MSE 上叠加第一步的 MSE，使 action[0] 更贴近当前动作
         """
         super().__init__()
-        
+
         # 确保 training 属性被初始化（nn.Module 会自动设置，但显式初始化更安全）
         self.training = True
-        
+
+        self.first_step_loss_weight = float(first_step_loss_weight)
         self.hidden_dim = hidden_dim
         self.cross_attention_dim = cross_attention_dim
         self.action_dim = action_dim
@@ -635,10 +638,13 @@ class FlowMatchingActionHead(nn.Module):
             # 预测速度场（只取动作部分）
             pred = self.action_decoder(x)  # [B, seq_len, action_dim]
             pred_velocity = pred[:, -actions.shape[1]:]  # [B, action_horizon, action_dim]
-            
+
             # 计算损失
             loss = ((pred_velocity - velocity) ** 2).mean()
-            
+            if self.first_step_loss_weight > 0 and pred_velocity.shape[1] > 0:
+                first_step_velocity_loss = ((pred_velocity[:, 0, :] - velocity[:, 0, :]) ** 2).mean()
+                loss = loss + self.first_step_loss_weight * first_step_velocity_loss
+
             if return_features:
                 return loss, x
             return loss

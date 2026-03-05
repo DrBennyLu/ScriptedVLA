@@ -29,7 +29,9 @@ model:
     patch_size: 8
     num_patches: 196  # 14x14 patches for 224x224 image
     norm_type: "ada_norm"
-    
+    # 第一步动作辅助损失权重；>0 时加强 action[0] 与当前动作一致，减轻在线 chunk 边界突变
+    first_step_loss_weight: 0.0  # 可选 1.0~2.0
+
   # 完整VLA模型
   vla:
     use_cross_attention: true

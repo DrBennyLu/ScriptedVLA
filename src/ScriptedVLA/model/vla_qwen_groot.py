@@ -124,7 +124,8 @@ class QwenGR00TVLAModel(nn.Module):
             norm_type=action_head_config.get("norm_type", "ada_norm"),  # 'layer_norm' or 'ada_norm'
             norm_elementwise_affine=action_head_config.get("norm_elementwise_affine", False),
             norm_eps=action_head_config.get("norm_eps", 1e-5),
-            compute_dtype=action_head_config.get("compute_dtype", torch.float32)
+            compute_dtype=action_head_config.get("compute_dtype", torch.float32),
+            first_step_loss_weight=action_head_config.get("first_step_loss_weight", 0.0),
         )
     
     @property

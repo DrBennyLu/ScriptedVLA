@@ -118,9 +118,20 @@ def run_online_simulation(
     sim_steps_per_call: int = 24,
     step_delay: float = 0.02,
     max_inference_rounds: int = 50,
+    smooth_first_step: bool = True,
+    first_step_alpha: float = 0.3,
+    chunk_execution_steps: int | None = None,
+    debug_print_ranges: bool = False,
+    quiet: bool = False,
 ):
     """
     在线仿真推理主流程：加载模型 -> 打开环境 -> 观测-推理-执行循环，直到红色方块入盒。
+
+    smooth_first_step: 是否用当前 EE 位置修正每个 chunk 的第一步，减轻 chunk 边界突变。
+    first_step_alpha: 第一步平滑时模型预测权重，(1-alpha)*current_ee + alpha*predicted；0 表示强平滑（第一步=当前位姿），1 表示不平滑。
+    chunk_execution_steps: 每轮执行的步数；None 表示执行整个 action_horizon（receding horizon 关闭）。
+    debug_print_ranges: 是否打印 state/action 范围以便与 normalizer 核对。
+    quiet: 为 True 时减少每轮打印，便于批量评估。
     """
     config = load_config(config_path)
     if seed is not None:
@@ -149,6 +160,10 @@ def run_online_simulation(
     normalizer_to_use = normalizer if use_normalizer else None
     model.eval()
 
+    # 每轮实际执行的步数（receding horizon）
+    steps_per_round = chunk_execution_steps if chunk_execution_steps is not None else action_horizon
+    steps_per_round = min(steps_per_round, action_horizon)
+
     # 创建仿真环境
     env = PickPlaceEnv(render=True, use_gui=use_gui, seed=seed)
     try:
@@ -157,16 +172,33 @@ def run_online_simulation(
         snapshot = env.collect_snapshot(None, image_width=image_size, image_height=image_size)
         round_count = 0
         done = False
+        last_action_chunk = None  # 上一轮的 action chunk，用于第一步平滑的 gripper 与 debug
 
         while round_count < max_inference_rounds:
             round_count += 1
-            print(f"\n--- Inference round {round_count} ---")
+            if not quiet:
+                print(f"\n--- Inference round {round_count} ---")
+
+            # 当前 EE 位置（用于本轮推理后的第一步平滑）
+            debug_positions = env.get_debug_positions()
+            current_ee_pos = np.array(debug_positions["ee_pos"], dtype=np.float64) if "ee_pos" in debug_positions else None
+            # 仿真器 action 空间：target = action[:3] + ee_to_grasp_offset，故保持位姿需 action[:3] = ee_pos - offset
+            if current_ee_pos is not None and hasattr(env, "_ee_to_grasp_offset_xyz"):
+                current_action_pos = current_ee_pos - np.asarray(env._ee_to_grasp_offset_xyz, dtype=np.float64)
+            else:
+                current_action_pos = current_ee_pos
 
             images_dict, state = snapshot_to_model_observation(snapshot, image_keys)
 
             if not images_dict:
                 print("No images in snapshot, abort.")
                 break
+
+            if debug_print_ranges and state is not None:
+                state_arr = np.asarray(state)
+                print(f"  [debug] state range: min={state_arr.min():.4f} max={state_arr.max():.4f} mean={state_arr.mean():.4f}")
+                if normalizer_to_use is not None and normalizer_to_use.state_min is not None:
+                    print(f"  [debug] normalizer state: min={normalizer_to_use.state_min} max={normalizer_to_use.state_max}")
 
             # 模型推理，得到 (50, 4) action chunk（x, y, z, gripper），与仿真器一致
             action_chunk = run_inference(
@@ -180,7 +212,22 @@ def run_online_simulation(
                 normalize_action=normalize_action,
                 normalize_state=normalize_state,
             )
-            steps_to_execute = min(action_horizon, len(action_chunk))
+            action_chunk = np.asarray(action_chunk, dtype=np.float64)
+
+            if debug_print_ranges:
+                print(f"  [debug] action_chunk (denorm) range: min={action_chunk.min():.4f} max={action_chunk.max():.4f}")
+                if normalizer_to_use is not None and normalizer_to_use.action_min is not None:
+                    print(f"  [debug] normalizer action: min={normalizer_to_use.action_min} max={normalizer_to_use.action_max}")
+
+            # 用当前 EE 位置修正或混合 chunk 第一步，减轻 chunk 边界突变
+            if smooth_first_step and action_chunk.size > 0 and current_action_pos is not None and len(current_action_pos) >= 3:
+                gripper = float(action_chunk[0, 3])
+                if last_action_chunk is not None and last_action_chunk.shape[0] > 0:
+                    gripper = float(last_action_chunk[-1, 3])
+                current_step = np.array([current_action_pos[0], current_action_pos[1], current_action_pos[2], gripper], dtype=np.float64)
+                action_chunk[0] = (1.0 - first_step_alpha) * current_step + first_step_alpha * action_chunk[0]
+
+            steps_to_execute = min(steps_per_round, len(action_chunk))
 
             for i in range(steps_to_execute):
                 env.step(
@@ -189,24 +236,27 @@ def run_online_simulation(
                     step_delay=step_delay,
                 )
 
+            last_action_chunk = action_chunk
+
             # 根据 instruction 推断目标颜色，检查对应红/蓝方块是否已入盒
             target_cube_id = (
                 env._blue_cube_id if "blue" in instruction.lower() else env._red_cube_id
             )
             if target_cube_id is not None and env._is_cube_in_box(target_cube_id):
-                print("Target cube is in the box. Task success.")
+                if not quiet:
+                    print("Target cube is in the box. Task success.")
                 done = True
                 break
 
             # 下一轮观测
             snapshot = env.collect_snapshot(None, image_width=image_size, image_height=image_size)
 
-        if not done:
+        if not done and not quiet:
             print(f"Reached max inference rounds ({max_inference_rounds}) without success.")
     finally:
         env.close()
 
-    return done
+    return done, round_count
 
 
 def main():
@@ -219,9 +269,13 @@ def main():
     parser.add_argument("--instruction", type=str, default="Pick up the red cube and place it in the box.", help="Task instruction")
     parser.add_argument("--max_rounds", type=int, default=50, help="Max inference rounds per episode")
     parser.add_argument("--step_delay", type=float, default=0.02, help="Delay per sim step (seconds)")
+    parser.add_argument("--no_smooth_first_step", action="store_true", help="Disable first-step EE smoothing")
+    parser.add_argument("--first_step_alpha", type=float, default=0.3, help="First-step blend: (1-alpha)*ee + alpha*pred (0=strong smooth)")
+    parser.add_argument("--chunk_steps", type=int, default=None, help="Steps to execute per round (default: full horizon); receding horizon")
+    parser.add_argument("--debug_ranges", action="store_true", help="Print state/action ranges for normalizer check")
     args = parser.parse_args()
 
-    run_online_simulation(
+    done, rounds = run_online_simulation(
         checkpoint_dir=args.checkpoint_dir,
         config_path=args.config,
         device=args.device,
@@ -230,7 +284,13 @@ def main():
         instruction=args.instruction,
         max_inference_rounds=args.max_rounds,
         step_delay=args.step_delay,
+        smooth_first_step=not args.no_smooth_first_step,
+        first_step_alpha=args.first_step_alpha,
+        chunk_execution_steps=args.chunk_steps,
+        debug_print_ranges=args.debug_ranges,
     )
+    if done:
+        print(f"Episode finished in {rounds} inference rounds.")
 
 
 if __name__ == "__main__":
