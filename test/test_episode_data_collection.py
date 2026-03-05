@@ -380,7 +380,6 @@ def test_lerobot_dataset_episode_collection(
                     "observation.images.wrist_image": wrist_img,
                     "action": action.astype(np.float32) if action.dtype != np.float32 else action,
                 }
-                dataset.add_frame(frame=frame, task=ep_task_desc, timestamp=t)
                 total_frames += 1
 
             # ---------- 3. 保存当前 episode（并自动为下一 episode 创建新 buffer） ----------
