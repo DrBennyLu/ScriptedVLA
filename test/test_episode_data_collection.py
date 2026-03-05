@@ -220,17 +220,41 @@ def test_lerobot_dataset_episode_collection(
     fps = collect_frequency_hz
 
     # ---------- 1. 创建数据集（明确 features + fps，便于 VLA/π0 训练） ----------
+    # dataset = LeRobotDataset.create(
+    #     repo_id=repo_id,
+    #     fps=int(fps),
+    #     features={
+    #         "observation.state": {"dtype": "float32", "shape": (9,)},
+    #         "observation.images.top_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+    #         "observation.images.wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
+    #         "action": {"dtype": "float32", "shape": (4,)},
+    #     },
+    #     root=root,
+    # )
     dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=int(fps),
-        features={
-            "observation.state": {"dtype": "float32", "shape": (9,)},
-            "observation.images.top_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
-            "observation.images.wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3)},
-            "action": {"dtype": "float32", "shape": (4,)},
+    repo_id=repo_id,
+    fps=int(fps),
+    features={
+        "observation.state": {"dtype": "float32", "shape": (9,)},
+        "observation.images.top_image": {
+            "dtype": "video",                 # 修改点 1: image -> video
+            "shape": (3, image_size, image_size), # 修改点 2: 变为 (C, H, W)
+            "names": ["color"],
+            "video_codec": "libx264",         # 添加编码器配置
+            "fps": int(fps),                  # 视频帧率需与数据集一致
         },
-        root=root,
-    )
+        "observation.images.wrist_image": {
+            "dtype": "video",                 # 修改点 1
+            "shape": (3, image_size, image_size), # 修改点 2
+            "names": ["color"],
+            "video_codec": "libx264",
+            "fps": int(fps),
+        },
+        "action": {"dtype": "float32", "shape": (4,)},
+    },
+    use_videos=True, # 修改点 3: 必须显式开启视频支持
+    root=root,
+)
 
     env = PickPlaceEnv(render=True, use_gui=use_gui, seed=seed)
     total_frames = 0
@@ -280,14 +304,32 @@ def test_lerobot_dataset_episode_collection(
 
             # ---------- 2. 逐帧 add_frame（frame=全量特征 dict，task=任务描述）；无 new_episode，由 save_episode 后自动重置 buffer ----------
             for fi, snap in enumerate(collected):
-                t = total_frames / fps
+                # t = total_frames / fps
+                # frame = {
+                #     "observation.state": snap["observation.state"].astype(np.float32),
+                #     "observation.images.top_image": snap["observation.images.top"],
+                #     "observation.images.wrist_image": snap["observation.images.wrist"],
+                #     "action": snap["action"].astype(np.float32),
+                # }
+                # dataset.add_frame(frame=frame, task=ep_task_desc, timestamp=t)
+                t = float(total_frames) / fps
+    
+                # 确保图片从 (H, W, C) 转换为 (C, H, W)
+                # 如果 snap 中的数据已经是 (3, H, W) 则不需要这一步
+                top_img = snap["observation.images.top"]
+                if top_img.shape[-1] == 3: # 如果最后一维是通道
+                    top_img = top_img.transpose(2, 0, 1)
+                    
+                wrist_img = snap["observation.images.wrist"]
+                if wrist_img.shape[-1] == 3:
+                    wrist_img = wrist_img.transpose(2, 0, 1)
+            
                 frame = {
                     "observation.state": snap["observation.state"].astype(np.float32),
-                    "observation.images.top_image": snap["observation.images.top"],
-                    "observation.images.wrist_image": snap["observation.images.wrist"],
+                    "observation.images.top_image": top_img,
+                    "observation.images.wrist_image": wrist_img,
                     "action": snap["action"].astype(np.float32),
                 }
-                dataset.add_frame(frame=frame, task=ep_task_desc, timestamp=t)
                 total_frames += 1
 
             # ---------- 3. 保存当前 episode（并自动为下一 episode 创建新 buffer） ----------
