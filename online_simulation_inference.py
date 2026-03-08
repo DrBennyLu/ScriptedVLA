@@ -27,9 +27,35 @@
 加载训练好的 VLA 模型，在 PickPlace 仿真环境中进行实时闭环推理：
 1. 加载 checkpoint，创建仿真环境并 reset
 2. 获取当前观测（双相机图像 + 机器人状态，state 为 9 维）
-3. 模型推理得到 50 步 action chunk（4 维：x, y, z, gripper），与仿真器一致
-4. 逐步执行 action chunk 驱动机械臂
+3. 模型推理得到 50 步 action chunk（4 维：Δx, Δy, Δz, gripper，相对位移）
+4. 转为绝对目标后逐步执行 action chunk 驱动机械臂
 5. 执行完一个 chunk 后再次采集观测，重复推理，直到红色方块被放入盒子。
+
+命令行使用示例:
+
+  # 使用默认 config 和 checkpoint 目录运行
+  python online_simulation_inference.py
+
+  # 指定 checkpoint 目录与 config
+  python online_simulation_inference.py --checkpoint_dir ./checkpoints --config config.yaml
+
+  # 无 GUI 运行（DIRECT 仿真，便于批量评估）
+  python online_simulation_inference.py --no_gui
+
+  # 指定任务指令（抓取蓝方块）
+  python online_simulation_inference.py --instruction "Pick up the blue cube and place it in the box."
+
+  # 调整推理参数：最大 30 轮、步间延时 0.01s
+  python online_simulation_inference.py --max_rounds 30 --step_delay 0.01
+
+  # 禁用第一步平滑、使用完整预测
+  python online_simulation_inference.py --no_smooth_first_step
+
+  # Receding horizon：每轮只执行 5 步
+  python online_simulation_inference.py --chunk_steps 5
+
+  # 调试：打印 state/action 范围
+  python online_simulation_inference.py --debug_ranges
 """
 
 import os

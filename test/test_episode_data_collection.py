@@ -4,6 +4,33 @@
 
 另含 test_lerobot_dataset_episode_collection：多 episode 采集，通过 LeRobotDataset.create /
 new_episode / add_frame / save_episode / save 写入 LeRobot 数据集格式。
+
+命令行使用示例:
+
+  # 单 episode 采集（无 GUI，保存到默认 test_output）
+  python test/test_episode_data_collection.py
+
+  # 单 episode 采集（带 GUI 可视化）
+  python test/test_episode_data_collection.py --gui
+
+  # LeRobot 格式多 episode 采集（默认 10 个，红方块任务）
+  python test/test_episode_data_collection.py --lerobot
+  python test/test_episode_data_collection.py --lerobot --seed-strategy varying --num-episodes 10 --output-dir ./dataset/0308
+
+  # LeRobot 采集 50 个 episode，红蓝交替任务
+  python test/test_episode_data_collection.py --lerobot --num-episodes 50 --task-mode red_blue_alternate
+
+  # LeRobot 采集，红蓝按 7:3 比例
+  python test/test_episode_data_collection.py --lerobot --task-mode red_blue_ratio --red-blue-ratio 0.7
+
+  # LeRobot 采集，无 GUI（DIRECT 仿真，便于批量）
+  python test/test_episode_data_collection.py --lerobot --no-gui
+
+  # LeRobot 采集，指定输出目录与 repo_id
+  python test/test_episode_data_collection.py --lerobot --output-dir ./data/my_dataset --repo-id my_dataset
+
+  # LeRobot 采集，添加轨迹噪声增强泛化
+  python test/test_episode_data_collection.py --lerobot --noise-action-pos 0.002
 """
 
 import sys
@@ -380,6 +407,7 @@ def test_lerobot_dataset_episode_collection(
                     "observation.images.wrist_image": wrist_img,
                     "action": action.astype(np.float32) if action.dtype != np.float32 else action,
                 }
+                dataset.add_frame(frame, task=ep_task_desc)
                 total_frames += 1
 
             # ---------- 3. 保存当前 episode（并自动为下一 episode 创建新 buffer） ----------
