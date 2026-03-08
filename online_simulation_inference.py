@@ -200,7 +200,7 @@ def run_online_simulation(
                 if normalizer_to_use is not None and normalizer_to_use.state_min is not None:
                     print(f"  [debug] normalizer state: min={normalizer_to_use.state_min} max={normalizer_to_use.state_max}")
 
-            # 模型推理，得到 (50, 4) action chunk（x, y, z, gripper），与仿真器一致
+            # 模型推理，得到 (50, 4) action chunk（Δx, Δy, Δz, gripper）相对位移
             action_chunk = run_inference(
                 model=model,
                 images=images_dict,
@@ -219,19 +219,35 @@ def run_online_simulation(
                 if normalizer_to_use is not None and normalizer_to_use.action_min is not None:
                     print(f"  [debug] normalizer action: min={normalizer_to_use.action_min} max={normalizer_to_use.action_max}")
 
-            # 用当前 EE 位置修正或混合 chunk 第一步，减轻 chunk 边界突变
+            # 用 alpha 缩放 chunk 第一步的相对位移，减轻 chunk 边界突变
             if smooth_first_step and action_chunk.size > 0 and current_action_pos is not None and len(current_action_pos) >= 3:
                 gripper = float(action_chunk[0, 3])
                 if last_action_chunk is not None and last_action_chunk.shape[0] > 0:
                     gripper = float(last_action_chunk[-1, 3])
-                current_step = np.array([current_action_pos[0], current_action_pos[1], current_action_pos[2], gripper], dtype=np.float64)
-                action_chunk[0] = (1.0 - first_step_alpha) * current_step + first_step_alpha * action_chunk[0]
+                rel_first = action_chunk[0, :3].copy()
+                action_chunk[0, :3] = first_step_alpha * rel_first
+                action_chunk[0, 3] = gripper
 
             steps_to_execute = min(steps_per_round, len(action_chunk))
 
             for i in range(steps_to_execute):
+                # 模型输出为相对位移，转为绝对目标后执行
+                ee = env._get_ee_pos()
+                if hasattr(env, "_ee_to_grasp_offset_xyz"):
+                    ee_action = ee - np.asarray(env._ee_to_grasp_offset_xyz, dtype=np.float64)
+                else:
+                    ee_action = np.asarray(ee, dtype=np.float64)
+                abs_action = np.array(
+                    [
+                        ee_action[0] + action_chunk[i, 0],
+                        ee_action[1] + action_chunk[i, 1],
+                        ee_action[2] + action_chunk[i, 2],
+                        action_chunk[i, 3],
+                    ],
+                    dtype=np.float64,
+                )
                 env.step(
-                    action_chunk[i],
+                    abs_action,
                     sim_steps_per_call=sim_steps_per_call,
                     step_delay=step_delay,
                 )

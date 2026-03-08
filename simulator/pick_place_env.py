@@ -1097,23 +1097,33 @@ class PickPlaceEnv:
         与 test_image_save 中 capture_full_scene_direct / capture_wrist_direct 的渲染逻辑一致，
         保证第三视角与腕部相机图像正确。
 
+        action 以相对坐标存储：[Δx, Δy, Δz, gripper]，其中 Δpos = next_target - current_ee_pos，
+        gripper 保持绝对（目标夹爪宽度）。需在 step 之前调用，此时 current_ee 为执行前末端位置。
+
         Returns:
             dict:
                 - "observation.images.top": (H,W,3) uint8，固定场景相机
                 - "observation.images.wrist": (H,W,3) uint8，夹爪相机
                 - "observation.state": (9,) float64，关节位置
-                - "action": (4,) float64，[x,y,z,gripper]，若 action 为 None 则为 zeros
+                - "action": (4,) float64，[Δx,Δy,Δz,gripper] 相对位移+夹爪，若 action 为 None 则为 zeros
         """
         img_fixed = self._capture_fixed_camera(image_width, image_height)
         img_gripper = self._capture_wrist_camera(image_width, image_height)
         joint_pos = self.get_joint_positions()
-        action_arr = (
-            np.asarray(action, dtype=np.float64)
-            if action is not None and len(action) >= 4
-            else np.zeros(4, dtype=np.float64)
-        )
-        if action_arr.shape[0] > 4:
-            action_arr = action_arr[:4]
+        if action is not None and len(action) >= 4:
+            action_raw = np.asarray(action[:4], dtype=np.float64)
+            current_ee = self._get_ee_pos()
+            action_arr = np.array(
+                [
+                    action_raw[0] - current_ee[0],
+                    action_raw[1] - current_ee[1],
+                    action_raw[2] - current_ee[2],
+                    action_raw[3],
+                ],
+                dtype=np.float64,
+            )
+        else:
+            action_arr = np.zeros(4, dtype=np.float64)
         eye_top, tgt_top = self.get_camera_eye_target("fixed")
         eye_wrist, tgt_wrist = self.get_camera_eye_target("gripper")
         return {
