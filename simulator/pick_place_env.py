@@ -9,6 +9,7 @@ Environment setup:
 - Task: Pick up cubes and place them in the box
 """
 
+import os
 import time
 from typing import Callable
 
@@ -96,6 +97,7 @@ class PickPlaceEnv:
         self._client_id: int | None = None
         self._robot_id: int | None = None
         self._table_id: int | None = None
+        self._table_top_pattern_ids: list[int] = []  # checkerboard overlay (visual only)
         self._box_id: int | None = None
         self._box_body_ids: list[int] = []
         self._red_cube_id: int | None = None
@@ -168,12 +170,9 @@ class PickPlaceEnv:
         )
 
         # Load table (1.4m x 1.1m surface, 8cm thick; robot/cubes/box all on top)
+        # Use textured mesh so table has a pattern (easier to distinguish from box/cubes)
         th = self.table_half_extents  # [x, y, z] half-extents
-        table_visual = p.createVisualShape(
-            p.GEOM_BOX,
-            halfExtents=list(th),
-            rgbaColor=[0.6, 0.4, 0.2, 1.0],
-        )
+        table_visual, tex_path_for_table = self._create_table_visual_shape(cid, th)
         table_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=list(th))
         table_pos = [0, 0, self.table_height - th[2]]
         self._table_id = p.createMultiBody(
@@ -183,6 +182,21 @@ class PickPlaceEnv:
             basePosition=table_pos,
             physicsClientId=cid,
         )
+        # Apply texture after body creation (PyBullet shows texture only when set via changeVisualShape)
+        if tex_path_for_table is not None:
+            try:
+                tex_path_abs = os.path.abspath(tex_path_for_table)
+                tex_uid = p.loadTexture(tex_path_abs, physicsClientId=cid)
+                p.changeVisualShape(
+                    self._table_id, -1,
+                    textureUniqueId=tex_uid,
+                    physicsClientId=cid,
+                )
+            except Exception:
+                pass
+
+        # Checkerboard overlay on table top (guaranteed visible pattern if texture not shown by renderer)
+        self._create_table_top_checkerboard(cid)
 
         # Load robot ON the table (base bottom at table_height)
         rx, ry = self.robot_base_xy[0], self.robot_base_xy[1]
@@ -225,6 +239,106 @@ class PickPlaceEnv:
                 cameraTargetPosition=self._camera_target,
                 physicsClientId=cid,
             )
+
+    def _ensure_table_texture(self) -> str:
+        """Generate table texture (checkerboard pattern) if not present. Returns path to PNG."""
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        tex_path = os.path.join(this_dir, "table_texture.png")
+        if os.path.exists(tex_path):
+            return tex_path
+        # Checkerboard + subtle stripes: light/dark beige, distinct from red/blue cubes and box
+        size = 256
+        tile = 32
+        img = np.ones((size, size, 3), dtype=np.uint8)
+        light = np.array([220, 195, 160], dtype=np.uint8)   # light beige
+        dark = np.array([160, 125, 85], dtype=np.uint8)    # darker brown
+        for i in range(size):
+            for j in range(size):
+                c = (i // tile + j // tile) % 2
+                # Add thin stripes for extra pattern
+                if (i // 8) % 2 == 0 or (j // 8) % 2 == 0:
+                    img[i, j] = light if c else dark
+                else:
+                    img[i, j] = dark if c else light
+        try:
+            from PIL import Image
+            Image.fromarray(img).save(tex_path)
+        except ImportError:
+            import cv2
+            cv2.imwrite(tex_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        return tex_path
+
+    def _create_table_visual_shape(self, cid: int, th: np.ndarray) -> tuple:
+        """Create table visual shape. Returns (visual_shape_id, texture_path or None).
+        Texture is applied in _load_scene via changeVisualShape after createMultiBody.
+        """
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        obj_path = os.path.abspath(os.path.join(this_dir, "table_box.obj"))
+        if not os.path.exists(obj_path):
+            vs = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=list(th),
+                rgbaColor=[0.6, 0.4, 0.2, 1.0],
+                physicsClientId=cid,
+            )
+            return vs, None
+        try:
+            tex_path = self._ensure_table_texture()
+            mesh_scale = [2.0 * th[0], 2.0 * th[1], 2.0 * th[2]]
+            vs = p.createVisualShape(
+                p.GEOM_MESH,
+                fileName=obj_path,
+                meshScale=mesh_scale,
+                rgbaColor=[1, 1, 1, 1],  # neutral base so texture shows
+                physicsClientId=cid,
+            )
+            return vs, tex_path
+        except Exception:
+            vs = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=list(th),
+                rgbaColor=[0.6, 0.4, 0.2, 1.0],
+                physicsClientId=cid,
+            )
+            return vs, None
+
+    def _create_table_top_checkerboard(self, cid: int) -> None:
+        """Add a checkerboard pattern on the table top (visual-only boxes) so table is clearly distinct from box/cubes."""
+        th = self.table_half_extents
+        top_z = self.table_height
+        # Grid: ~14 x 11 tiles to cover table top
+        nx, ny = 14, 11
+        tile_x = 2.0 * th[0] / nx
+        tile_y = 2.0 * th[1] / ny
+        tile_z = 0.002  # 2mm thick so it sits on table top
+        half_x = tile_x / 2.0
+        half_y = tile_y / 2.0
+        half_z = tile_z / 2.0
+        light = [0.85, 0.75, 0.55, 1.0]   # light beige
+        dark = [0.55, 0.42, 0.28, 1.0]    # darker brown
+        self._table_top_pattern_ids = []
+        for i in range(nx):
+            for j in range(ny):
+                c = (i + j) % 2
+                color = light if c == 0 else dark
+                cx = -th[0] + half_x + i * tile_x
+                cy = -th[1] + half_y + j * tile_y
+                cz = top_z + half_z
+                vs = p.createVisualShape(
+                    p.GEOM_BOX,
+                    halfExtents=[half_x, half_y, half_z],
+                    rgbaColor=color,
+                    physicsClientId=cid,
+                )
+                # Visual-only: no collision (body still needed for rendering)
+                body_id = p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=-1,
+                    baseVisualShapeIndex=vs,
+                    basePosition=[cx, cy, cz],
+                    physicsClientId=cid,
+                )
+                self._table_top_pattern_ids.append(body_id)
 
     def _solve_ik(
         self,
@@ -1206,6 +1320,11 @@ class PickPlaceEnv:
         """Disconnect from PyBullet and clean up."""
         if self._client_id is not None:
             try:
+                for bid in self._table_top_pattern_ids:
+                    try:
+                        p.removeBody(bid, physicsClientId=self._client_id)
+                    except Exception:
+                        pass
                 p.disconnect(physicsClientId=self._client_id)
             except p.error:
                 # 如果物理服务器已经断开连接，忽略错误
@@ -1213,6 +1332,7 @@ class PickPlaceEnv:
             self._client_id = None
         self._robot_id = None
         self._table_id = None
+        self._table_top_pattern_ids = []
         self._box_id = None
         self._box_body_ids = []
         self._red_cube_id = None
