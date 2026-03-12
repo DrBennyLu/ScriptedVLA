@@ -1,0 +1,7 @@
+# SmolVLA 在线仿真推理依赖
+# 安装: pip install -r requirements.txt
+
+lerobot[smolvla]
+pybullet
+numpy
+torch
