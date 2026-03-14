@@ -4,10 +4,13 @@
 
 from .config import (
     load_config,
+    load_script_config,
+    ScriptConfig,
+    ensure_offline_mode_if_needed,
     get_model_config,
     get_training_config,
     get_data_config,
-    get_inference_config
+    get_inference_config,
 )
 from .logger import setup_logger, log_model_info
 from .normalization import (
@@ -20,6 +23,9 @@ from .normalization import (
 
 __all__ = [
     "load_config",
+    "load_script_config",
+    "ScriptConfig",
+    "ensure_offline_mode_if_needed",
     "get_model_config",
     "get_training_config",
     "get_data_config",

@@ -58,30 +58,11 @@
   python online_simulation_inference.py --debug_ranges
 """
 
-import os
 import sys
 
+from src.ScriptedVLA.utils import ensure_offline_mode_if_needed
 
-def _maybe_enable_offline():
-    """若配置了 cache_dir 或 local_model_path，在 import transformers 之前设置离线模式"""
-    import yaml
-    from pathlib import Path
-    config_path = "config.yaml"
-    for i, arg in enumerate(sys.argv):
-        if arg == "--config" and i + 1 < len(sys.argv):
-            config_path = sys.argv[i + 1]
-            break
-    path = Path(config_path)
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        vlm = cfg.get("model", {}).get("vlm", {})
-        if vlm.get("cache_dir") or vlm.get("local_model_path"):
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            os.environ["HF_HUB_OFFLINE"] = "1"
-
-
-_maybe_enable_offline()
+ensure_offline_mode_if_needed()
 
 import argparse
 from pathlib import Path
@@ -89,7 +70,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.ScriptedVLA.utils import load_config, get_data_config, get_model_config
+from src.ScriptedVLA.utils import load_script_config
+from src.ScriptedVLA.cli import add_common_args, parse_common_args
 from inference import (
     find_latest_checkpoint,
     load_model_from_checkpoint,
@@ -98,35 +80,43 @@ from inference import (
 from simulator.pick_place_env import PickPlaceEnv
 
 
-# 仿真环境 collect_snapshot 返回的键名与 config dataset.image_keys 的对应关系
-# config: observation.images.image, observation.images.wrist_image
-# env:    observation.images.top,   observation.images.wrist
-SNAPSHOT_KEY_TO_CAMERA_NAME = {
-    "observation.images.top": "image",
-    "observation.images.wrist": "wrist_image",
-}
+# 仿真环境固定返回: observation.images.top（俯视）, observation.images.wrist（夹爪）
+ENV_SNAPSHOT_TOP = "observation.images.top"
+ENV_SNAPSHOT_WRIST = "observation.images.wrist"
+
+
+def _camera_name_to_snapshot_key(camera_name: str) -> str:
+    """
+    根据 config image_keys 中的相机名，自动匹配仿真器 snapshot 的键。
+    - 含 wrist -> 夹爪相机 (observation.images.wrist)
+    - 含 top 或 其他（image/base_image 等）-> 俯视/主相机 (observation.images.top)
+    """
+    cam_lower = camera_name.lower()
+    if "wrist" in cam_lower:
+        return ENV_SNAPSHOT_WRIST
+    return ENV_SNAPSHOT_TOP
 
 
 def snapshot_to_model_observation(snapshot: dict, image_keys: list):
     """
     将仿真环境 collect_snapshot 的一帧转为模型推理所需的 images 与 state。
 
-    - 图像：snapshot 的 top/wrist 按 image_keys 映射为 camera_name -> tensor (C,H,W)，0~1 归一化。
-    - 状态：observation.state 按 config 的 state_dim（9 维）原样使用，不截断。
+    - 图像：按 image_keys 自动匹配 env 的 top/wrist，camera_name -> tensor (C,H,W)，0~1 归一化。
+    - 状态：observation.state 原样使用，不截断。
     """
     images = {}
     for key in image_keys:
         camera_name = key.replace("observation.images.", "")
-        for snap_key, cam in SNAPSHOT_KEY_TO_CAMERA_NAME.items():
-            if cam == camera_name and snap_key in snapshot:
-                rgb = snapshot[snap_key]  # (H, W, 3) uint8
-                arr = np.asarray(rgb, dtype=np.float32) / 255.0
-                if arr.ndim == 2:
-                    arr = np.stack([arr] * 3, axis=0)
-                else:
-                    arr = np.transpose(arr, (2, 0, 1))
-                images[camera_name] = torch.from_numpy(arr).float()
-                break
+        snap_key = _camera_name_to_snapshot_key(camera_name)
+        if snap_key not in snapshot:
+            continue
+        rgb = snapshot[snap_key]  # (H, W, 3) uint8
+        arr = np.asarray(rgb, dtype=np.float32) / 255.0
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=0)
+        else:
+            arr = np.transpose(arr, (2, 0, 1))
+        images[camera_name] = torch.from_numpy(arr).float()
     state = snapshot.get("observation.state")
     if state is not None:
         state = np.asarray(state, dtype=np.float64)
@@ -134,13 +124,11 @@ def snapshot_to_model_observation(snapshot: dict, image_keys: list):
 
 
 def run_online_simulation(
-    checkpoint_dir: str = "./checkpoints",
-    config_path: str = "config.yaml",
+    cfg,
     device: str | None = None,
     use_gui: bool = True,
     seed: int | None = 42,
     instruction: str = "Pick up the red cube and place it in the box.",
-    action_horizon: int = 50,
     sim_steps_per_call: int = 24,
     step_delay: float = 0.02,
     max_inference_rounds: int = 50,
@@ -152,29 +140,20 @@ def run_online_simulation(
 ):
     """
     在线仿真推理主流程：加载模型 -> 打开环境 -> 观测-推理-执行循环，直到红色方块入盒。
-
-    smooth_first_step: 是否用当前 EE 位置修正每个 chunk 的第一步，减轻 chunk 边界突变。
-    first_step_alpha: 第一步平滑时模型预测权重，(1-alpha)*current_ee + alpha*predicted；0 表示强平滑（第一步=当前位姿），1 表示不平滑。
-    chunk_execution_steps: 每轮执行的步数；None 表示执行整个 action_horizon（receding horizon 关闭）。
-    debug_print_ranges: 是否打印 state/action 范围以便与 normalizer 核对。
-    quiet: 为 True 时减少每轮打印，便于批量评估。
+    cfg: ScriptConfig，由 load_script_config 提供。
     """
-    config = load_config(config_path)
+    image_keys = cfg.image_keys
+    action_horizon = cfg.action_horizon
+    image_size = cfg.image_size
+    use_normalizer = cfg.use_normalizer
+    normalize_action = cfg.normalize_action
+    normalize_state = cfg.normalize_state
+    checkpoint_dir = cfg.checkpoint_dir
+    config_path = cfg.config_path
+
     if seed is not None:
         np.random.seed(seed)
         torch.manual_seed(seed)
-
-    dataset_config = config.get("dataset", {})
-    data_config = get_data_config(config)
-    model_config = get_model_config(config)
-    image_keys = dataset_config.get("image_keys", ["observation.images.image", "observation.images.wrist_image"])
-    if not isinstance(image_keys, list):
-        image_keys = [image_keys]
-    action_horizon = dataset_config.get("action_horizon", action_horizon)
-    image_size = model_config.get("vlm", {}).get("image_size", 224)
-    use_normalizer = data_config.get("use_normalizer", True)
-    normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
-    normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
 
     # 加载模型
     ckpt_dir = Path(checkpoint_dir)
@@ -303,11 +282,14 @@ def run_online_simulation(
 
 def main():
     parser = argparse.ArgumentParser(description="Online simulation inference: run trained VLA in pick-place sim until red cube in box.")
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Checkpoint directory")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Config path")
-    parser.add_argument("--device", type=str, default=None, help="cuda or cpu")
+    add_common_args(
+        parser,
+        include_config=True,
+        include_device=True,
+        include_seed=True,
+        include_checkpoint_dir=True,
+    )
     parser.add_argument("--no_gui", action="store_true", help="Disable GUI (DIRECT simulation)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (None to disable)")
     parser.add_argument("--instruction", type=str, default="Pick up the red cube and place it in the box.", help="Task instruction")
     parser.add_argument("--max_rounds", type=int, default=50, help="Max inference rounds per episode")
     parser.add_argument("--step_delay", type=float, default=0.02, help="Delay per sim step (seconds)")
@@ -317,12 +299,14 @@ def main():
     parser.add_argument("--debug_ranges", action="store_true", help="Print state/action ranges for normalizer check")
     args = parser.parse_args()
 
+    common = parse_common_args(args)
+    cfg = load_script_config(common.config_path, checkpoint_dir=common.checkpoint_dir)
+
     done, rounds = run_online_simulation(
-        checkpoint_dir=args.checkpoint_dir,
-        config_path=args.config,
-        device=args.device,
+        cfg,
+        device=common.device,
         use_gui=not args.no_gui,
-        seed=args.seed,
+        seed=common.seed,
         instruction=args.instruction,
         max_inference_rounds=args.max_rounds,
         step_delay=args.step_delay,

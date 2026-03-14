@@ -28,26 +28,9 @@ VLA模型训练脚本
 import os
 import sys
 
-# 若配置了 cache_dir 或 local_model_path，在 import transformers 之前设置离线模式
-def _maybe_enable_offline():
-    import yaml
-    from pathlib import Path
-    config_path = "config.yaml"
-    for i, arg in enumerate(sys.argv):
-        if arg == "--config" and i + 1 < len(sys.argv):
-            config_path = sys.argv[i + 1]
-            break
-    path = Path(config_path)
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        vlm = cfg.get("model", {}).get("vlm", {})
-        if vlm.get("cache_dir") or vlm.get("local_model_path"):
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            os.environ["HF_HUB_OFFLINE"] = "1"
+from src.ScriptedVLA.utils import ensure_offline_mode_if_needed
 
-
-_maybe_enable_offline()
+ensure_offline_mode_if_needed()
 
 import torch
 import torch.nn as nn
@@ -65,14 +48,12 @@ from PIL import Image
 
 from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import (
-    load_config,
-    get_model_config,
-    get_training_config,
-    get_data_config,
+    load_script_config,
     create_normalizer_from_dataset,
     create_normalizer_from_lerobot_meta,
     Normalizer,
 )
+from src.ScriptedVLA.cli import add_common_args, parse_common_args
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -657,83 +638,54 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_
     print(f"Checkpoint saved to {save_path}")
 
 
-def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: str = "./dataset/libero_object", max_steps: int = 20000, save_steps: int = 5000):
+def train_with_lerobot_dataset(cfg):
     """
-    使用LeRobot数据集进行训练
-    
-    Args:
-        config_path: 配置文件路径
-        dataset_path: 数据集路径（默认为 ./dataset/libero_object）
-        max_steps: 最大训练步数（默认20000）
-        save_steps: 保存检查点的间隔步数（默认5000）
+    使用 LeRobot 数据集进行训练。配置由 load_script_config 提供。
     """
     print("=" * 60)
     print("LeRobot数据集训练")
     print("=" * 60)
-    
+
     if not HAS_LEROBOT:
         raise ImportError(
             "lerobot library not installed. "
             "Install with: pip install lerobot==0.3.3"
         )
-    
-    # 1. 加载配置
-    print(f"\n步骤1: 加载配置文件: {config_path}")
-    config = load_config(config_path)
-    
-    # 设置随机种子
-    seed = config.get("seed", 42)
-    print(f"\n步骤0.5: 设置随机种子: {seed}")
-    set_seed(seed)
-    print(f"  ✓ 随机种子已设置")
-    
-    # 获取模型和训练配置
-    model_config = get_model_config(config)
-    training_config = get_training_config(config)
-    data_config = get_data_config(config)
-    default_state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
-    
-    # 获取数据集配置
-    dataset_config = config.get("dataset", {})
+
+    # 从 ScriptConfig 提取
+    config_path = cfg.config_path
+    local_path = cfg.dataset_path
+    image_size = cfg.image_size
+    image_keys = cfg.image_keys
+    state_key = cfg.state_key
+    action_horizon = cfg.action_horizon
+    action_dim = cfg.action_dim
+    state_dim = cfg.state_dim
+    use_normalizer = cfg.use_normalizer
+    normalize_action = cfg.normalize_action
+    normalize_state = cfg.normalize_state
+    batch_size = cfg.batch_size
+    max_steps = cfg.max_steps
+    save_steps = cfg.save_steps
+    eval_steps = cfg.eval_steps
+    max_eval_batches = cfg.max_eval_batches
+    logging_steps = cfg.logging_steps
+    save_dir = cfg.save_dir
+
+    raw = cfg.raw_config
+    dataset_config = raw.get("dataset", {})
     dataloader_config = dataset_config.get("dataloader", {})
     task_description_config = dataset_config.get("task_description", {})
-    
-    # 从dataset配置中获取数据集相关参数
-    # 优先级：命令行参数 > 配置文件 > 默认值
-    if dataset_path == "./dataset/libero_object":  # 如果使用的是默认值，从配置文件读取
-        local_path = dataset_config.get("local_path", "./dataset/libero_object")
-    else:
-        local_path = dataset_path  # 使用命令行传入的路径
-    
-    action_horizon = dataset_config.get("action_horizon", 50)
-    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
-    vlm_config = model_config.get("vlm", {})
-    image_size = vlm_config.get("image_size", 224)
-    
-    # 从task_description配置中获取参数
-    use_batch_task = task_description_config.get("use_batch_task", True)
-    
-    # 使用config.training中的配置
-    merged_training_config = training_config.copy()
-    
-    # 从config.training中读取batch_size
-    batch_size = training_config.get("batch_size", 8)
-    
-    # 从配置文件中读取训练参数
-    # 优先级：命令行参数 > 配置文件 > 默认值
-    # 如果函数参数是默认值，说明用户没有通过命令行指定，则从配置文件读取
-    if max_steps == 20000:  # 如果使用的是默认值，从配置文件读取
-        max_steps = training_config.get("max_steps", 20000)
-    
-    if save_steps == 5000:  # 如果使用的是默认值，从配置文件读取
-        save_steps = merged_training_config.get("save_steps", 5000)
-    
-    eval_steps = merged_training_config.get("eval_steps", 5000)
-    max_eval_batches = merged_training_config.get("max_eval_batches", 50)
-    logging_steps = merged_training_config.get("logging_steps", 100)
-    
-    # 打印训练参数信息
-    print(f"\n训练参数（从配置文件读取）:")
+    data_config = raw.get("data", {})
+    model_config = raw.get("model", {})
+    merged_training_config = raw.get("training", {}).copy()
+
+    print(f"\n步骤1: 加载配置文件: {config_path}")
+    print(f"\n步骤0.5: 设置随机种子: {cfg.seed}")
+    set_seed(cfg.seed)
+    print(f"  ✓ 随机种子已设置")
+
+    print(f"\n训练参数:")
     print(f"  save_steps: {save_steps}")
     print(f"  eval_steps: {eval_steps}")
     print(f"  max_eval_batches: {max_eval_batches}")
@@ -744,27 +696,12 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     dataset_path_obj = Path(local_path).resolve()
     if not dataset_path_obj.exists():
         raise ValueError(f"数据集路径不存在: {dataset_path_obj}")
-    
+
     print(f"  数据集路径: {dataset_path_obj}")
-    
-    # 2.5. 从配置文件读取数据集参数
-    print(f"\n步骤2.5: 从配置文件读取数据集参数")
-    
-    # 从配置读取相机和维度配置
-    image_keys = dataset_config.get("image_keys", ["observation.images.wrist_image"])
-    if not isinstance(image_keys, list):
-        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
-    print(f"  图像键名（从配置）: {image_keys}")
-    
-    state_key = dataset_config.get("state_key", "observation.state")
-    print(f"  状态键名（从配置）: {state_key}")
-    
-    action_dim = dataset_config.get("action_dim", model_config.get("action_head", {}).get("action_dim", 7))
-    print(f"  动作维度（从配置）: {action_dim}")
-    
-    state_dim = data_config.get("robot_state", {}).get("state_dim", 7)
-    print(f"  状态维度（从配置）: {state_dim}")
-    
+    print(f"  图像键名: {image_keys}")
+    print(f"  状态键名: {state_key}")
+    print(f"  动作维度: {action_dim}, 状态维度: {state_dim}")
+
     # 从info.json获取fps（仅用于创建delta_timestamps）
     dataset_info = load_dataset_info(dataset_path_obj)
     fps = dataset_info.get("fps", 10)
@@ -837,11 +774,12 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"  Batch size: {batch_size}")
     print(f"  最大训练步数: {max_steps}")
 
-    use_normalizer = data_config.get("use_normalizer", True)
     if not use_normalizer:
         normalizer = None
     normalize_action = data_config.get("normalize_action", False) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", False) if use_normalizer else False
+    augmentation_config = data_config.get("augmentation")
+    use_batch_task = task_description_config.get("use_batch_task", True)
     augmentation_config = data_config.get("augmentation")
     custom_collate_fn = create_collate_fn(
         image_keys=image_keys,
@@ -916,7 +854,7 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
     print(f"  调度器: {type(scheduler).__name__ if scheduler else 'None'}")
     
     # 6. 创建保存目录
-    save_dir = Path(merged_training_config.get("save_dir", "./checkpoints"))
+    save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"  检查点保存目录: {save_dir}")
     
@@ -1121,40 +1059,28 @@ def train_with_lerobot_dataset(config_path: str = "config.yaml", dataset_path: s
 
 def main():
     parser = argparse.ArgumentParser(description="Train VLA Model")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="Path to config file"
+    add_common_args(
+        parser,
+        include_config=True,
+        include_device=False,
+        include_seed=True,
+        include_dataset=True,
     )
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="./dataset/libero_object",
-        help="Path to LeRobot dataset (default: ./dataset/libero_object)"
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=20000,
-        help="Maximum training steps (default: 20000)"
-    )
-    parser.add_argument(
-        "--save_steps",
-        type=int,
-        default=5000,
-        help="Steps interval for saving checkpoints (default: 5000)"
-    )
+    parser.add_argument("--max_steps", type=int, default=None, help="Maximum training steps")
+    parser.add_argument("--save_steps", type=int, default=None, help="Steps interval for saving checkpoints")
     args = parser.parse_args()
-    
-    # 使用LeRobot数据集训练
+
+    common = parse_common_args(args)
+    cfg = load_script_config(
+        common.config_path,
+        dataset_path=common.dataset_path,
+        max_steps=args.max_steps,
+        save_steps=args.save_steps,
+        seed=common.seed,
+    )
+
     try:
-        model, losses = train_with_lerobot_dataset(
-            config_path=args.config,
-            dataset_path=args.dataset_path,
-            max_steps=args.max_steps,
-            save_steps=args.save_steps
-        )
+        model, losses = train_with_lerobot_dataset(cfg)
         print("\n✓ 训练成功完成")
     except Exception as e:
         print(f"\n✗ LeRobot训练失败: {e}")

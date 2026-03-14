@@ -51,7 +51,7 @@ from inference import (
     load_dataset_episode,
     find_latest_checkpoint,
 )
-from src.ScriptedVLA.utils import load_config, get_data_config, get_model_config, Normalizer
+from src.ScriptedVLA.utils import load_config, load_script_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter
 from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
 
@@ -449,10 +449,12 @@ def test_inference_from_dataset(
     config_path: str = "config.yaml",
     frame_idx: int = 0,
     device: Optional[str] = None,
-    validate_checkpoint_first: bool = True
+    validate_checkpoint_first: bool = True,
+    cfg=None,
 ):
     """
-    从数据集读取一帧数据并运行推理，并与GT值进行比较
+    从数据集读取一帧数据并运行推理，并与GT值进行比较。
+    cfg: 可选的 ScriptConfig，若提供则不再从 config_path 加载。
     
     Args:
         dataset_path: 数据集路径
@@ -468,27 +470,18 @@ def test_inference_from_dataset(
     print("=" * 60)
     print("VLA模型单帧推理测试")
     print("=" * 60)
-    
-    # 加载配置并设置随机种子
-    config = load_config(config_path)
-    seed = config.get("seed", 42)
+
+    if cfg is None:
+        cfg = load_script_config(config_path, dataset_path=dataset_path)
+    seed = cfg.seed
+    image_size = cfg.image_size
+    image_keys = cfg.image_keys
     print(f"\n设置随机种子: {seed}")
     set_seed(seed)
     print(f"  ✓ 随机种子已设置")
-    
-    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
-    model_config = get_model_config(config)
-    vlm_config = model_config.get("vlm", {})
-    image_size = vlm_config.get("image_size", 224)
     print(f"\n图像尺寸配置: {image_size}x{image_size}")
-    
-    # 从dataset配置中读取image_keys，用于判断单相机/多相机
-    dataset_config = config.get("dataset", {})
-    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-    if not isinstance(image_keys, list):
-        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
     print(f"图像键名配置: {image_keys} ({'单相机' if len(image_keys) == 1 else '多相机'})")
-    
+
     result = {
         "success": False,
         "predicted_actions": None,
@@ -550,43 +543,10 @@ def test_inference_from_dataset(
                 state = state.numpy()
             print(f"    State维度: {state.shape if state is not None else None}")
         
-        # 2. 加载模型checkpoint（使用测试配置，与test_training.py一致）
+        # 2. 加载模型checkpoint
         print("\n[Step 2] 加载模型checkpoint...")
-        # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
-        # 默认不使用测试配置，直接使用原始配置以确保与训练时一致
         test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
-        temp_config_path = None
-        if test_config_path != config_path:
-            temp_config_path = test_config_path
-            config = load_config(test_config_path)
-            print(f"  使用测试配置: hidden_dim={config['model']['action_head'].get('hidden_dim', 'unknown')}, num_layers={config['model']['action_head'].get('num_layers', 'unknown')}")
-            if "data" in config and "robot_state" in config["data"]:
-                print(f"  state_dim={config['data']['robot_state'].get('state_dim', 'unknown')}")
-            # 重新读取image_keys（使用测试配置）
-            dataset_config = config.get("dataset", {})
-            image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-            if not isinstance(image_keys, list):
-                raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
-        else:
-            # 如果没有使用测试配置，确保使用原始config
-            config = load_config(config_path)
-            # 重新读取image_keys（使用原始配置）
-            dataset_config = config.get("dataset", {})
-            image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-            if not isinstance(image_keys, list):
-                raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
-        
-        # 从model.vlm.image_size读取图像尺寸（优先使用测试配置中的，如果没有则使用原始配置）
-        model_config = get_model_config(config)
-        vlm_config = model_config.get("vlm", {})
-        image_size = vlm_config.get("image_size", 224)
-        
-        # 从dataset配置中读取image_keys，用于判断单相机/多相机
-        dataset_config = config.get("dataset", {})
-        image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-        if not isinstance(image_keys, list):
-            raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
-        
+        temp_config_path = test_config_path if test_config_path != config_path else None
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
             # 确保模型处于eval模式并清理显存
@@ -808,12 +768,10 @@ def test_inference_from_dataset(
             print(f"  警告: 无法获取chat内容: {e}")
             print(f"  使用原始指令: {instruction}")
         
-        # 5. 运行推理（从 config 读取是否使用 normalizer 及 action/state 归一化）
-        config = load_config(test_config_path)
-        data_config = get_data_config(config)
-        use_normalizer = data_config.get("use_normalizer", True)
-        normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
-        normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+        # 5. 运行推理（从 cfg 读取是否使用 normalizer 及 action/state 归一化）
+        use_normalizer = cfg.use_normalizer
+        normalize_action = cfg.normalize_action
+        normalize_state = cfg.normalize_state
         normalizer_to_use = normalizer if use_normalizer else None
         print("\n[Step 5] 运行推理...")
         predicted_actions = run_inference(
@@ -899,10 +857,11 @@ def test_episode_inference_with_3d_visualization(
     config_path: str = "config.yaml",
     episode_id: int = 0,
     device: Optional[str] = None,
-    output_path: Optional[str] = None
+    output_path: Optional[str] = None,
+    cfg=None,
 ):
     """
-    测试一个episode的推理，并绘制3D轨迹对比图
+    测试一个episode的推理，并绘制3D轨迹对比图。cfg 可选，由 main 传入。
     
     Args:
         dataset_path: 数据集路径
@@ -918,27 +877,18 @@ def test_episode_inference_with_3d_visualization(
     print("=" * 60)
     print("VLA模型Episode推理测试（3D可视化）")
     print("=" * 60)
-    
-    # 加载配置并设置随机种子
-    config = load_config(config_path)
-    seed = config.get("seed", 42)
+
+    if cfg is None:
+        cfg = load_script_config(config_path, dataset_path=dataset_path)
+    seed = cfg.seed
+    image_size = cfg.image_size
+    image_keys = cfg.image_keys
     print(f"\n设置随机种子: {seed}")
     set_seed(seed)
     print(f"  ✓ 随机种子已设置")
-    
-    # 从model.vlm.image_size读取图像尺寸，而不是dataset.image_size
-    model_config = get_model_config(config)
-    vlm_config = model_config.get("vlm", {})
-    image_size = vlm_config.get("image_size", 224)
     print(f"\n图像尺寸配置: {image_size}x{image_size}")
-    
-    # 从dataset配置中读取image_keys，用于判断单相机/多相机
-    dataset_config = config.get("dataset", {})
-    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-    if not isinstance(image_keys, list):
-        raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
     print(f"图像键名配置: {image_keys} ({'单相机' if len(image_keys) == 1 else '多相机'})")
-    
+
     result = {
         "success": False,
         "episode_id": episode_id,
@@ -977,28 +927,7 @@ def test_episode_inference_with_3d_visualization(
         # 获取应用了测试配置的配置文件路径（从数据集信息中获取state_dim）
         # 默认不使用测试配置，直接使用原始配置以确保与训练时一致
         test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
-        temp_config_path = None
-        if test_config_path != config_path:
-            temp_config_path = test_config_path
-            config = load_config(test_config_path)
-            print(f"  使用测试配置: hidden_dim={config['model']['action_head'].get('hidden_dim', 'unknown')}, num_layers={config['model']['action_head'].get('num_layers', 'unknown')}")
-            if "data" in config and "robot_state" in config["data"]:
-                print(f"  state_dim={config['data']['robot_state'].get('state_dim', 'unknown')}")
-        else:
-            # 如果没有使用测试配置，确保使用原始config
-            config = load_config(config_path)
-        
-        # 从model.vlm.image_size读取图像尺寸（优先使用测试配置中的，如果没有则使用原始配置）
-        model_config = get_model_config(config)
-        vlm_config = model_config.get("vlm", {})
-        image_size = vlm_config.get("image_size", 224)
-        
-        # 从dataset配置中读取image_keys，用于判断单相机/多相机
-        dataset_config = config.get("dataset", {})
-        image_keys = dataset_config.get("image_keys", ["observation.images.image"])
-        if not isinstance(image_keys, list):
-            raise ValueError(f"配置中的image_keys必须是列表，当前类型: {type(image_keys)}")
-        
+        temp_config_path = test_config_path if test_config_path != config_path else None
         try:
             model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
             # 确保模型处于eval模式并清理显存
@@ -1017,11 +946,10 @@ def test_episode_inference_with_3d_visualization(
         result["num_frames"] = len(episode_frames)
         print(f"  ✓ Episode包含 {len(episode_frames)} 帧")
         
-        # 4. 对每一帧进行推理（从 config 读取是否使用 normalizer 及 action/state 归一化）
-        data_config = get_data_config(config)
-        use_normalizer = data_config.get("use_normalizer", True)
-        normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
-        normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+        # 4. 对每一帧进行推理（从 cfg 读取 normalizer 及 action/state 归一化）
+        use_normalizer = cfg.use_normalizer
+        normalize_action = cfg.normalize_action
+        normalize_state = cfg.normalize_state
         normalizer_to_use = normalizer if use_normalizer else None
         print(f"\n[Step 4] 对每一帧进行推理...")
         predicted_xyz_list = []
@@ -1439,17 +1367,13 @@ def main():
         action="store_true",
         help="跳过checkpoint验证（仅用于single模式）"
     )
-    
     args = parser.parse_args()
-    
-    # 加载配置并设置随机种子
-    config = load_config(args.config)
-    seed = config.get("seed", 42)
-    print(f"设置随机种子: {seed}")
-    set_seed(seed)
+
+    cfg = load_script_config(args.config, dataset_path=args.dataset)
+    print(f"设置随机种子: {cfg.seed}")
+    set_seed(cfg.seed)
     print(f"  ✓ 随机种子已设置")
-    
-    # 检查数据集路径
+
     dataset_path = Path(args.dataset)
     if not dataset_path.exists():
         print(f"错误: 数据集路径不存在: {dataset_path}")
@@ -1468,12 +1392,13 @@ def main():
         if args.mode == "single":
             # 单帧测试
             result = test_inference_from_dataset(
-            dataset_path=str(dataset_path),
-            checkpoint_path=str(checkpoint_path),
-            config_path=args.config,
-            frame_idx=args.frame_idx,
+                dataset_path=str(dataset_path),
+                checkpoint_path=str(checkpoint_path),
+                config_path=args.config,
+                frame_idx=args.frame_idx,
                 device=args.device,
-                validate_checkpoint_first=not args.no_validate
+                validate_checkpoint_first=not args.no_validate,
+                cfg=cfg,
             )
             
             if result["success"]:
@@ -1493,7 +1418,8 @@ def main():
                 config_path=args.config,
                 episode_id=args.episode_id,
                 device=args.device,
-                output_path=args.output
+                output_path=args.output,
+                cfg=cfg,
             )
             
             if result["success"]:

@@ -424,64 +424,60 @@ def test_lerobot_dataset_episode_collection(
         raise RuntimeError(f"LeRobot 数据集采集测试失败: {e}") from e
 
 
-def _parse_lerobot_args():
-    """解析 LeRobot 采集命令行参数"""
+def _parse_args():
+    """解析命令行参数：LeRobot 采集或单 episode 采集"""
     import argparse
-    ap = argparse.ArgumentParser(description="LeRobot 格式多 episode 数据采集")
-    ap.add_argument("--lerobot", action="store_true", help="使用 LeRobot 格式采集")
+    ap = argparse.ArgumentParser(description="Episode 数据采集：单 episode 或 LeRobot 格式多 episode")
+    ap.add_argument("--config", type=str, default="config.yaml", help="配置文件路径（用于 image_size 等）")
+    ap.add_argument("--lerobot", action="store_true", help="LeRobot 格式多 episode 采集")
     ap.add_argument("--no-gui", action="store_true", help="禁用 GUI（DIRECT 仿真）")
-    ap.add_argument("--num-episodes", type=int, default=10, help="Episode 数量")
+    ap.add_argument("--num-episodes", type=int, default=10, help="[lerobot] Episode 数量")
     ap.add_argument("--task-mode", type=str, default="red_only",
                     choices=["red_only", "blue_only", "red_blue_alternate", "red_blue_ratio"],
-                    help="任务模式：red_only/blue_only/red_blue_alternate/red_blue_ratio")
-    ap.add_argument("--red-blue-ratio", type=float, default=0.5,
-                    help="当 task_mode=red_blue_ratio 时 red 任务占比 (0~1)")
-    ap.add_argument("--seed-strategy", type=str, default="fixed",
-                    choices=["fixed", "varying"],
-                    help="seed 策略：fixed 共用同一 seed，varying 每 episode 使用 base_seed+ep")
-    ap.add_argument("--repo-id", type=str, default="pick_red_lerobot_dataset",
-                    help="LeRobot 数据集 repo_id（红蓝任务建议 pick_red_blue_lerobot_dataset）")
+                    help="[lerobot] 任务模式")
+    ap.add_argument("--red-blue-ratio", type=float, default=0.5, help="[lerobot] task_mode=red_blue_ratio 时 red 占比")
+    ap.add_argument("--seed-strategy", type=str, default="fixed", choices=["fixed", "varying"], help="[lerobot] seed 策略")
+    ap.add_argument("--repo-id", type=str, default="pick_red_lerobot_dataset", help="[lerobot] repo_id")
     ap.add_argument("--output-dir", type=str, default=None, help="输出目录")
-    ap.add_argument("--use-videos", action="store_true", default=True,
-                    help="以 MP4 格式存储图像（默认开启）")
-    ap.add_argument("--no-use-videos", action="store_false", dest="use_videos",
-                    help="使用图像格式存储（不启用 MP4）")
-    ap.add_argument("--noise-state", type=float, default=0.0,
-                    help="state 噪声标准差 (rad)，0 表示不加噪")
-    ap.add_argument("--noise-action-pos", type=float, default=0.0,
-                    help="action x,y,z 噪声标准差 (m)，0 表示不加噪")
-    ap.add_argument("--noise-action-gripper", type=float, default=0.0,
-                    help="action gripper 噪声标准差，0 表示不加噪")
+    ap.add_argument("--no-use-videos", action="store_true", help="[lerobot] 用图像格式存储，不用 MP4")
+    ap.add_argument("--noise-state", type=float, default=0.0, help="[lerobot] state 噪声标准差")
+    ap.add_argument("--noise-action-pos", type=float, default=0.0, help="[lerobot] action 位置噪声标准差")
+    ap.add_argument("--noise-action-gripper", type=float, default=0.0, help="[lerobot] action 夹爪噪声标准差")
+    ap.add_argument("--gui", action="store_true", help="单 episode 模式启用 GUI")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
-    args = _parse_lerobot_args()
+    from src.ScriptedVLA.utils import load_script_config
+
+    args = _parse_args()
+    cfg = load_script_config(args.config)
+    image_size = cfg.image_size
+    collect_freq_hz = 10.0
+
     if args.lerobot:
-        use_gui = not args.no_gui
         out_dir = Path(args.output_dir) if args.output_dir else None
         if out_dir is None and args.task_mode in ("red_blue_alternate", "red_blue_ratio"):
             out_dir = project_root / "test_output" / "lerobot_pick_red_blue_dataset"
         test_lerobot_dataset_episode_collection(
             num_episodes=args.num_episodes,
             output_dir=out_dir,
-            use_gui=use_gui,
-            collect_frequency_hz=10.0,
-            image_size=224,
+            use_gui=not args.no_gui,
+            collect_frequency_hz=collect_freq_hz,
+            image_size=image_size,
             task_mode=args.task_mode,
             red_blue_ratio=args.red_blue_ratio,
             seed_strategy=args.seed_strategy,
             repo_id=args.repo_id,
-            use_videos=args.use_videos,
+            use_videos=not args.no_use_videos,
             state_noise_sigma=args.noise_state,
             action_pos_noise_sigma=args.noise_action_pos,
             action_gripper_noise_sigma=args.noise_action_gripper,
         )
         sys.exit(0)
 
-    use_gui = "--gui" in sys.argv
     test_episode_data_collection(
-        use_gui=use_gui,
-        collect_frequency_hz=10.0,
-        image_size=224,
+        use_gui=args.gui,
+        collect_frequency_hz=collect_freq_hz,
+        image_size=image_size,
     )

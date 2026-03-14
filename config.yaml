@@ -106,8 +106,8 @@ dataset:
   
   # 数据集相关参数
   action_horizon: 50  # 动作序列长度（chunk大小）
-  image_size: 224  # 图像尺寸
-  
+  # image_size 统一使用 model.vlm.image_size
+
   # 相机配置（从数据集中读取的图像键名）
   # 单相机示例: ["observation.images.wrist_image"]
   # 多相机示例: ["observation.images.wrist_image", "observation.images.base_image"]
@@ -164,10 +164,8 @@ data:
     use_state_vlm: false          # VLM 是否使用状态
     use_state_action_head: true  # 动作头是否使用状态
 
-# 推理配置
+# 推理配置（checkpoint/device 由 CLI 或 load_script_config 管理）
 inference:
-  checkpoint_path: "./checkpoints/best_model.pt"
-  device: "cuda"  # 或 "cpu"
   batch_size: 1
   max_new_tokens: 50
 
@@ -178,143 +176,37 @@ logging:
   use_tensorboard: true
   log_dir: "./logs"
 
-# 测试配置（用于test_training.py）
+# 测试配置（仅保留与主配置不同的覆盖项，其余继承主配置）
 test:
-  
-  # 测试模型配置（可以使用较小的配置以加快测试）
   model:
-    # VLM配置
     vlm:
       model_name: "Qwen/Qwen2-VL-2B-Instruct"
       cache_dir: "./cache/models"
-      image_size: 224
-    
-    # 动作头配置（测试时使用较小的配置）
-    action_head:
-      hidden_dim: 1536
-      num_layers: 6  # 测试时使用较少的层数
-      num_heads: 12
-      action_dim: 4
-      action_horizon: 50
-      num_inference_timesteps: 10
-      norm_type: "ada_norm"
-    
-    # VLA模型配置（与主配置一致：VLM 不用 state，action head 用 state）
     vla:
-      use_state_vlm: false
-      use_state_action_head: true
-      state_dim: 9
       future_action_window_size: 49
-  
-  # 测试训练配置
   training:
-    # 训练轮数
-    num_epochs: 2
-    # 批次大小
     batch_size: 2
-    # 学习率
-    learning_rate: 1e-4
-    # 权重衰减
-    weight_decay: 0.01
-    # 最大训练步数（与training.max_steps对齐）
     max_steps: 100
-    # 保存检查点的间隔步数（与training.save_steps对齐）
     save_steps: 50
-    # 评估间隔步数（与training.eval_steps对齐）
     eval_steps: 50
-    # 日志记录间隔步数（与training.logging_steps对齐）
     logging_steps: 10
-    # 保存目录（如果为null，则使用training.save_dir）
     save_dir: ./test_temp
-    # 优化器配置
-    optimizer:
-      type: "adamw"
-      betas: [0.9, 0.999]
-      eps: 1e-8
-    # 学习率调度器配置
-    scheduler:
-      type: "cosine"
-      warmup_ratio: 0.1
-      min_lr_ratio: 0.01
-    # 梯度累积步数
-    gradient_accumulation_steps: 1
-    # 最大梯度范数
-    max_grad_norm: 1.0
-  
-  # 测试数据加载器配置
   dataloader:
-    # 数据加载器工作进程数（测试时使用0避免问题）
     num_workers: 0
-    # 是否使用pin_memory
-    pin_memory: false
-    # 是否打乱数据
-    shuffle: true
-  
-  # 数据集配置（用于创建测试数据集和VLADataset）
   dataset:
-    # 每个数据集创建的episode数量
     num_episodes: 15
-    # 每个episode的步数
     steps_per_episode: 50
-    # 任务数量
     num_tasks: 1
-    # 验证集episode数量（如果为null，则使用num_episodes // 2）
-    val_episodes: null
-    # action_horizon（动作序列长度）：从配置中的model.action_head.action_horizon获取
-    # 如果未指定，则从test.model.action_head.action_horizon获取
-    # 如果仍未指定，则使用默认值4
-    action_horizon: null  # null表示从模型配置中获取
-    # 如果episode末尾不够action_horizon，是否使用最后一个动作填充
     pad_action_chunk: true
-  
-  # 临时目录配置（如果为null，则自动创建临时目录）
   temp_dir: ./test_temp
 
-# LeRobot训练测试配置（用于test_lerobot_training.py和test_inference.py）
+# LeRobot 测试配置（仅覆盖项）
 lerobot_test:
-  # 数据集配置
   dataset:
-    # repo_id: HuggingFace数据集名称或本地数据集名称
-    # 如果是本地路径，repo_id为目录名，root为父目录
-    repo_id: "k1000dai/libero-object-smolvla"  # HF数据集名称
-    # root: 本地数据集根目录（如果repo_id是本地路径，则使用此路径的父目录）
-    root: null  # null表示使用HF数据集，或本地路径如"./dataset"
-    # 本地数据集路径（如果使用本地路径，repo_id会被忽略）
-    local_path: "./dataset/libero_object/"  # 本地数据集路径（可选）
-    
-    # action_horizon: 动作序列长度（chunk大小），默认50
-    action_horizon: 50
-    # 图像尺寸
-    image_size: 224
-  
-  # 训练配置
+    repo_id: "k1000dai/libero-object-smolvla"
+    local_path: "./dataset/libero_object/"
   training:
-    # 最大训练步数
     max_steps: 100
-    # 批次大小
     batch_size: 2
-    # 学习率（如果为null，从training配置中获取）
-    learning_rate: null
-    # 权重衰减（如果为null，从training配置中获取）
-    weight_decay: null
-    # 优化器配置（如果为null，从training配置中获取）
-    optimizer: null
-    # 学习率调度器配置（如果为null，从training配置中获取）
-    scheduler: null
-    # 梯度累积步数（如果为null，从training配置中获取）
-    gradient_accumulation_steps: null
-    # 最大梯度范数（如果为null，从training配置中获取）
-    max_grad_norm: null
-  
-  # 数据加载器配置
   dataloader:
-    num_workers: 0  # 测试时使用0避免问题
-    pin_memory: false
-    shuffle: true
-  
-  # 任务描述获取方式
-  task_description:
-    # 方式1: 直接从batch["task"]获取（推荐，如果数据集包含此字段）
-    use_batch_task: true
-    # 方式2: 从tasks.jsonl文件查询（如果use_batch_task为false或batch中没有task字段）
-    use_tasks_jsonl: true  # 作为备选方案
+    num_workers: 0
