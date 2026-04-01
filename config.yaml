@@ -44,6 +44,17 @@ model:
     # 如果action_horizon=11，则future_action_window_size=10
     future_action_window_size: 49  # 默认值，应该等于action_horizon - 1（实际值会从dataset配置中计算）
 
+  # RL token 压缩模块（用于在线 RL 状态）
+  rl_token:
+    model_dim: 768
+    num_encoder_layers: 2
+    num_decoder_layers: 2
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    rl_token_dim: 256
+    checkpoint: null  # 例如 "./checkpoints/rl_token/rl_token_final.pt"
+
 # 随机种子配置（用于保证训练和推理的可重复性）
 seed: 42
 
@@ -98,6 +109,35 @@ training:
     bias: "none"            # 偏置训练方式: "none" | "all" | "lora_only"
     # modules_to_save: []   # 额外需要保存为可训练的模块（可选）
     # layers_to_transform: null  # 指定应用 LoRA 的层索引，null 表示全部层
+
+  # RL token 预训练（train_rl_token.py）
+  rl_token_pretrain:
+    batch_size: 8
+    learning_rate: 1e-4
+    weight_decay: 0.0
+    max_steps: 20000
+    save_steps: 1000
+    logging_steps: 50
+    save_dir: "./checkpoints/rl_token"
+
+  # 在线 RL（online_rl_td3.py）
+  online_rl:
+    td3:
+      episodes: 100
+      start_steps: 1000
+      batch_size: 128
+      buffer_size: 100000
+      gamma: 0.99
+      tau: 0.005
+      actor_lr: 1e-4
+      critic_lr: 1e-3
+      hidden_dim: 256
+      policy_noise: 0.2
+      noise_clip: 0.5
+      policy_delay: 2
+      explore_noise: 0.1
+      max_action: 1.0
+      save_dir: "./checkpoints/td3"
 
 # 数据集配置（LeRobot格式）
 dataset:

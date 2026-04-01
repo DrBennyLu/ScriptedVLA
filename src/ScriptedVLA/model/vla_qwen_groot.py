@@ -275,6 +275,49 @@ class QwenGR00TVLAModel(nn.Module):
                 )
 
     @torch.inference_mode()
+    def extract_vla_tokens(
+        self,
+        inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],
+    ) -> torch.Tensor:
+        """
+        提取 VLA 最后一层 token embeddings，用于 RL token 训练/推理。
+
+        Args:
+            inputs: 与 predict_action 相同的统一输入格式（无需 actions）
+
+        Returns:
+            torch.Tensor: last_hidden_state [B, seq_len, hidden_dim] (float32)
+        """
+        images = inputs.get("images")
+        instructions = inputs.get("instructions")
+        states = inputs.get("states")
+
+        if images is None:
+            raise ValueError("inputs['images'] is required")
+        if instructions is None:
+            raise ValueError("inputs['instructions'] is required")
+
+        if states is not None and (self.use_state_vlm or self.use_state_action_head):
+            states = self._normalize_states(states)
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=images,
+            instructions=instructions,
+            states=states if self.use_state_vlm else None,
+        )
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                output_hidden_states=True,
+                output_attentions=False,
+                return_dict=True,
+                **qwen_inputs
+            )
+            last_hidden = qwenvl_outputs["last_hidden_state"]
+            last_hidden = last_hidden.to(dtype=torch.float32)
+        return last_hidden
+
+    @torch.inference_mode()
     def predict_action(
         self,
         inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],
