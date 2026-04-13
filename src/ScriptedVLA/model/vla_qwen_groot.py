@@ -318,6 +318,28 @@ class QwenGR00TVLAModel(nn.Module):
         return last_hidden
 
     @torch.inference_mode()
+    def extract_rl_token(
+        self,
+        inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],
+        rl_token_encoder: nn.Module,
+    ) -> torch.Tensor:
+        """
+        显式提取 RL token（z_rl），用于在线强化学习状态编码。
+
+        Args:
+            inputs: 与 predict_action 相同的统一输入格式（无需 actions）
+            rl_token_encoder: 已训练好的 RLTokenBottleneck（或兼容 encode(z_tokens) 的模块）
+
+        Returns:
+            torch.Tensor: z_rl [B, rl_token_dim] (float32)
+        """
+        z_tokens = self.extract_vla_tokens(inputs)
+        if not hasattr(rl_token_encoder, "encode"):
+            raise ValueError("rl_token_encoder must implement encode(z_tokens)")
+        z_rl = rl_token_encoder.encode(z_tokens)
+        return z_rl.to(dtype=torch.float32)
+
+    @torch.inference_mode()
     def predict_action(
         self,
         inputs: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List, str, None]],

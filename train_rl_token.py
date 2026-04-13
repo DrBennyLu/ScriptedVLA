@@ -174,6 +174,8 @@ def train_rl_token(cfg) -> None:
         if "state" in batch:
             inputs["states"] = batch["state"].to(device)
         with torch.no_grad():
+            # RL token bottleneck 预训练阶段的监督目标是 VLA token 序列（z_tokens），
+            # 真正的 z_rl 由 rl_module.reconstruction_loss 内部调用 encoder 产生。
             z_tokens = model.extract_vla_tokens(inputs)
         out = rl_module.reconstruction_loss(z_tokens)
         loss = out["loss"]

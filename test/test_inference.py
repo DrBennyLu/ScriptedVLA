@@ -51,6 +51,7 @@ from inference import (
     load_dataset_episode,
     find_latest_checkpoint,
 )
+from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import load_config, load_script_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter
 from train import load_dataset_info, get_state_dim_from_info, create_delta_timestamps
@@ -443,6 +444,86 @@ def load_dataset_frame(
     return result
 
 
+def load_model_from_checkpoint_with_lora_support(
+    checkpoint_path: str,
+    config_path: str = "config.yaml",
+    device: Optional[str] = None
+) -> Tuple[QwenGR00TVLAModel, Optional[Normalizer]]:
+    """
+    从 checkpoint 加载模型，并自动兼容 LoRA 微调后的权重格式。
+
+    - 若检测到 LoRA 键（如 *.lora_A.*），自动按训练配置应用 LoRA 结构再加载。
+    - 否则退化为普通加载逻辑。
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model_state_dict = checkpoint.get("model_state_dict", {})
+    is_lora_checkpoint = any("lora_A" in k or "lora_B" in k for k in model_state_dict.keys())
+
+    if not is_lora_checkpoint:
+        return load_model_from_checkpoint(checkpoint_path, config_path, device)
+
+    try:
+        from lora_train import apply_lora_to_vlm
+    except ImportError as e:
+        raise ImportError(
+            "检测到 LoRA checkpoint，但无法导入 lora_train.apply_lora_to_vlm。"
+            "请确认项目包含 lora_train.py 且依赖 peft 已安装。"
+        ) from e
+
+    config = load_config(config_path)
+    model_config = get_model_config(config)
+    data_config = get_data_config(config)
+    dataset_config = config.get("dataset", {})
+    training_config = config.get("training", {})
+    lora_config = training_config.get("lora", {})
+
+    image_keys = dataset_config.get("image_keys", ["observation.images.image"])
+    camera_names = []
+    for key in image_keys:
+        if key.startswith("observation.images."):
+            camera_names.append(key.replace("observation.images.", ""))
+    if not camera_names:
+        camera_names = ["global_img", "left_wrist_img"]
+
+    robot_state_config = data_config.get("robot_state", {})
+    vla_config = model_config.get("vla", {})
+    use_state_vlm = vla_config.get("use_state_vlm", robot_state_config.get("use_state_vlm", robot_state_config.get("use_state", True)))
+    use_state_action_head = vla_config.get("use_state_action_head", robot_state_config.get("use_state_action_head", robot_state_config.get("use_state", True)))
+    state_dim = robot_state_config.get("state_dim", 7)
+    future_action_window_size = vla_config.get("future_action_window_size", 10)
+
+    if device is None:
+        device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device_obj = torch.device(device)
+
+    model = QwenGR00TVLAModel(
+        vlm_config=model_config.get("vlm", {}),
+        action_head_config=model_config.get("action_head", {}),
+        camera_names=camera_names,
+        use_state_vlm=use_state_vlm,
+        use_state_action_head=use_state_action_head,
+        state_dim=state_dim,
+        future_action_window_size=future_action_window_size
+    )
+
+    if not lora_config.get("enabled", True):
+        print("  ⚠️ 检测到 LoRA checkpoint，但 config.training.lora.enabled=false，推理时强制启用 LoRA 结构。")
+        lora_config = {**lora_config, "enabled": True}
+
+    model = apply_lora_to_vlm(model, lora_config)
+    model.load_state_dict(model_state_dict, strict=True)
+    model = model.to(device_obj)
+    model.eval()
+
+    normalizer = None
+    if "normalizer" in checkpoint:
+        normalizer = Normalizer.from_dict(checkpoint["normalizer"])
+
+    print("  ✓ 已按 LoRA 模式加载checkpoint")
+    return model, normalizer
+
+
 def test_inference_from_dataset(
     dataset_path: str = "./dataset/libero_object",
     checkpoint_path: str = "./checkpoints/best_model.pt",
@@ -548,7 +629,7 @@ def test_inference_from_dataset(
         test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
         temp_config_path = test_config_path if test_config_path != config_path else None
         try:
-            model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
+            model, normalizer = load_model_from_checkpoint_with_lora_support(checkpoint_path, test_config_path, device)
             # 确保模型处于eval模式并清理显存
             model.eval()
             if torch.cuda.is_available():
@@ -929,7 +1010,7 @@ def test_episode_inference_with_3d_visualization(
         test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
         temp_config_path = test_config_path if test_config_path != config_path else None
         try:
-            model, normalizer = load_model_from_checkpoint(checkpoint_path, test_config_path, device)
+            model, normalizer = load_model_from_checkpoint_with_lora_support(checkpoint_path, test_config_path, device)
             # 确保模型处于eval模式并清理显存
             model.eval()
             if torch.cuda.is_available():
@@ -1297,6 +1378,55 @@ def test_episode_inference_with_3d_visualization(
         return result
 
 
+def test_lora_episode_inference_with_3d_visualization(
+    dataset_path: str = "./dataset/libero_object",
+    checkpoint_path: str = "./checkpoints/best_model.pt",
+    config_path: str = "config.yaml",
+    episode_id: int = 0,
+    device: Optional[str] = None,
+    output_path: Optional[str] = None,
+    cfg=None,
+):
+    """
+    LoRA 训练后模型的 episode 推理 + 3D 轨迹可视化入口函数。
+    内部复用通用 episode 测试流程，并通过 LoRA-aware loader 自动加载模型。
+    """
+    print("\n[LoRA] 开始 LoRA checkpoint 的 episode 3D 可视化测试...")
+    return test_episode_inference_with_3d_visualization(
+        dataset_path=dataset_path,
+        checkpoint_path=checkpoint_path,
+        config_path=config_path,
+        episode_id=episode_id,
+        device=device,
+        output_path=output_path,
+        cfg=cfg,
+    )
+
+
+def test_single_lora_inference_from_dataset(
+    dataset_path: str = "./dataset/libero_object",
+    checkpoint_path: str = "./checkpoints/best_model.pt",
+    config_path: str = "config.yaml",
+    frame_idx: int = 0,
+    device: Optional[str] = None,
+    validate_checkpoint_first: bool = True,
+    cfg=None,
+):
+    """
+    LoRA 训练后模型的单帧推理入口。
+    """
+    print("\n[LoRA] 开始 LoRA checkpoint 的单帧推理测试...")
+    return test_inference_from_dataset(
+        dataset_path=dataset_path,
+        checkpoint_path=checkpoint_path,
+        config_path=config_path,
+        frame_idx=frame_idx,
+        device=device,
+        validate_checkpoint_first=validate_checkpoint_first,
+        cfg=cfg,
+    )
+
+
 def main():
     """主函数"""
     import argparse
@@ -1308,6 +1438,9 @@ def main():
 示例:
   # 单帧测试
   python test/test_inference.py --mode single --dataset ./dataset/libero_object --checkpoint ./test_temp/test_checkpoint.pt
+
+  # LoRA单帧测试
+  python test/test_inference.py --mode single_lora --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_5000.pt --frame_idx 0
   
   # Episode测试（3D可视化）
   python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./test_temp/test_checkpoint.pt --episode_id 0 --output episode_trajectory.png
@@ -1317,8 +1450,8 @@ def main():
         "--mode",
         type=str,
         default="single",
-        choices=["single", "episode"],
-        help="测试模式: 'single' (单帧测试) 或 'episode' (episode测试)"
+        choices=["single", "single_lora", "episode", "episode_lora"],
+        help="测试模式: 'single' (单帧), 'single_lora' (LoRA单帧), 'episode' (episode), 或 'episode_lora' (LoRA episode+3D可视化)"
     )
     parser.add_argument(
         "--dataset",
@@ -1342,7 +1475,7 @@ def main():
         "--frame_idx",
         type=int,
         default=0,
-        help="要测试的帧索引（仅用于single模式，默认0）"
+        help="要测试的帧索引（仅用于single/single_lora模式，默认0）"
     )
     parser.add_argument(
         "--episode_id",
@@ -1365,7 +1498,7 @@ def main():
     parser.add_argument(
         "--no-validate",
         action="store_true",
-        help="跳过checkpoint验证（仅用于single模式）"
+        help="跳过checkpoint验证（仅用于single/single_lora模式）"
     )
     args = parser.parse_args()
 
@@ -1409,6 +1542,26 @@ def main():
                 if result["errors"]:
                     for error in result["errors"]:
                         print(f"  - {error}")
+        elif args.mode == "single_lora":
+            # LoRA单帧测试
+            result = test_single_lora_inference_from_dataset(
+                dataset_path=str(dataset_path),
+                checkpoint_path=str(checkpoint_path),
+                config_path=args.config,
+                frame_idx=args.frame_idx,
+                device=args.device,
+                validate_checkpoint_first=not args.no_validate,
+                cfg=cfg,
+            )
+
+            if result["success"]:
+                print(f"\n✓ LoRA单帧测试成功！")
+                print(f"  MAE: {result['mae']:.4f}")
+            else:
+                print(f"\n✗ LoRA单帧测试失败")
+                if result["errors"]:
+                    for error in result["errors"]:
+                        print(f"  - {error}")
                         
         elif args.mode == "episode":
             # Episode测试
@@ -1428,6 +1581,27 @@ def main():
                 print(f"  MAE: {result['mae']:.4f}")
             else:
                 print(f"\n✗ Episode测试失败")
+                if result["errors"]:
+                    for error in result["errors"]:
+                        print(f"  - {error}")
+        elif args.mode == "episode_lora":
+            # LoRA Episode测试
+            result = test_lora_episode_inference_with_3d_visualization(
+                dataset_path=str(dataset_path),
+                checkpoint_path=str(checkpoint_path),
+                config_path=args.config,
+                episode_id=args.episode_id,
+                device=args.device,
+                output_path=args.output,
+                cfg=cfg,
+            )
+
+            if result["success"]:
+                print(f"\n✓ LoRA Episode测试成功！")
+                print(f"  处理的帧数: {result['num_frames']}")
+                print(f"  MAE: {result['mae']:.4f}")
+            else:
+                print(f"\n✗ LoRA Episode测试失败")
                 if result["errors"]:
                     for error in result["errors"]:
                         print(f"  - {error}")

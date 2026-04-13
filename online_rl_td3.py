@@ -189,8 +189,7 @@ def encode_state(vla, rl, obs: dict, device: torch.device) -> np.ndarray:
     if "states" in obs:
         inputs["states"] = torch.tensor(obs["states"], dtype=torch.float32, device=device)
     with torch.no_grad():
-        z = vla.extract_vla_tokens(inputs)
-        zrl = rl.encode(z)
+        zrl = vla.extract_rl_token(inputs, rl)
     return zrl.squeeze(0).detach().cpu().numpy()
 
 
