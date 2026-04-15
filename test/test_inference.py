@@ -1444,6 +1444,10 @@ def main():
   
   # Episode测试（3D可视化）
   python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./test_temp/test_checkpoint.pt --episode_id 0 --output episode_trajectory.png
+
+    # 推理测试：
+  python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_50000.pt --episode_id 4 --output episode_4_trajectory.png
+  python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_100000.pt --episode_id 0 --output episode_0_trajectory_10k.png
         """
     )
     parser.add_argument(

@@ -1,12 +1,32 @@
 """
 Train RL token bottleneck with frozen VLA token embeddings.
+
+Demo（在仓库根目录执行）::
+
+    # 1) 在 config.yaml 的 training.rl_token_pretrain 里设置 vla_checkpoint（VLA 权重目录或 .pt 文件）
+    # 2) 启动预训练（数据集可用 --dataset 覆盖 config 中的 dataset.local_path）
+    python train_rl_token.py --config config.yaml
+
+    # 指定设备 / 随机种子
+    python train_rl_token.py --config config.yaml --device cuda --seed 42
+
+    # 临时覆盖 VLA 来源（优先级高于 config 中的 rl_token_pretrain.vla_checkpoint）
+    python train_rl_token.py --config config.yaml --checkpoint ./checkpoints/checkpoint_step_1000.pt
+    python train_rl_token.py --config config.yaml --checkpoint ./runs/exp1/
+
+    # 仅覆盖「自动选最新 ckpt」时扫描的目录（与 inference / training 推导的 checkpoint_dir 一致用法）
+    python train_rl_token.py --config config.yaml --checkpoint_dir ./checkpoints
+
+VLA 路径解析顺序：命令行 ``--checkpoint`` > ``training.rl_token_pretrain.vla_checkpoint``
+> ``training.rl_token_pretrain.vla_checkpoint_dir``（兼容别名）> ``checkpoint_dir``（来自
+``--checkpoint_dir`` 或 config 推导），在目录内选取最新的 ``checkpoint_step_*.pt``。
 """
 
 import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -14,9 +34,15 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from inference import find_latest_checkpoint
 from src.ScriptedVLA.cli import add_common_args, parse_common_args
-from src.ScriptedVLA.model import QwenGR00TVLAModel, RLTokenBottleneck
+from src.ScriptedVLA.model import RLTokenBottleneck
 from src.ScriptedVLA.utils import ensure_offline_mode_if_needed, load_script_config
+from test.test_inference import (
+    get_test_model_config,
+    load_model_from_checkpoint_with_lora_support,
+    validate_checkpoint,
+)
 
 ensure_offline_mode_if_needed()
 
@@ -95,35 +121,72 @@ def create_collate_fn(image_keys, state_key, image_size=None, use_batch_task=Tru
     return collate_fn
 
 
-def build_vla_model(raw_cfg: dict, cfg) -> QwenGR00TVLAModel:
-    model_cfg = raw_cfg.get("model", {})
-    vla_cfg = model_cfg.get("vla", {})
-    action_head_cfg = model_cfg.get("action_head", {}).copy()
-    action_head_cfg["action_horizon"] = cfg.action_horizon
-    action_head_cfg["action_dim"] = cfg.action_dim
-    model = QwenGR00TVLAModel(
-        vlm_config=model_cfg.get("vlm", {}),
-        action_head_config=action_head_cfg,
-        use_state_vlm=vla_cfg.get("use_state_vlm", vla_cfg.get("use_state", True)),
-        use_state_action_head=vla_cfg.get("use_state_action_head", vla_cfg.get("use_state", True)),
-        state_dim=cfg.state_dim,
-        future_action_window_size=cfg.action_horizon - 1,
-    )
-    return model
+def resolve_vla_checkpoint_path(explicit: Optional[str], checkpoint_dir: str) -> Path:
+    """目录内取最新的 checkpoint_step_*.pt；显式路径可为文件或目录。"""
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"checkpoint path not found: {p}")
+        if p.is_dir():
+            latest = find_latest_checkpoint(p)
+            if latest is None:
+                raise FileNotFoundError(f"no checkpoint_step_*.pt under {p}")
+            return latest
+        return p
+    d = Path(checkpoint_dir).expanduser().resolve()
+    latest = find_latest_checkpoint(d)
+    if latest is None:
+        raise FileNotFoundError(
+            f"no checkpoint_step_*.pt under {d}; set training.rl_token_pretrain.vla_checkpoint in config, "
+            "pass --checkpoint / --checkpoint_dir, or set inference.checkpoint_path"
+        )
+    return latest
 
 
-def train_rl_token(cfg) -> None:
+def _vla_checkpoint_explicit(cli: Optional[str], rl_token_pretrain_cfg: dict) -> Optional[str]:
+    if cli:
+        return cli
+    for key in ("vla_checkpoint", "vla_checkpoint_dir"):
+        v = rl_token_pretrain_cfg.get(key)
+        if v:
+            return str(v)
+    return None
+
+
+def train_rl_token(cfg, vla_checkpoint: Optional[str] = None, device_str: Optional[str] = None) -> None:
     if not HAS_LEROBOT:
         raise ImportError("lerobot is required: pip install lerobot==0.3.3")
 
     set_seed(cfg.seed)
     raw = cfg.raw_config
-    model = build_vla_model(raw, cfg)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    train_cfg = raw.get("training", {}).get("rl_token_pretrain", {})
+    device = torch.device(device_str if device_str else ("cuda" if torch.cuda.is_available() else "cpu"))
+    explicit_ckpt = _vla_checkpoint_explicit(vla_checkpoint, train_cfg)
+    vla_ckpt = resolve_vla_checkpoint_path(explicit_ckpt, cfg.checkpoint_dir)
+    print(f"Loading frozen VLA from checkpoint: {vla_ckpt}")
+    is_valid, ckpt_info = validate_checkpoint(
+        str(vla_ckpt), cfg.config_path, str(device), dataset_path=cfg.dataset_path
+    )
+    if not is_valid:
+        raise RuntimeError(f"checkpoint validation failed: {ckpt_info.get('errors', [])}")
+
+    test_config_path = get_test_model_config(
+        cfg.config_path, dataset_path=cfg.dataset_path, use_test_config=False
+    )
+    temp_config_path = test_config_path if test_config_path != cfg.config_path else None
+    try:
+        model, _normalizer = load_model_from_checkpoint_with_lora_support(
+            str(vla_ckpt), test_config_path, str(device)
+        )
+    finally:
+        if temp_config_path and Path(temp_config_path).exists():
+            Path(temp_config_path).unlink()
+
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     rl_cfg = raw.get("model", {}).get("rl_token", {})
     rl_module = RLTokenBottleneck(
@@ -137,7 +200,6 @@ def train_rl_token(cfg) -> None:
         rl_token_dim=rl_cfg.get("rl_token_dim"),
     ).to(device)
 
-    train_cfg = raw.get("training", {}).get("rl_token_pretrain", {})
     lr = train_cfg.get("learning_rate", 1e-4)
     weight_decay = train_cfg.get("weight_decay", 0.0)
     max_steps = train_cfg.get("max_steps", cfg.max_steps)
@@ -173,10 +235,11 @@ def train_rl_token(cfg) -> None:
         inputs = {"images": batch["images"], "instructions": batch["text"]}
         if "state" in batch:
             inputs["states"] = batch["state"].to(device)
+        # extract_vla_tokens 使用了 @torch.inference_mode()，返回的是 inference tensor。
+        # 这类 tensor 不能直接参与后续需要 backward 的算子（如 Linear 对权重求梯度时会保存输入）。
+        # clone 一次可转换为普通 tensor，避免 "Inference tensors cannot be saved for backward"。
         with torch.no_grad():
-            # RL token bottleneck 预训练阶段的监督目标是 VLA token 序列（z_tokens），
-            # 真正的 z_rl 由 rl_module.reconstruction_loss 内部调用 encoder 产生。
-            z_tokens = model.extract_vla_tokens(inputs)
+            z_tokens = model.extract_vla_tokens(inputs).clone()
         out = rl_module.reconstruction_loss(z_tokens)
         loss = out["loss"]
         optimizer.zero_grad()
@@ -199,8 +262,28 @@ def train_rl_token(cfg) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train RL token bottleneck")
-    add_common_args(parser, include_config=True, include_device=False, include_seed=True, include_dataset=True)
+    parser = argparse.ArgumentParser(
+        description="Train RL token bottleneck (frozen VLA, train RLTokenBottleneck only).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python train_rl_token.py --config config.yaml\n"
+            "  python train_rl_token.py --config config.yaml --dataset ./dataset/libero_object\n"
+            "  python train_rl_token.py --config config.yaml --checkpoint ./checkpoints/checkpoint_step_5000.pt\n"
+            "\n"
+            "VLA 权重请在 config 的 training.rl_token_pretrain.vla_checkpoint 中配置（目录或 .pt）；\n"
+            "--checkpoint 可临时覆盖。\n"
+        ),
+    )
+    add_common_args(
+        parser,
+        include_config=True,
+        include_device=True,
+        include_seed=True,
+        include_checkpoint=True,
+        include_checkpoint_dir=True,
+        include_dataset=True,
+    )
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--save_steps", type=int, default=None)
     args = parser.parse_args()
@@ -208,11 +291,12 @@ def main():
     cfg = load_script_config(
         common.config_path,
         dataset_path=common.dataset_path,
+        checkpoint_dir=common.checkpoint_dir,
         max_steps=args.max_steps,
         save_steps=args.save_steps,
         seed=common.seed,
     )
-    train_rl_token(cfg)
+    train_rl_token(cfg, vla_checkpoint=common.checkpoint, device_str=common.device)
 
 
 if __name__ == "__main__":

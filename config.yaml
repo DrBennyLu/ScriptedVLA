@@ -115,10 +115,13 @@ training:
     batch_size: 8
     learning_rate: 1e-4
     weight_decay: 0.0
-    max_steps: 20000
-    save_steps: 1000
+    max_steps: 10000
+    save_steps: 5000
     logging_steps: 50
     save_dir: "./checkpoints/rl_token"
+    # 冻结 VLA 的 checkpoint：填目录则在该目录下自动选最新的 checkpoint_step_*.pt；填具体 .pt 则直接加载
+    # 未设置时回退到 inference.checkpoint_path 的父目录或 training.save_dir（见 load_script_config）
+    vla_checkpoint: "./checkpoints"
 
   # 在线 RL（online_rl_td3.py）
   online_rl:
