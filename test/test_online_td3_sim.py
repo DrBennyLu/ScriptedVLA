@@ -1,0 +1,644 @@
+"""
+Simulated online TD3 training on local LeRobot dataset.
+
+Key behavior:
+- Build replay samples from a specified task index.
+- Warm up TD3 with offline replay.
+- Run online-style training in episode units.
+- Evaluate TD3 action chunks against dataset ground truth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import sys
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Deque, Dict, List, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.ScriptedVLA.model import RLTokenBottleneck, TD3ChunkAgent, TD3ChunkConfig
+from src.ScriptedVLA.utils import load_script_config
+from test.test_inference import (
+    get_test_model_config,
+    load_model_from_checkpoint_with_lora_support,
+    validate_checkpoint,
+)
+from train_rl_token import create_delta_timestamps
+
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except ImportError as exc:
+    raise ImportError("Please install lerobot==0.3.3 first") from exc
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def tensor_to_pil_image(img_tensor: torch.Tensor):
+    from PIL import Image
+
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)
+    img_tensor = img_tensor.permute(1, 2, 0)
+    img_array = img_tensor.cpu().numpy()
+    if img_array.dtype != np.uint8:
+        if img_array.max() <= 1.0 and img_array.min() >= 0.0:
+            img_array = (img_array * 255).astype(np.uint8)
+        else:
+            img_array = np.clip(img_array, 0, 255).astype(np.uint8)
+    if img_array.ndim == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    if img_array.shape[2] == 1:
+        img_array = np.repeat(img_array, 3, axis=2)
+    return Image.fromarray(img_array, mode="RGB")
+
+
+def load_lerobot_dataset(
+    dataset_path: Path,
+    action_horizon: int,
+    episodes: Optional[List[int]] = None,
+    repo_id: Optional[str] = None,
+) -> LeRobotDataset:
+    info_file = dataset_path / "meta" / "info.json"
+    if not info_file.exists():
+        raise FileNotFoundError(f"missing info.json: {info_file}")
+    with open(info_file, "r", encoding="utf-8") as f:
+        info = json.load(f)
+    fps = info.get("fps", 10)
+    return LeRobotDataset(
+        repo_id=repo_id or dataset_path.name,
+        root=str(dataset_path),
+        delta_timestamps=create_delta_timestamps(action_horizon, fps),
+        episodes=episodes,
+    )
+
+
+def _scalar(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return value.reshape(-1)[0].item()
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.item()
+        return value.reshape(-1)[0].item()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return _scalar(value[0])
+    return value
+
+
+def sample_task_index(sample: Dict) -> Optional[int]:
+    candidates = [
+        "task_index",
+        "task_idx",
+    ]
+    for key in candidates:
+        if key in sample:
+            value = _scalar(sample[key])
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    task_value = sample.get("task")
+    scalar_task = _scalar(task_value)
+    if isinstance(scalar_task, (int, np.integer)):
+        return int(scalar_task)
+    return None
+
+
+def sample_episode_index(sample: Dict) -> int:
+    for key in ("episode_index", "episode_id", "episode", "episode_idx"):
+        if key in sample:
+            value = _scalar(sample[key])
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return -1
+
+
+def build_single_input(sample: Dict, image_keys: List[str], state_key: str, device: torch.device) -> Dict:
+    images = []
+    for key in image_keys:
+        if key not in sample:
+            raise KeyError(f"sample missing image key: {key}")
+        images.append(tensor_to_pil_image(sample[key]))
+    if len(images) == 1:
+        images = [images[0]]
+    else:
+        images = [images]
+
+    task_text = str(_scalar(sample.get("task", "")))
+    inputs = {"images": images, "instructions": [task_text]}
+    if state_key in sample:
+        state = sample[state_key]
+        if isinstance(state, torch.Tensor):
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            inputs["states"] = state.to(device=device, dtype=torch.float32)
+    return inputs
+
+
+def load_trained_modules(
+    config_path: str,
+    dataset_path: str,
+    vla_checkpoint: str,
+    rl_checkpoint: str,
+    device: torch.device,
+):
+    ok, info = validate_checkpoint(vla_checkpoint, config_path, str(device), dataset_path=dataset_path)
+    if not ok:
+        raise RuntimeError(f"VLA checkpoint validation failed: {info.get('errors', [])}")
+    test_config_path = get_test_model_config(config_path, dataset_path=dataset_path, use_test_config=False)
+    temp_config_path = test_config_path if test_config_path != config_path else None
+    try:
+        model, _ = load_model_from_checkpoint_with_lora_support(vla_checkpoint, test_config_path, str(device))
+    finally:
+        if temp_config_path and Path(temp_config_path).exists():
+            Path(temp_config_path).unlink()
+    model.eval()
+
+    cfg = load_script_config(config_path, dataset_path=dataset_path)
+    rl_cfg = cfg.raw_config.get("model", {}).get("rl_token", {})
+    rl_module = RLTokenBottleneck(
+        input_dim=model.qwen_vl_interface.get_hidden_dim(),
+        model_dim=rl_cfg.get("model_dim"),
+        num_encoder_layers=rl_cfg.get("num_encoder_layers", 2),
+        num_decoder_layers=rl_cfg.get("num_decoder_layers", 2),
+        num_heads=rl_cfg.get("num_heads", 8),
+        ffn_dim=rl_cfg.get("ffn_dim"),
+        dropout=rl_cfg.get("dropout", 0.1),
+        rl_token_dim=rl_cfg.get("rl_token_dim"),
+    ).to(device)
+    ckpt = torch.load(rl_checkpoint, map_location=device)
+    state_dict = ckpt.get("rl_token_state_dict")
+    if state_dict is None:
+        raise KeyError(f"rl_token_state_dict missing in {rl_checkpoint}")
+    rl_module.load_state_dict(state_dict, strict=True)
+    rl_module.eval()
+    return cfg, model, rl_module
+
+
+@dataclass
+class ReplayTransition:
+    sample_index: int
+    next_sample_index: int
+    episode_id: int
+    state: torch.Tensor
+    next_state: torch.Tensor
+    gt_action_chunk: torch.Tensor
+    reward: float
+    done: float
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.buf: Deque[ReplayTransition] = deque(maxlen=capacity)
+
+    def add(self, transition: ReplayTransition) -> None:
+        self.buf.append(transition)
+
+    def __len__(self) -> int:
+        return len(self.buf)
+
+    def sample(self, batch_size: int) -> List[ReplayTransition]:
+        return random.sample(list(self.buf), min(batch_size, len(self.buf)))
+
+
+def collect_task_episode_ids(dataset: LeRobotDataset, task_index: int) -> List[int]:
+    episode_ids = set()
+    unknown_task_count = 0
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        sample_task = sample_task_index(sample)
+        if sample_task is None:
+            unknown_task_count += 1
+            continue
+        if sample_task != task_index:
+            continue
+        episode_id = sample_episode_index(sample)
+        episode_ids.add(episode_id)
+    if not episode_ids:
+        raise RuntimeError(
+            f"No episodes found for task_index={task_index}. "
+            f"Unknown-task samples skipped={unknown_task_count}."
+        )
+    return sorted(episode_ids)
+
+
+def build_episode_index(dataset: LeRobotDataset) -> Dict[int, List[int]]:
+    episode_to_indices: Dict[int, List[int]] = defaultdict(list)
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        episode_id = sample_episode_index(sample)
+        episode_to_indices[episode_id].append(idx)
+    for episode_id in episode_to_indices:
+        episode_to_indices[episode_id].sort()
+    return dict(episode_to_indices)
+
+
+def build_replay_from_dataset(
+    dataset: LeRobotDataset,
+    episode_to_indices: Dict[int, List[int]],
+    state_key: str,
+    chunk_len: int,
+    stride: int,
+    device: torch.device,
+    capacity: int,
+) -> ReplayBuffer:
+    replay = ReplayBuffer(capacity=capacity)
+    for episode_id, indices in episode_to_indices.items():
+        if len(indices) < chunk_len + 1:
+            continue
+        # sample starts at 0,2,4,... in each episode
+        for local_start in range(0, len(indices) - 1, stride):
+            current_idx = indices[local_start]
+            next_idx = indices[min(local_start + 1, len(indices) - 1)]
+            sample = dataset[current_idx]
+            next_sample = dataset[next_idx]
+            actions = sample["action"]
+            if actions.shape[0] < chunk_len:
+                continue
+            action_chunk = actions[:chunk_len].to(dtype=torch.float32)
+            state = sample[state_key] if state_key in sample else torch.zeros_like(next_sample[state_key])
+            next_state = next_sample[state_key] if state_key in next_sample else state
+            terminal = 1.0 if local_start + stride >= len(indices) - 1 else 0.0
+            reward = 1.0 if terminal > 0.5 else 0.0
+            replay.add(
+                ReplayTransition(
+                    sample_index=current_idx,
+                    next_sample_index=next_idx,
+                    episode_id=episode_id,
+                    state=state.to(device=device, dtype=torch.float32).detach().cpu(),
+                    next_state=next_state.to(device=device, dtype=torch.float32).detach().cpu(),
+                    gt_action_chunk=action_chunk.detach().cpu(),
+                    reward=reward,
+                    done=terminal,
+                )
+            )
+    if len(replay) == 0:
+        raise RuntimeError("ReplayBuffer is empty after filtering and chunk sampling.")
+    return replay
+
+
+class OnlineFeatureProvider:
+    def __init__(
+        self,
+        dataset: LeRobotDataset,
+        image_keys: List[str],
+        state_key: str,
+        vla_model,
+        rl_encoder,
+        device: torch.device,
+        chunk_len: int,
+    ):
+        self.dataset = dataset
+        self.image_keys = image_keys
+        self.state_key = state_key
+        self.vla_model = vla_model
+        self.rl_encoder = rl_encoder
+        self.device = device
+        self.chunk_len = chunk_len
+        self.cache: Dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    @torch.no_grad()
+    def get(self, sample_index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if sample_index in self.cache:
+            z_rl, ref_chunk, state = self.cache[sample_index]
+            return z_rl.clone(), ref_chunk.clone(), state.clone()
+
+        sample = self.dataset[sample_index]
+        inputs = build_single_input(sample, self.image_keys, self.state_key, self.device)
+        z_tokens = self.vla_model.extract_vla_tokens(inputs).clone()
+        z_rl = self.rl_encoder.encode(z_tokens).float()
+        pred = self.vla_model.predict_action(inputs)["normalized_actions"]
+        ref_chunk = torch.tensor(pred[:, : self.chunk_len, :], dtype=torch.float32, device=self.device)
+        state = sample[self.state_key] if self.state_key in sample else torch.zeros((1, 0), device=self.device)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        state = state.to(device=self.device, dtype=torch.float32)
+        self.cache[sample_index] = (z_rl.detach().cpu(), ref_chunk.detach().cpu(), state.detach().cpu())
+        return z_rl, ref_chunk, state
+
+
+def train_from_batch(
+    agent: TD3ChunkAgent,
+    provider: OnlineFeatureProvider,
+    batch: List[ReplayTransition],
+    apply_ref_mask: bool = True,
+) -> Dict[str, float]:
+    z_rl = []
+    state = []
+    ref = []
+    action = []
+    reward = []
+    next_z_rl = []
+    next_state = []
+    next_ref = []
+    done = []
+    for tr in batch:
+        curr_z, curr_ref, curr_state = provider.get(tr.sample_index)
+        nxt_z, nxt_ref, nxt_state = provider.get(tr.next_sample_index)
+        z_rl.append(curr_z.squeeze(0))
+        state.append(curr_state.squeeze(0))
+        ref.append(curr_ref.squeeze(0))
+        action.append(tr.gt_action_chunk)
+        reward.append([tr.reward])
+        next_z_rl.append(nxt_z.squeeze(0))
+        next_state.append(nxt_state.squeeze(0))
+        next_ref.append(nxt_ref.squeeze(0))
+        done.append([tr.done])
+
+    return agent.train_step(
+        z_rl=torch.stack(z_rl, dim=0),
+        state=torch.stack(state, dim=0),
+        ref_actions=torch.stack(ref, dim=0),
+        action=torch.stack(action, dim=0).to(agent.device),
+        reward=torch.tensor(reward, dtype=torch.float32, device=agent.device),
+        next_z_rl=torch.stack(next_z_rl, dim=0),
+        next_state=torch.stack(next_state, dim=0),
+        next_ref_actions=torch.stack(next_ref, dim=0),
+        done=torch.tensor(done, dtype=torch.float32, device=agent.device),
+        apply_ref_mask=apply_ref_mask,
+    )
+
+
+def warmup_train(
+    agent: TD3ChunkAgent,
+    replay: ReplayBuffer,
+    provider: OnlineFeatureProvider,
+    batch_size: int,
+    warmup_updates: int,
+) -> List[Dict[str, float]]:
+    logs: List[Dict[str, float]] = []
+    for step in range(warmup_updates):
+        batch = replay.sample(batch_size)
+        metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
+        metrics["phase"] = "warmup"
+        metrics["step"] = float(step + 1)
+        logs.append(metrics)
+    return logs
+
+
+def online_train_loop(
+    agent: TD3ChunkAgent,
+    replay: ReplayBuffer,
+    provider: OnlineFeatureProvider,
+    batch_size: int,
+    online_train_episodes: int,
+) -> List[Dict[str, float]]:
+    logs: List[Dict[str, float]] = []
+    transitions = list(replay.buf)
+    transitions_by_episode: Dict[int, List[ReplayTransition]] = defaultdict(list)
+    for tr in transitions:
+        transitions_by_episode[tr.episode_id].append(tr)
+    episode_ids = sorted(transitions_by_episode.keys())
+    for ep in range(online_train_episodes):
+        ep_id = episode_ids[ep % len(episode_ids)]
+        ep_transitions = transitions_by_episode[ep_id]
+        random.shuffle(ep_transitions)
+        for start in range(0, len(ep_transitions), batch_size):
+            batch = ep_transitions[start : start + batch_size]
+            if not batch:
+                continue
+            metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
+            metrics["phase"] = "online"
+            metrics["episode"] = float(ep + 1)
+            logs.append(metrics)
+        if (ep + 1) % max(1, online_train_episodes // 10) == 0:
+            print(f"[online] episode {ep + 1}/{online_train_episodes}")
+    return logs
+
+
+@torch.no_grad()
+def eval_with_vla_reference(
+    agent: TD3ChunkAgent,
+    replay: ReplayBuffer,
+    provider: OnlineFeatureProvider,
+    max_eval_samples: int = 256,
+) -> Dict[str, float]:
+    selected = list(replay.buf)[: max_eval_samples]
+    mse_vals = []
+    mae_vals = []
+    l2_vals = []
+    ref_mse_vals = []
+    q_vals = []
+
+    for tr in selected:
+        z_rl, ref_chunk, state = provider.get(tr.sample_index)
+        gt = tr.gt_action_chunk.unsqueeze(0).to(agent.device)
+        pred = agent.act(z_rl, state, ref_chunk, deterministic=True, apply_ref_mask=False)
+        q1, q2 = agent.critic(z_rl.to(agent.device), state.to(agent.device), pred.to(agent.device))
+        q_vals.append(torch.min(q1, q2).mean().item())
+
+        mse_vals.append(F.mse_loss(pred, gt).item())
+        mae_vals.append(F.l1_loss(pred, gt).item())
+        l2_vals.append((pred - gt).pow(2).sum(dim=-1).sqrt().mean().item())
+        ref_mse_vals.append(F.mse_loss(ref_chunk.to(agent.device), gt).item())
+
+    if not mse_vals:
+        raise RuntimeError("No evaluation samples available.")
+    return {
+        "mse": float(np.mean(mse_vals)),
+        "mae": float(np.mean(mae_vals)),
+        "mean_l2_per_step": float(np.mean(l2_vals)),
+        "ref_mse": float(np.mean(ref_mse_vals)),
+        "eval_q_mean": float(np.mean(q_vals)),
+    }
+
+
+def export_q_logs(logs: List[Dict[str, float]], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "q_curve.csv"
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["phase", "step", "episode", "q1_mean", "q2_mean", "target_q_mean", "critic_loss", "actor_loss"],
+        )
+        writer.writeheader()
+        for row in logs:
+            writer.writerow(
+                {
+                    "phase": row.get("phase", ""),
+                    "step": row.get("step", ""),
+                    "episode": row.get("episode", ""),
+                    "q1_mean": row.get("q1_mean", ""),
+                    "q2_mean": row.get("q2_mean", ""),
+                    "target_q_mean": row.get("target_q_mean", ""),
+                    "critic_loss": row.get("critic_loss", ""),
+                    "actor_loss": row.get("actor_loss", ""),
+                }
+            )
+
+    try:
+        import matplotlib.pyplot as plt
+
+        x = np.arange(len(logs))
+        q1 = np.array([row.get("q1_mean", 0.0) for row in logs], dtype=np.float32)
+        q2 = np.array([row.get("q2_mean", 0.0) for row in logs], dtype=np.float32)
+        tq = np.array([row.get("target_q_mean", 0.0) for row in logs], dtype=np.float32)
+        plt.figure(figsize=(9, 5))
+        plt.plot(x, q1, label="q1_mean")
+        plt.plot(x, q2, label="q2_mean")
+        plt.plot(x, tq, label="target_q_mean")
+        plt.title("TD3 Q-value Curve")
+        plt.xlabel("Update Step")
+        plt.ylabel("Q Value")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "q_curve.png", dpi=150)
+        plt.close()
+    except Exception as exc:
+        print(f"[warn] q_curve.png not generated: {exc}")
+
+
+def run_online_td3_sim(args) -> Dict[str, float]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(args.seed)
+
+    cfg, vla_model, rl_encoder = load_trained_modules(
+        config_path=args.config,
+        dataset_path=args.dataset,
+        vla_checkpoint=args.vla_checkpoint,
+        rl_checkpoint=args.rl_checkpoint,
+        device=device,
+    )
+    full_dataset = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
+    selected_episodes = collect_task_episode_ids(full_dataset, args.task_index)
+    dataset = load_lerobot_dataset(
+        Path(args.dataset),
+        cfg.action_horizon,
+        episodes=selected_episodes,
+    )
+    episode_map = build_episode_index(dataset)
+    replay = build_replay_from_dataset(
+        dataset=dataset,
+        episode_to_indices=episode_map,
+        state_key=cfg.state_key,
+        chunk_len=args.chunk_len,
+        stride=args.stride,
+        device=device,
+        capacity=args.replay_capacity,
+    )
+    print(
+        f"task_index={args.task_index}, selected_episodes={len(selected_episodes)}, "
+        f"dataset_episodes={len(episode_map)}, "
+        f"replay_size={len(replay)}, chunk_len={args.chunk_len}, stride={args.stride}"
+    )
+
+    rl_token_dim = cfg.raw_config.get("model", {}).get("rl_token", {}).get("rl_token_dim", 256)
+    td3_cfg = TD3ChunkConfig(
+        gamma=args.gamma,
+        tau=args.tau,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        policy_noise=args.policy_noise,
+        noise_clip=args.noise_clip,
+        policy_delay=args.policy_delay,
+        fixed_std=args.actor_std,
+        max_action=args.max_action,
+        ref_mask_prob=args.ref_mask_prob,
+        hidden_dims=[args.hidden_dim, args.hidden_dim],
+    )
+    agent = TD3ChunkAgent(
+        rl_token_dim=rl_token_dim,
+        state_dim=cfg.state_dim,
+        action_dim=cfg.action_dim,
+        chunk_size=args.chunk_len,
+        cfg=td3_cfg,
+        device=device,
+    )
+
+    provider = OnlineFeatureProvider(
+        dataset=dataset,
+        image_keys=cfg.image_keys,
+        state_key=cfg.state_key,
+        vla_model=vla_model,
+        rl_encoder=rl_encoder,
+        device=device,
+        chunk_len=args.chunk_len,
+    )
+
+    default_warmup = max(1, int(np.ceil(len(replay) / max(args.batch_size, 1))))
+    warmup_updates = args.warmup_updates if args.warmup_updates > 0 else default_warmup
+    print(f"warmup_updates={warmup_updates}, online_train_episodes={args.online_train_episodes}")
+
+    all_logs = []
+    all_logs.extend(warmup_train(agent, replay, provider, args.batch_size, warmup_updates))
+    all_logs.extend(
+        online_train_loop(
+            agent=agent,
+            replay=replay,
+            provider=provider,
+            batch_size=args.batch_size,
+            online_train_episodes=args.online_train_episodes,
+        )
+    )
+    export_q_logs(all_logs, Path(args.output_dir))
+    metrics = eval_with_vla_reference(agent, replay, provider, max_eval_samples=args.max_eval_samples)
+    print(
+        "eval metrics: "
+        f"mse={metrics['mse']:.6f}, mae={metrics['mae']:.6f}, "
+        f"mean_l2_per_step={metrics['mean_l2_per_step']:.6f}, "
+        f"ref_mse={metrics['ref_mse']:.6f}, eval_q_mean={metrics['eval_q_mean']:.6f}"
+    )
+    return metrics
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Simulated online TD3 training with LeRobot data")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--dataset", type=str, default="./dataset/libero_object")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--task-index", type=int, default=0)
+    parser.add_argument("--chunk-len", type=int, default=10)
+    parser.add_argument("--stride", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--replay-capacity", type=int, default=200000)
+    parser.add_argument("--warmup-updates", type=int, default=0)
+    parser.add_argument("--online-train-episodes", type=int, default=400)
+    parser.add_argument("--max-eval-samples", type=int, default=256)
+
+    parser.add_argument("--vla-checkpoint", type=str, default="./checkpoints/checkpoint_step_100000.pt")
+    parser.add_argument("--rl-checkpoint", type=str, default="./checkpoints/rl_token/rl_token_step_10000.pt")
+    parser.add_argument("--output-dir", type=str, default="./checkpoints/td3_sim")
+
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--actor-lr", type=float, default=1e-4)
+    parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--policy-noise", type=float, default=0.2)
+    parser.add_argument("--noise-clip", type=float, default=0.5)
+    parser.add_argument("--policy-delay", type=int, default=2)
+    parser.add_argument("--actor-std", type=float, default=0.1)
+    parser.add_argument("--max-action", type=float, default=1.0)
+    parser.add_argument("--ref-mask-prob", type=float, default=0.5)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    return parser
+
+
+def main():
+    parser = build_argparser()
+    args = parser.parse_args()
+    run_online_td3_sim(args)
+
+
+if __name__ == "__main__":
+    main()
