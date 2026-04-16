@@ -35,7 +35,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.ScriptedVLA.model import RLTokenBottleneck, TD3ChunkAgent, TD3ChunkConfig
-from src.ScriptedVLA.utils import load_script_config
+from src.ScriptedVLA.utils import (
+    create_normalizer_from_dataset,
+    create_normalizer_from_lerobot_meta,
+    load_script_config,
+)
 from test.test_inference import (
     get_test_model_config,
     load_model_from_checkpoint_with_lora_support,
@@ -76,6 +80,14 @@ try:
 
 except ImportError as exc:
     raise ImportError("请先安装 lerobot==0.3.3") from exc
+
+
+# 固定测试子集（用于 dataset 步骤之外的快速迭代）
+FIXED_EPISODE_SLICE = [
+    0, 22, 25, 28, 30, 41, 47, 59, 63, 73, 91, 116, 119, 172, 206, 234, 236,
+    237, 238, 239, 240, 242, 243, 266, 277, 286, 287, 307, 314, 315, 332, 339,
+    348, 350, 352, 353, 365, 366, 368, 370, 390, 393, 400, 411, 420,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -963,9 +975,60 @@ def _execute(args: argparse.Namespace) -> None:
     if args.step == "replay":
         print("[main] 当前任务：仅构建 ReplayBuffer")
         cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
-        full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
-        selected = collect_task_episode_ids(full_ds, args.task_index)
-        sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
+        dataset_path_obj = Path(args.dataset).resolve()
+        info_file = dataset_path_obj / "meta" / "info.json"
+        if not info_file.exists():
+            raise ValueError(f"本地数据集路径不存在或无效: {info_file}")
+
+        with open(info_file, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        fps = info.get("fps", 10)
+        delta_timestamps = create_delta_timestamps(cfg.action_horizon, fps)
+        dataset_name = dataset_path_obj.name
+        root_path_str = str(dataset_path_obj)
+
+        try:
+            sub_ds = LeRobotDatasetSubset(
+                repo_id=dataset_name,
+                root=root_path_str,
+                delta_timestamps=delta_timestamps,
+                episodes=FIXED_EPISODE_SLICE,
+            )
+            print(f"  ✓ 固定测试集创建成功: repo_id={dataset_name}, root={root_path_str}")
+            print(f"  ✓ 固定 episode 数量: {len(FIXED_EPISODE_SLICE)}")
+        except Exception as e:
+            print(f"  ✗ 创建固定测试集失败: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        try:
+            _normalizer = create_normalizer_from_lerobot_meta(
+                sub_ds,
+                state_key=cfg.state_key,
+                action_key="action",
+            )
+            print("  ✓ 归一化器已从 meta.episodes_stats 创建")
+            if _normalizer.action_min is not None:
+                print(
+                    "  Action 范围: "
+                    f"[{_normalizer.action_min.min():.4f}, {_normalizer.action_max.max():.4f}]"
+                )
+            if _normalizer.state_min is not None:
+                print(
+                    "  State 范围: "
+                    f"[{_normalizer.state_min.min():.4f}, {_normalizer.state_max.max():.4f}]"
+                )
+        except Exception as e:
+            print(f"  从 meta.episodes_stats 创建归一化器失败: {e}，尝试从 episodes_stats.jsonl 创建")
+            try:
+                _normalizer = create_normalizer_from_dataset(dataset_path_obj)
+                print("  ✓ 归一化器已从 episodes_stats.jsonl 创建")
+            except Exception as e2:
+                print(f"  ✗ 归一化器创建失败: {e2}")
+                print("  警告: 将不使用归一化，训练可能不稳定")
+                _normalizer = None
+
         ep_map = build_episode_index(sub_ds)
         replay = build_replay_from_dataset(
             sub_ds,
@@ -990,9 +1053,60 @@ def _execute(args: argparse.Namespace) -> None:
     cfg, vla_model, rl_encoder = load_trained_modules(
         args.config, args.dataset, args.vla_checkpoint, args.rl_checkpoint, device
     )
-    full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
-    selected = collect_task_episode_ids(full_ds, args.task_index)
-    sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
+    dataset_path_obj = Path(args.dataset).resolve()
+    info_file = dataset_path_obj / "meta" / "info.json"
+    if not info_file.exists():
+        raise ValueError(f"本地数据集路径不存在或无效: {info_file}")
+
+    with open(info_file, "r", encoding="utf-8") as f:
+        info = json.load(f)
+    fps = info.get("fps", 10)
+    delta_timestamps = create_delta_timestamps(cfg.action_horizon, fps)
+    dataset_name = dataset_path_obj.name
+    root_path_str = str(dataset_path_obj)
+
+    try:
+        sub_ds = LeRobotDatasetSubset(
+            repo_id=dataset_name,
+            root=root_path_str,
+            delta_timestamps=delta_timestamps,
+            episodes=FIXED_EPISODE_SLICE,
+        )
+        print(f"  ✓ 固定测试集创建成功: repo_id={dataset_name}, root={root_path_str}")
+        print(f"  ✓ 固定 episode 数量: {len(FIXED_EPISODE_SLICE)}")
+    except Exception as e:
+        print(f"  ✗ 创建固定测试集失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    try:
+        _normalizer = create_normalizer_from_lerobot_meta(
+            sub_ds,
+            state_key=cfg.state_key,
+            action_key="action",
+        )
+        print("  ✓ 归一化器已从 meta.episodes_stats 创建")
+        if _normalizer.action_min is not None:
+            print(
+                "  Action 范围: "
+                f"[{_normalizer.action_min.min():.4f}, {_normalizer.action_max.max():.4f}]"
+            )
+        if _normalizer.state_min is not None:
+            print(
+                "  State 范围: "
+                f"[{_normalizer.state_min.min():.4f}, {_normalizer.state_max.max():.4f}]"
+            )
+    except Exception as e:
+        print(f"  从 meta.episodes_stats 创建归一化器失败: {e}，尝试从 episodes_stats.jsonl 创建")
+        try:
+            _normalizer = create_normalizer_from_dataset(dataset_path_obj)
+            print("  ✓ 归一化器已从 episodes_stats.jsonl 创建")
+        except Exception as e2:
+            print(f"  ✗ 归一化器创建失败: {e2}")
+            print("  警告: 将不使用归一化，训练可能不稳定")
+            _normalizer = None
+
     ep_map = build_episode_index(sub_ds)
     replay = build_replay_from_dataset(
         sub_ds,
@@ -1033,7 +1147,7 @@ def _execute(args: argparse.Namespace) -> None:
     if args.step == "warmup":
         print("[main] 当前任务：执行 warmup 训练")
         print(
-            f"[warmup] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
+            f"[warmup] episodes={len(FIXED_EPISODE_SLICE)}, replay={len(replay)}, "
             f"warmup_updates={warmup_n}"
         )
         agent = TD3ChunkAgent(
@@ -1086,7 +1200,7 @@ def _execute(args: argparse.Namespace) -> None:
     if args.step == "full":
         print("[main] 当前任务：执行 full 全流程（warmup -> online -> eval）")
         print(
-            f"[full] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
+            f"[full] episodes={len(FIXED_EPISODE_SLICE)}, replay={len(replay)}, "
             f"warmup={warmup_n}, online_ep={args.online_train_episodes}"
         )
         agent = TD3ChunkAgent(
@@ -1137,4 +1251,10 @@ def run_online_td3_sim(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    """
+    测试流程：
+    python -m test.test_online_td3_sim --step dataset --dataset ./dataset/libero_object
+    
+    
+    """
     main()
