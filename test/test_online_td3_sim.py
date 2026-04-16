@@ -1,11 +1,17 @@
 """
-Simulated online TD3 training on local LeRobot dataset.
+本地 LeRobot 数据上的 TD3 模拟在线训练脚本。
 
-Key behavior:
-- Build replay samples from a specified task index.
-- Warm up TD3 with offline replay.
-- Run online-style training in episode units.
-- Evaluate TD3 action chunks against dataset ground truth.
+分步调试（任选其一）::
+
+    python -m test.test_online_td3_sim --step dataset --dataset ./dataset/libero_object
+    python -m test.test_online_td3_sim --step models
+    python -m test.test_online_td3_sim --step replay
+    python -m test.test_online_td3_sim --step warmup --save-agent ./out/agent.pt
+    python -m test.test_online_td3_sim --step online --load-agent ./out/agent.pt
+    python -m test.test_online_td3_sim --step eval --load-agent ./out/agent.pt
+    python -m test.test_online_td3_sim --step full
+
+默认 --step full 为完整流程。
 """
 
 from __future__ import annotations
@@ -39,7 +45,12 @@ from train_rl_token import create_delta_timestamps
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 except ImportError as exc:
-    raise ImportError("Please install lerobot==0.3.3 first") from exc
+    raise ImportError("请先安装 lerobot==0.3.3") from exc
+
+
+# ---------------------------------------------------------------------------
+# 基础工具：随机种子、张量转 PIL、从样本里取 task / episode 标量
+# ---------------------------------------------------------------------------
 
 
 def set_seed(seed: int = 42) -> None:
@@ -50,6 +61,7 @@ def set_seed(seed: int = 42) -> None:
 
 
 def tensor_to_pil_image(img_tensor: torch.Tensor):
+    """LeRobot 图像张量 [C,H,W] 转成 PIL RGB，供 VLA 使用。"""
     from PIL import Image
 
     if img_tensor.dim() == 4:
@@ -68,12 +80,29 @@ def tensor_to_pil_image(img_tensor: torch.Tensor):
     return Image.fromarray(img_array, mode="RGB")
 
 
+def sample_task_index(sample: Dict) -> int:
+    """
+    从单帧样本里直接读取 task_index。
+    数据格式约定固定：sample["task_index"] 为标量张量。
+    """
+    return int(sample["task_index"].item())
+
+
+def sample_episode_index(sample: Dict) -> int:
+    """
+    从单帧样本里直接读取 episode_index。
+    数据格式约定固定：sample["episode_index"] 为标量张量。
+    """
+    return int(sample["episode_index"].item())
+
+
 def load_lerobot_dataset(
     dataset_path: Path,
     action_horizon: int,
     episodes: Optional[List[int]] = None,
     repo_id: Optional[str] = None,
 ) -> LeRobotDataset:
+    """读 meta/info.json，按 fps 构造 delta_timestamps，打开 LeRobotDataset。"""
     info_file = dataset_path / "meta" / "info.json"
     if not info_file.exists():
         raise FileNotFoundError(f"missing info.json: {info_file}")
@@ -88,53 +117,8 @@ def load_lerobot_dataset(
     )
 
 
-def _scalar(value):
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            return value.item()
-        return value.reshape(-1)[0].item()
-    if isinstance(value, np.ndarray):
-        if value.size == 1:
-            return value.item()
-        return value.reshape(-1)[0].item()
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        return _scalar(value[0])
-    return value
-
-
-def sample_task_index(sample: Dict) -> Optional[int]:
-    candidates = [
-        "task_index",
-        "task_idx",
-    ]
-    for key in candidates:
-        if key in sample:
-            value = _scalar(sample[key])
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return None
-    task_value = sample.get("task")
-    scalar_task = _scalar(task_value)
-    if isinstance(scalar_task, (int, np.integer)):
-        return int(scalar_task)
-    return None
-
-
-def sample_episode_index(sample: Dict) -> int:
-    for key in ("episode_index", "episode_id", "episode", "episode_idx"):
-        if key in sample:
-            value = _scalar(sample[key])
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-    return -1
-
-
 def build_single_input(sample: Dict, image_keys: List[str], state_key: str, device: torch.device) -> Dict:
+    """把一帧 LeRobot 样本转成 VLA 前向所需的 images / instructions / states。"""
     images = []
     for key in image_keys:
         if key not in sample:
@@ -145,7 +129,7 @@ def build_single_input(sample: Dict, image_keys: List[str], state_key: str, devi
     else:
         images = [images]
 
-    task_text = str(_scalar(sample.get("task", "")))
+    task_text = str(sample.get("task", ""))
     inputs = {"images": images, "instructions": [task_text]}
     if state_key in sample:
         state = sample[state_key]
@@ -163,6 +147,7 @@ def load_trained_modules(
     rl_checkpoint: str,
     device: torch.device,
 ):
+    """加载验证过的 VLA 权重与 RL token 编码器（项目既有逻辑）。"""
     ok, info = validate_checkpoint(vla_checkpoint, config_path, str(device), dataset_path=dataset_path)
     if not ok:
         raise RuntimeError(f"VLA checkpoint validation failed: {info.get('errors', [])}")
@@ -196,6 +181,11 @@ def load_trained_modules(
     return cfg, model, rl_module
 
 
+# ---------------------------------------------------------------------------
+# 经验池：一条转移、环形缓冲、按 episode 切块写入
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class ReplayTransition:
     sample_index: int
@@ -209,6 +199,8 @@ class ReplayTransition:
 
 
 class ReplayBuffer:
+    """简单 FIFO，存 transition；sample 随机抽 batch。"""
+
     def __init__(self, capacity: int):
         self.buf: Deque[ReplayTransition] = deque(maxlen=capacity)
 
@@ -223,32 +215,24 @@ class ReplayBuffer:
 
 
 def collect_task_episode_ids(dataset: LeRobotDataset, task_index: int) -> List[int]:
+    """遍历全量数据，找出属于 task_index 的所有 episode_id。"""
     episode_ids = set()
-    unknown_task_count = 0
     for idx in range(len(dataset)):
         sample = dataset[idx]
-        sample_task = sample_task_index(sample)
-        if sample_task is None:
-            unknown_task_count += 1
+        if sample_task_index(sample) != task_index:
             continue
-        if sample_task != task_index:
-            continue
-        episode_id = sample_episode_index(sample)
-        episode_ids.add(episode_id)
+        episode_ids.add(sample_episode_index(sample))
     if not episode_ids:
-        raise RuntimeError(
-            f"No episodes found for task_index={task_index}. "
-            f"Unknown-task samples skipped={unknown_task_count}."
-        )
+        raise RuntimeError(f"task_index={task_index} 下没有 episode")
     return sorted(episode_ids)
 
 
 def build_episode_index(dataset: LeRobotDataset) -> Dict[int, List[int]]:
+    """子集数据集上：episode_id -> 该 episode 内全局帧下标列表（已排序）。"""
     episode_to_indices: Dict[int, List[int]] = defaultdict(list)
     for idx in range(len(dataset)):
         sample = dataset[idx]
-        episode_id = sample_episode_index(sample)
-        episode_to_indices[episode_id].append(idx)
+        episode_to_indices[sample_episode_index(sample)].append(idx)
     for episode_id in episode_to_indices:
         episode_to_indices[episode_id].sort()
     return dict(episode_to_indices)
@@ -263,11 +247,14 @@ def build_replay_from_dataset(
     device: torch.device,
     capacity: int,
 ) -> ReplayBuffer:
+    """
+    在每个 episode 内按 stride 取起点，截取 chunk_len 步动作作为监督；
+    下一帧用 stride 步后的索引，done/reward 按 episode 末尾给稀疏 1。
+    """
     replay = ReplayBuffer(capacity=capacity)
     for episode_id, indices in episode_to_indices.items():
         if len(indices) < chunk_len + 1:
             continue
-        # sample starts at 0,2,4,... in each episode
         for local_start in range(0, len(indices) - 1, stride):
             current_idx = indices[local_start]
             next_idx = indices[min(local_start + 1, len(indices) - 1)]
@@ -294,11 +281,18 @@ def build_replay_from_dataset(
                 )
             )
     if len(replay) == 0:
-        raise RuntimeError("ReplayBuffer is empty after filtering and chunk sampling.")
+        raise RuntimeError("经验池为空：检查 task、chunk_len、stride 或 episode 长度。")
     return replay
 
 
+# ---------------------------------------------------------------------------
+# 训练时现场算 z_rl 与 VLA 参考动作（不写入 replay）
+# ---------------------------------------------------------------------------
+
+
 class OnlineFeatureProvider:
+    """按全局帧下标缓存：VLA token -> RL token；VLA predict 前 chunk_len 步作为 reference。"""
+
     def __init__(
         self,
         dataset: LeRobotDataset,
@@ -344,6 +338,7 @@ def train_from_batch(
     batch: List[ReplayTransition],
     apply_ref_mask: bool = True,
 ) -> Dict[str, float]:
+    """组一个 batch：现场取 z_rl/ref，与 GT chunk 一起喂 TD3ChunkAgent.train_step。"""
     z_rl = []
     state = []
     ref = []
@@ -387,6 +382,7 @@ def warmup_train(
     batch_size: int,
     warmup_updates: int,
 ) -> List[Dict[str, float]]:
+    """从经验池随机采样，重复 warmup_updates 次梯度步。"""
     logs: List[Dict[str, float]] = []
     for step in range(warmup_updates):
         batch = replay.sample(batch_size)
@@ -404,6 +400,7 @@ def online_train_loop(
     batch_size: int,
     online_train_episodes: int,
 ) -> List[Dict[str, float]]:
+    """按 episode 轮次：每轮选一个 episode 的全部 transition 打乱后按 batch 训练。"""
     logs: List[Dict[str, float]] = []
     transitions = list(replay.buf)
     transitions_by_episode: Dict[int, List[ReplayTransition]] = defaultdict(list)
@@ -434,7 +431,8 @@ def eval_with_vla_reference(
     provider: OnlineFeatureProvider,
     max_eval_samples: int = 256,
 ) -> Dict[str, float]:
-    selected = list(replay.buf)[: max_eval_samples]
+    """对比 TD3 输出与数据 GT、与 VLA reference 的 MSE，并估 Q 均值。"""
+    selected = list(replay.buf)[:max_eval_samples]
     mse_vals = []
     mae_vals = []
     l2_vals = []
@@ -454,7 +452,7 @@ def eval_with_vla_reference(
         ref_mse_vals.append(F.mse_loss(ref_chunk.to(agent.device), gt).item())
 
     if not mse_vals:
-        raise RuntimeError("No evaluation samples available.")
+        raise RuntimeError("没有可用于评估的样本。")
     return {
         "mse": float(np.mean(mse_vals)),
         "mae": float(np.mean(mae_vals)),
@@ -464,9 +462,10 @@ def eval_with_vla_reference(
     }
 
 
-def export_q_logs(logs: List[Dict[str, float]], output_dir: Path) -> None:
+def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str = "q_curve") -> None:
+    """把训练日志写 CSV；若装了 matplotlib 再画一张 Q 曲线图。"""
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "q_curve.csv"
+    csv_path = output_dir / f"{base_name}.csv"
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -503,46 +502,214 @@ def export_q_logs(logs: List[Dict[str, float]], output_dir: Path) -> None:
         plt.ylabel("Q Value")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(output_dir / "q_curve.png", dpi=150)
+        plt.savefig(output_dir / f"{base_name}.png", dpi=150)
         plt.close()
     except Exception as exc:
-        print(f"[warn] q_curve.png not generated: {exc}")
+        print(f"[warn] 未生成 {base_name}.png: {exc}")
 
 
-def run_online_td3_sim(args) -> Dict[str, float]:
+def save_td3_agent(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
+    """保存 actor/critic 与 TD3 超参，便于 --load-agent 续跑。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rl_token_dim = cfg.raw_config.get("model", {}).get("rl_token", {}).get("rl_token_dim", 256)
+    c = TD3ChunkConfig(
+        gamma=args.gamma,
+        tau=args.tau,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        policy_noise=args.policy_noise,
+        noise_clip=args.noise_clip,
+        policy_delay=args.policy_delay,
+        fixed_std=args.actor_std,
+        max_action=args.max_action,
+        ref_mask_prob=args.ref_mask_prob,
+        hidden_dims=[args.hidden_dim, args.hidden_dim],
+    )
+    meta = {
+        "rl_token_dim": rl_token_dim,
+        "state_dim": cfg.state_dim,
+        "action_dim": cfg.action_dim,
+        "chunk_size": args.chunk_len,
+        "td3_cfg": {
+            "gamma": c.gamma,
+            "tau": c.tau,
+            "actor_lr": c.actor_lr,
+            "critic_lr": c.critic_lr,
+            "policy_noise": c.policy_noise,
+            "noise_clip": c.noise_clip,
+            "policy_delay": c.policy_delay,
+            "fixed_std": c.fixed_std,
+            "max_action": c.max_action,
+            "ref_mask_prob": c.ref_mask_prob,
+            "hidden_dims": c.hidden_dims,
+        },
+    }
+    torch.save(
+        {
+            "meta": meta,
+            "actor": agent.actor.state_dict(),
+            "actor_target": agent.actor_target.state_dict(),
+            "critic": agent.critic.state_dict(),
+            "critic_target": agent.critic_target.state_dict(),
+            "total_updates": int(agent.total_updates),
+        },
+        path,
+    )
+    print(f"已保存 TD3 权重: {path}")
+
+
+def load_td3_agent(path: Path, device: torch.device) -> TD3ChunkAgent:
+    """从 save_td3_agent 写出的文件恢复 TD3ChunkAgent。"""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        payload = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
+    meta = payload["meta"]
+    td3_cfg = TD3ChunkConfig(**meta["td3_cfg"])
+    agent = TD3ChunkAgent(
+        rl_token_dim=int(meta["rl_token_dim"]),
+        state_dim=int(meta["state_dim"]),
+        action_dim=int(meta["action_dim"]),
+        chunk_size=int(meta["chunk_size"]),
+        cfg=td3_cfg,
+        device=device,
+    )
+    agent.actor.load_state_dict(payload["actor"])
+    agent.actor_target.load_state_dict(payload["actor_target"])
+    agent.critic.load_state_dict(payload["critic"])
+    agent.critic_target.load_state_dict(payload["critic_target"])
+    agent.total_updates = int(payload.get("total_updates", 0))
+    print(f"已加载 TD3 权重: {path}, total_updates={agent.total_updates}")
+    return agent
+
+
+# ---------------------------------------------------------------------------
+# 入口：按 --step 分支，每段内顺序写清（少套一层函数名）
+# ---------------------------------------------------------------------------
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="LeRobot 上 TD3 模拟在线训练")
+    p.add_argument(
+        "--step",
+        type=str,
+        default="full",
+        choices=("dataset", "models", "replay", "warmup", "online", "eval", "full"),
+        help="分步调试或 full 全流程",
+    )
+    p.add_argument("--save-agent", type=str, default=None, help="保存 TD3 权重路径（.pt）")
+    p.add_argument("--load-agent", type=str, default=None, help="加载已有 TD3 权重")
+    p.add_argument("--config", type=str, default="config.yaml")
+    p.add_argument("--dataset", type=str, default="./dataset/libero_object")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--task-index", type=int, default=0)
+    p.add_argument("--chunk-len", type=int, default=10)
+    p.add_argument("--stride", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--replay-capacity", type=int, default=200000)
+    p.add_argument("--warmup-updates", type=int, default=0)
+    p.add_argument("--online-train-episodes", type=int, default=400)
+    p.add_argument("--max-eval-samples", type=int, default=256)
+    p.add_argument("--vla-checkpoint", type=str, default="./checkpoints/checkpoint_step_100000.pt")
+    p.add_argument("--rl-checkpoint", type=str, default="./checkpoints/rl_token/rl_token_step_10000.pt")
+    p.add_argument("--output-dir", type=str, default="./checkpoints/td3_sim")
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--actor-lr", type=float, default=1e-4)
+    p.add_argument("--critic-lr", type=float, default=1e-3)
+    p.add_argument("--policy-noise", type=float, default=0.2)
+    p.add_argument("--noise-clip", type=float, default=0.5)
+    p.add_argument("--policy-delay", type=int, default=2)
+    p.add_argument("--actor-std", type=float, default=0.1)
+    p.add_argument("--max-action", type=float, default=1.0)
+    p.add_argument("--ref-mask-prob", type=float, default=0.5)
+    p.add_argument("--hidden-dim", type=int, default=256)
+    return p
+
+
+def _execute(args: argparse.Namespace) -> None:
+    """根据 args.step 执行对应阶段（所有分支集中在此，避免再套一层 run_step_*）。"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir = Path(args.output_dir)
+
+    # ---------- 只检查数据：task 对应哪些 episode，写 json ----------
+    if args.step == "dataset":
+        set_seed(args.seed)
+        cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
+        full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
+        selected = collect_task_episode_ids(full_ds, args.task_index)
+        sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
+        print(
+            f"[dataset] task_index={args.task_index}, episodes={len(selected)}, len(sub_ds)={len(sub_ds)}"
+        )
+        if len(sub_ds) > 0:
+            keys = sorted(sub_ds[0].keys())
+            print(f"[dataset] 首帧字段示例: {keys[:24]}{'...' if len(keys) > 24 else ''}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ep_path = out_dir / "selected_episodes.json"
+        with open(ep_path, "w", encoding="utf-8") as f:
+            json.dump({"task_index": args.task_index, "episodes": selected}, f, indent=2)
+        print(f"[dataset] 已写入 {ep_path}")
+        return
+
+    # ---------- 只加载 VLA + RL token，不做训练 ----------
+    if args.step == "models":
+        set_seed(args.seed)
+        cfg, _, _ = load_trained_modules(
+            args.config, args.dataset, args.vla_checkpoint, args.rl_checkpoint, device
+        )
+        print(
+            f"[models] device={device}, state_dim={cfg.state_dim}, action_dim={cfg.action_dim}, "
+            f"action_horizon={cfg.action_horizon}"
+        )
+        return
+
+    # ---------- 只构建经验池（不加载大模型）----------
+    if args.step == "replay":
+        cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
+        full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
+        selected = collect_task_episode_ids(full_ds, args.task_index)
+        sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
+        ep_map = build_episode_index(sub_ds)
+        replay = build_replay_from_dataset(
+            sub_ds,
+            ep_map,
+            cfg.state_key,
+            args.chunk_len,
+            args.stride,
+            device,
+            args.replay_capacity,
+        )
+        print(f"[replay] len(replay)={len(replay)}, state_key={cfg.state_key}")
+        tr0 = next(iter(replay.buf))
+        print(
+            f"[replay] 首条 transition: idx={tr0.sample_index}->{tr0.next_sample_index}, "
+            f"gt_chunk.shape={tuple(tr0.gt_action_chunk.shape)}"
+        )
+        return
+
+    # 以下步骤需要 VLA + RL + 子集数据 + 经验池；先统一准备好 cfg / 模型 / replay / provider 所需的数据集
     set_seed(args.seed)
-
     cfg, vla_model, rl_encoder = load_trained_modules(
-        config_path=args.config,
-        dataset_path=args.dataset,
-        vla_checkpoint=args.vla_checkpoint,
-        rl_checkpoint=args.rl_checkpoint,
-        device=device,
+        args.config, args.dataset, args.vla_checkpoint, args.rl_checkpoint, device
     )
-    full_dataset = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
-    selected_episodes = collect_task_episode_ids(full_dataset, args.task_index)
-    dataset = load_lerobot_dataset(
-        Path(args.dataset),
-        cfg.action_horizon,
-        episodes=selected_episodes,
-    )
-    episode_map = build_episode_index(dataset)
+    full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
+    selected = collect_task_episode_ids(full_ds, args.task_index)
+    sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
+    ep_map = build_episode_index(sub_ds)
     replay = build_replay_from_dataset(
-        dataset=dataset,
-        episode_to_indices=episode_map,
-        state_key=cfg.state_key,
-        chunk_len=args.chunk_len,
-        stride=args.stride,
-        device=device,
-        capacity=args.replay_capacity,
+        sub_ds,
+        ep_map,
+        cfg.state_key,
+        args.chunk_len,
+        args.stride,
+        device,
+        args.replay_capacity,
     )
-    print(
-        f"task_index={args.task_index}, selected_episodes={len(selected_episodes)}, "
-        f"dataset_episodes={len(episode_map)}, "
-        f"replay_size={len(replay)}, chunk_len={args.chunk_len}, stride={args.stride}"
-    )
-
     rl_token_dim = cfg.raw_config.get("model", {}).get("rl_token", {}).get("rl_token_dim", 256)
     td3_cfg = TD3ChunkConfig(
         gamma=args.gamma,
@@ -557,87 +724,105 @@ def run_online_td3_sim(args) -> Dict[str, float]:
         ref_mask_prob=args.ref_mask_prob,
         hidden_dims=[args.hidden_dim, args.hidden_dim],
     )
-    agent = TD3ChunkAgent(
-        rl_token_dim=rl_token_dim,
-        state_dim=cfg.state_dim,
-        action_dim=cfg.action_dim,
-        chunk_size=args.chunk_len,
-        cfg=td3_cfg,
-        device=device,
-    )
-
     provider = OnlineFeatureProvider(
-        dataset=dataset,
-        image_keys=cfg.image_keys,
-        state_key=cfg.state_key,
-        vla_model=vla_model,
-        rl_encoder=rl_encoder,
-        device=device,
-        chunk_len=args.chunk_len,
+        sub_ds,
+        cfg.image_keys,
+        cfg.state_key,
+        vla_model,
+        rl_encoder,
+        device,
+        args.chunk_len,
     )
-
     default_warmup = max(1, int(np.ceil(len(replay) / max(args.batch_size, 1))))
-    warmup_updates = args.warmup_updates if args.warmup_updates > 0 else default_warmup
-    print(f"warmup_updates={warmup_updates}, online_train_episodes={args.online_train_episodes}")
+    warmup_n = args.warmup_updates if args.warmup_updates > 0 else default_warmup
 
-    all_logs = []
-    all_logs.extend(warmup_train(agent, replay, provider, args.batch_size, warmup_updates))
-    all_logs.extend(
-        online_train_loop(
-            agent=agent,
-            replay=replay,
-            provider=provider,
-            batch_size=args.batch_size,
-            online_train_episodes=args.online_train_episodes,
+    # ---------- 只 warmup ----------
+    if args.step == "warmup":
+        print(
+            f"[warmup] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
+            f"warmup_updates={warmup_n}"
         )
-    )
-    export_q_logs(all_logs, Path(args.output_dir))
-    metrics = eval_with_vla_reference(agent, replay, provider, max_eval_samples=args.max_eval_samples)
-    print(
-        "eval metrics: "
-        f"mse={metrics['mse']:.6f}, mae={metrics['mae']:.6f}, "
-        f"mean_l2_per_step={metrics['mean_l2_per_step']:.6f}, "
-        f"ref_mse={metrics['ref_mse']:.6f}, eval_q_mean={metrics['eval_q_mean']:.6f}"
-    )
-    return metrics
+        agent = TD3ChunkAgent(
+            rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
+        )
+        logs = warmup_train(agent, replay, provider, args.batch_size, warmup_n)
+        export_q_logs(logs, out_dir, base_name="q_curve_warmup")
+        if args.save_agent:
+            save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        return
 
+    # ---------- 只 online（无权重则先在同进程里 warmup 一遍）----------
+    if args.step == "online":
+        if args.load_agent:
+            agent = load_td3_agent(Path(args.load_agent), device)
+        else:
+            print("[online] 未指定 --load-agent，先随机初始化并执行 warmup")
+            agent = TD3ChunkAgent(
+                rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
+            )
+            warmup_train(agent, replay, provider, args.batch_size, warmup_n)
+        logs = online_train_loop(
+            agent, replay, provider, args.batch_size, args.online_train_episodes
+        )
+        export_q_logs(logs, out_dir, base_name="q_curve_online")
+        if args.save_agent:
+            save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        return
 
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Simulated online TD3 training with LeRobot data")
-    parser.add_argument("--config", type=str, default="config.yaml")
-    parser.add_argument("--dataset", type=str, default="./dataset/libero_object")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--task-index", type=int, default=0)
-    parser.add_argument("--chunk-len", type=int, default=10)
-    parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=200000)
-    parser.add_argument("--warmup-updates", type=int, default=0)
-    parser.add_argument("--online-train-episodes", type=int, default=400)
-    parser.add_argument("--max-eval-samples", type=int, default=256)
+    # ---------- 只评估 ----------
+    if args.step == "eval":
+        if args.load_agent:
+            agent = load_td3_agent(Path(args.load_agent), device)
+        else:
+            print("[eval] 未指定 --load-agent，使用未训练的随机策略作基线对比")
+            agent = TD3ChunkAgent(
+                rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
+            )
+        metrics = eval_with_vla_reference(agent, replay, provider, args.max_eval_samples)
+        print(
+            f"[eval] mse={metrics['mse']:.6f} mae={metrics['mae']:.6f} "
+            f"l2={metrics['mean_l2_per_step']:.6f} ref_mse={metrics['ref_mse']:.6f} "
+            f"q_mean={metrics['eval_q_mean']:.6f}"
+        )
+        return
 
-    parser.add_argument("--vla-checkpoint", type=str, default="./checkpoints/checkpoint_step_100000.pt")
-    parser.add_argument("--rl-checkpoint", type=str, default="./checkpoints/rl_token/rl_token_step_10000.pt")
-    parser.add_argument("--output-dir", type=str, default="./checkpoints/td3_sim")
+    # ---------- 全流程：warmup -> online -> 评估 -> 可选存盘 ----------
+    if args.step == "full":
+        print(
+            f"[full] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
+            f"warmup={warmup_n}, online_ep={args.online_train_episodes}"
+        )
+        agent = TD3ChunkAgent(
+            rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
+        )
+        all_logs: List[Dict[str, float]] = []
+        all_logs.extend(warmup_train(agent, replay, provider, args.batch_size, warmup_n))
+        all_logs.extend(
+            online_train_loop(agent, replay, provider, args.batch_size, args.online_train_episodes)
+        )
+        export_q_logs(all_logs, out_dir, base_name="q_curve")
+        metrics = eval_with_vla_reference(agent, replay, provider, args.max_eval_samples)
+        print(
+            f"[full] mse={metrics['mse']:.6f} mae={metrics['mae']:.6f} "
+            f"l2={metrics['mean_l2_per_step']:.6f} ref_mse={metrics['ref_mse']:.6f} "
+            f"q_mean={metrics['eval_q_mean']:.6f}"
+        )
+        if args.save_agent:
+            save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        return
 
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--critic-lr", type=float, default=1e-3)
-    parser.add_argument("--policy-noise", type=float, default=0.2)
-    parser.add_argument("--noise-clip", type=float, default=0.5)
-    parser.add_argument("--policy-delay", type=int, default=2)
-    parser.add_argument("--actor-std", type=float, default=0.1)
-    parser.add_argument("--max-action", type=float, default=1.0)
-    parser.add_argument("--ref-mask-prob", type=float, default=0.5)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    return parser
+    raise RuntimeError(f"未知 step: {args.step}")
 
 
 def main():
-    parser = build_argparser()
-    args = parser.parse_args()
-    run_online_td3_sim(args)
+    _execute(build_argparser().parse_args())
+
+
+def run_online_td3_sim(args: argparse.Namespace) -> None:
+    """兼容旧接口：强制跑完整流程（等同 --step full）。"""
+    args = argparse.Namespace(**vars(args))
+    args.step = "full"
+    _execute(args)
 
 
 if __name__ == "__main__":
