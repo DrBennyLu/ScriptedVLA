@@ -126,10 +126,11 @@ training:
   # 在线 RL（online_rl_td3.py）
   online_rl:
     td3:
-      episodes: 100
+      # 兼容 online_rl_td3.py
+      episodes: 400
       start_steps: 1000
-      batch_size: 128
-      buffer_size: 100000
+      batch_size: 32
+      buffer_size: 200000
       gamma: 0.99
       tau: 0.005
       actor_lr: 1e-4
@@ -140,7 +141,24 @@ training:
       policy_delay: 2
       explore_noise: 0.1
       max_action: 1.0
-      save_dir: "./checkpoints/td3"
+
+      # test/test_online_td3_sim.py 默认参数
+      chunk_len: 10
+      stride: 2
+      replay_capacity: 200000
+      warmup_updates: 0              # 0 表示自动按 ceil(len(replay)/batch_size)
+      warmup_update_ratio: 3
+      online_train_episodes: 400
+      max_eval_samples: 256
+
+      vla_checkpoint: "./checkpoints/checkpoint_step_100000.pt"
+      rl_checkpoint: "./checkpoints/rl_token/rl_token_step_10000.pt"
+      output_dir: "./checkpoints/td3_agent"
+
+      actor_std: 0.1
+      ref_mask_prob: 0.5
+      policy_constraint_beta: 0.1
+      use_chunk_return_target: true
 
 # 数据集配置（LeRobot格式）
 dataset:

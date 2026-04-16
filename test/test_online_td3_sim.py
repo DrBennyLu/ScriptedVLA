@@ -301,6 +301,7 @@ class ReplayTransition:
     next_state: torch.Tensor
     gt_action_chunk: torch.Tensor
     reward: float
+    chunk_return: float
     done: float
 
 
@@ -401,6 +402,7 @@ def build_replay_from_dataset(
     state_key: str,
     chunk_len: int,
     stride: int,
+    gamma: float,
     device: torch.device,
     capacity: int,
 ) -> ReplayBuffer:
@@ -442,6 +444,14 @@ def build_replay_from_dataset(
             next_state = next_sample[state_key] if state_key in next_sample else state
             terminal = 1.0 if local_start + stride >= len(indices) - 1 else 0.0
             reward = 1.0 if terminal > 0.5 else 0.0
+            # chunk 回报：chunk 内若覆盖到 episode 最后一步，则奖励折扣到对应相对位置
+            episode_last_local = len(indices) - 1
+            chunk_end_local = min(local_start + chunk_len - 1, episode_last_local)
+            if local_start <= episode_last_local <= chunk_end_local:
+                reward_step_offset = episode_last_local - local_start
+                chunk_return = float((gamma ** reward_step_offset) * 1.0)
+            else:
+                chunk_return = 0.0
             replay.add(
                 ReplayTransition(
                     sample_index=current_idx,
@@ -451,6 +461,7 @@ def build_replay_from_dataset(
                     next_state=next_state.to(device=device, dtype=torch.float32).detach().cpu(),
                     gt_action_chunk=action_chunk.detach().cpu(),
                     reward=reward,
+                    chunk_return=chunk_return,
                     done=terminal,
                 )
             )
@@ -517,7 +528,12 @@ class OnlineFeatureProvider:
         """
         if sample_index in self.cache:
             z_rl, ref_chunk, state = self.cache[sample_index]
-            return z_rl.clone(), ref_chunk.clone(), state.clone()
+            # 缓存里存的是 CPU 张量；返回前统一搬到目标设备，避免 batch 内出现 CPU/CUDA 混合
+            return (
+                z_rl.clone().to(self.device),
+                ref_chunk.clone().to(self.device),
+                state.clone().to(self.device),
+            )
 
         sample = self.dataset[sample_index]
         inputs = build_single_input(sample, self.image_keys, self.state_key, self.device)
@@ -556,6 +572,7 @@ def train_from_batch(
     ref = []
     action = []
     reward = []
+    chunk_return = []
     next_z_rl = []
     next_state = []
     next_ref = []
@@ -568,6 +585,7 @@ def train_from_batch(
         ref.append(curr_ref.squeeze(0))
         action.append(tr.gt_action_chunk)
         reward.append([tr.reward])
+        chunk_return.append([tr.chunk_return])
         next_z_rl.append(nxt_z.squeeze(0))
         next_state.append(nxt_state.squeeze(0))
         next_ref.append(nxt_ref.squeeze(0))
@@ -579,6 +597,7 @@ def train_from_batch(
         ref_actions=torch.stack(ref, dim=0),
         action=torch.stack(action, dim=0).to(agent.device),
         reward=torch.tensor(reward, dtype=torch.float32, device=agent.device),
+        chunk_return=torch.tensor(chunk_return, dtype=torch.float32, device=agent.device),
         next_z_rl=torch.stack(next_z_rl, dim=0),
         next_state=torch.stack(next_state, dim=0),
         next_ref_actions=torch.stack(next_ref, dim=0),
@@ -593,6 +612,7 @@ def warmup_train(
     provider: OnlineFeatureProvider,
     batch_size: int,
     warmup_updates: int,
+    warmup_update_ratio: int,
 ) -> List[Dict[str, float]]:
     """
     warmup 阶段训练循环。
@@ -607,14 +627,19 @@ def warmup_train(
     Returns:
         List[Dict[str, float]]: 每步训练日志。
     """
-    print(f"[warmup] 开始 warmup 训练，共 {warmup_updates} 次更新...")
+    print(
+        f"[warmup] 开始 warmup 训练，共 {warmup_updates} 次外层更新，"
+        f"每次更新内梯度步数 G={warmup_update_ratio}..."
+    )
     logs: List[Dict[str, float]] = []
     for step in tqdm(range(warmup_updates), desc="warmup_updates", leave=False):
-        batch = replay.sample(batch_size)
-        metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
-        metrics["phase"] = "warmup"
-        metrics["step"] = float(step + 1)
-        logs.append(metrics)
+        for g in range(warmup_update_ratio):
+            batch = replay.sample(batch_size)
+            metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
+            metrics["phase"] = "warmup"
+            metrics["step"] = float(step + 1)
+            metrics["warmup_inner_g"] = float(g + 1)
+            logs.append(metrics)
     return logs
 
 
@@ -733,7 +758,20 @@ def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["phase", "step", "episode", "q1_mean", "q2_mean", "target_q_mean", "critic_loss", "actor_loss"],
+            fieldnames=[
+                "phase",
+                "step",
+                "episode",
+                "warmup_inner_g",
+                "q1_mean",
+                "q2_mean",
+                "target_q_mean",
+                "chunk_return_mean",
+                "critic_loss",
+                "actor_loss",
+                "actor_constraint_loss",
+                "pred_vs_ref_mse",
+            ],
         )
         writer.writeheader()
         for row in logs:
@@ -742,11 +780,15 @@ def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str
                     "phase": row.get("phase", ""),
                     "step": row.get("step", ""),
                     "episode": row.get("episode", ""),
+                    "warmup_inner_g": row.get("warmup_inner_g", ""),
                     "q1_mean": row.get("q1_mean", ""),
                     "q2_mean": row.get("q2_mean", ""),
                     "target_q_mean": row.get("target_q_mean", ""),
+                    "chunk_return_mean": row.get("chunk_return_mean", ""),
                     "critic_loss": row.get("critic_loss", ""),
                     "actor_loss": row.get("actor_loss", ""),
+                    "actor_constraint_loss": row.get("actor_constraint_loss", ""),
+                    "pred_vs_ref_mse": row.get("pred_vs_ref_mse", ""),
                 }
             )
 
@@ -799,6 +841,8 @@ def save_td3_agent(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
         fixed_std=args.actor_std,
         max_action=args.max_action,
         ref_mask_prob=args.ref_mask_prob,
+        policy_constraint_beta=args.policy_constraint_beta,
+        use_chunk_return_target=args.use_chunk_return_target,
         hidden_dims=[args.hidden_dim, args.hidden_dim],
     )
     meta = {
@@ -817,6 +861,8 @@ def save_td3_agent(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
             "fixed_std": c.fixed_std,
             "max_action": c.max_action,
             "ref_mask_prob": c.ref_mask_prob,
+            "policy_constraint_beta": c.policy_constraint_beta,
+            "use_chunk_return_target": c.use_chunk_return_target,
             "hidden_dims": c.hidden_dims,
         },
     }
@@ -876,7 +922,7 @@ def load_td3_agent(path: Path, device: torch.device) -> TD3ChunkAgent:
 # ---------------------------------------------------------------------------
 
 
-def build_argparser() -> argparse.ArgumentParser:
+def build_argparser(td3_defaults: Dict) -> argparse.ArgumentParser:
     """
     构建命令行参数解析器。
 
@@ -897,27 +943,34 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", type=str, default="./dataset/libero_object")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--task-index", type=int, default=0)
-    p.add_argument("--chunk-len", type=int, default=10)
-    p.add_argument("--stride", type=int, default=2)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--replay-capacity", type=int, default=200000)
-    p.add_argument("--warmup-updates", type=int, default=0)
-    p.add_argument("--online-train-episodes", type=int, default=400)
-    p.add_argument("--max-eval-samples", type=int, default=256)
-    p.add_argument("--vla-checkpoint", type=str, default="./checkpoints/checkpoint_step_100000.pt")
-    p.add_argument("--rl-checkpoint", type=str, default="./checkpoints/rl_token/rl_token_step_10000.pt")
-    p.add_argument("--output-dir", type=str, default="./checkpoints/td3_sim")
-    p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--tau", type=float, default=0.005)
-    p.add_argument("--actor-lr", type=float, default=1e-4)
-    p.add_argument("--critic-lr", type=float, default=1e-3)
-    p.add_argument("--policy-noise", type=float, default=0.2)
-    p.add_argument("--noise-clip", type=float, default=0.5)
-    p.add_argument("--policy-delay", type=int, default=2)
-    p.add_argument("--actor-std", type=float, default=0.1)
-    p.add_argument("--max-action", type=float, default=1.0)
-    p.add_argument("--ref-mask-prob", type=float, default=0.5)
-    p.add_argument("--hidden-dim", type=int, default=256)
+    p.add_argument("--chunk-len", type=int, default=td3_defaults["chunk_len"])
+    p.add_argument("--stride", type=int, default=td3_defaults["stride"])
+    p.add_argument("--batch-size", type=int, default=td3_defaults["batch_size"])
+    p.add_argument("--replay-capacity", type=int, default=td3_defaults["replay_capacity"])
+    p.add_argument("--warmup-updates", type=int, default=td3_defaults["warmup_updates"])
+    p.add_argument("--warmup-update-ratio", type=int, default=td3_defaults["warmup_update_ratio"])
+    p.add_argument("--online-train-episodes", type=int, default=td3_defaults["online_train_episodes"])
+    p.add_argument("--max-eval-samples", type=int, default=td3_defaults["max_eval_samples"])
+    p.add_argument("--vla-checkpoint", type=str, default=td3_defaults["vla_checkpoint"])
+    p.add_argument("--rl-checkpoint", type=str, default=td3_defaults["rl_checkpoint"])
+    p.add_argument("--output-dir", type=str, default=td3_defaults["output_dir"])
+    p.add_argument("--gamma", type=float, default=td3_defaults["gamma"])
+    p.add_argument("--tau", type=float, default=td3_defaults["tau"])
+    p.add_argument("--actor-lr", type=float, default=td3_defaults["actor_lr"])
+    p.add_argument("--critic-lr", type=float, default=td3_defaults["critic_lr"])
+    p.add_argument("--policy-noise", type=float, default=td3_defaults["policy_noise"])
+    p.add_argument("--noise-clip", type=float, default=td3_defaults["noise_clip"])
+    p.add_argument("--policy-delay", type=int, default=td3_defaults["policy_delay"])
+    p.add_argument("--actor-std", type=float, default=td3_defaults["actor_std"])
+    p.add_argument("--max-action", type=float, default=td3_defaults["max_action"])
+    p.add_argument("--ref-mask-prob", type=float, default=td3_defaults["ref_mask_prob"])
+    p.add_argument("--policy-constraint-beta", type=float, default=td3_defaults["policy_constraint_beta"])
+    p.add_argument(
+        "--use-chunk-return-target",
+        action=argparse.BooleanOptionalAction,
+        default=td3_defaults["use_chunk_return_target"],
+    )
+    p.add_argument("--hidden-dim", type=int, default=td3_defaults["hidden_dim"])
     return p
 
 
@@ -932,7 +985,11 @@ def _execute(args: argparse.Namespace) -> None:
         None.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 只调用一次 load_script_config
+    cfg_once = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
+
     out_dir = Path(args.output_dir)
+    warmup_ckpt_path = out_dir / "warmup_agent.pt"
     print("=" * 80)
     print(f"[main] 启动脚本，step={args.step}, device={device}")
     print("=" * 80)
@@ -941,7 +998,7 @@ def _execute(args: argparse.Namespace) -> None:
     if args.step == "dataset":
         print("[main] 当前任务：仅检查数据集与 task 对应 episode 列表")
         set_seed(args.seed)
-        cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
+        cfg = cfg_once
         full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
         selected = collect_task_episode_ids(full_ds, args.task_index)
         sub_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon, episodes=selected)
@@ -956,6 +1013,7 @@ def _execute(args: argparse.Namespace) -> None:
         with open(ep_path, "w", encoding="utf-8") as f:
             json.dump({"task_index": args.task_index, "episodes": selected}, f, indent=2)
         print(f"[dataset] 已写入 {ep_path}")
+        print("[dataset] ✅ 测试成功：数据集与 episode 切片检查完成")
         return
 
     # ---------- 只加载 VLA + RL token，不做训练 ----------
@@ -969,12 +1027,13 @@ def _execute(args: argparse.Namespace) -> None:
             f"[models] device={device}, state_dim={cfg.state_dim}, action_dim={cfg.action_dim}, "
             f"action_horizon={cfg.action_horizon}"
         )
+        print("[models] ✅ 测试成功：模型与权重加载完成")
         return
 
     # ---------- 只构建经验池（不加载大模型）----------
     if args.step == "replay":
         print("[main] 当前任务：仅构建 ReplayBuffer")
-        cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
+        cfg = cfg_once
         dataset_path_obj = Path(args.dataset).resolve()
         info_file = dataset_path_obj / "meta" / "info.json"
         if not info_file.exists():
@@ -1036,6 +1095,7 @@ def _execute(args: argparse.Namespace) -> None:
             cfg.state_key,
             args.chunk_len,
             args.stride,
+            args.gamma,
             device,
             args.replay_capacity,
         )
@@ -1045,6 +1105,7 @@ def _execute(args: argparse.Namespace) -> None:
             f"[replay] 首条 transition: idx={tr0.sample_index}->{tr0.next_sample_index}, "
             f"gt_chunk.shape={tuple(tr0.gt_action_chunk.shape)}"
         )
+        print(f"[replay] ✅ 测试成功：ReplayBuffer 构建完成，样本数={len(replay)}")
         return
 
     # 以下步骤需要 VLA + RL + 子集数据 + 经验池；先统一准备好 cfg / 模型 / replay / provider 所需的数据集
@@ -1114,6 +1175,7 @@ def _execute(args: argparse.Namespace) -> None:
         cfg.state_key,
         args.chunk_len,
         args.stride,
+        args.gamma,
         device,
         args.replay_capacity,
     )
@@ -1129,6 +1191,8 @@ def _execute(args: argparse.Namespace) -> None:
         fixed_std=args.actor_std,
         max_action=args.max_action,
         ref_mask_prob=args.ref_mask_prob,
+        policy_constraint_beta=args.policy_constraint_beta,
+        use_chunk_return_target=args.use_chunk_return_target,
         hidden_dims=[args.hidden_dim, args.hidden_dim],
     )
     provider = OnlineFeatureProvider(
@@ -1153,10 +1217,14 @@ def _execute(args: argparse.Namespace) -> None:
         agent = TD3ChunkAgent(
             rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
         )
-        logs = warmup_train(agent, replay, provider, args.batch_size, warmup_n)
+        logs = warmup_train(agent, replay, provider, args.batch_size, warmup_n, args.warmup_update_ratio)
         export_q_logs(logs, out_dir, base_name="q_curve_warmup")
+        # warmup 结束后默认保存一份固定权重，供后续 online/eval 直接加载
+        save_td3_agent(warmup_ckpt_path, agent, args, cfg)
         if args.save_agent:
             save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        print(f"[warmup] ✅ 测试成功：warmup 完成，更新步数={len(logs)}")
+        print(f"[warmup] 已保存默认 warmup 权重: {warmup_ckpt_path}")
         return
 
     # ---------- 只 online（无权重则先在同进程里 warmup 一遍）----------
@@ -1164,18 +1232,26 @@ def _execute(args: argparse.Namespace) -> None:
         print("[main] 当前任务：执行 online 训练")
         if args.load_agent:
             agent = load_td3_agent(Path(args.load_agent), device)
+        elif warmup_ckpt_path.exists():
+            print(f"[online] 使用默认 warmup 权重: {warmup_ckpt_path}")
+            agent = load_td3_agent(warmup_ckpt_path, device)
         else:
-            print("[online] 未指定 --load-agent，先随机初始化并执行 warmup")
+            print("[online] 未找到 warmup 权重，先执行一次 warmup 并保存默认权重")
             agent = TD3ChunkAgent(
                 rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
             )
-            warmup_train(agent, replay, provider, args.batch_size, warmup_n)
+            warmup_train(agent, replay, provider, args.batch_size, warmup_n, args.warmup_update_ratio)
+            save_td3_agent(warmup_ckpt_path, agent, args, cfg)
         logs = online_train_loop(
             agent, replay, provider, args.batch_size, args.online_train_episodes
         )
         export_q_logs(logs, out_dir, base_name="q_curve_online")
         if args.save_agent:
             save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        print(
+            f"[online] ✅ 测试成功：online 训练完成，episode={args.online_train_episodes}，"
+            f"更新步数={len(logs)}"
+        )
         return
 
     # ---------- 只评估 ----------
@@ -1183,10 +1259,13 @@ def _execute(args: argparse.Namespace) -> None:
         print("[main] 当前任务：执行评估")
         if args.load_agent:
             agent = load_td3_agent(Path(args.load_agent), device)
+        elif warmup_ckpt_path.exists():
+            print(f"[eval] 使用默认 warmup 权重: {warmup_ckpt_path}")
+            agent = load_td3_agent(warmup_ckpt_path, device)
         else:
-            print("[eval] 未指定 --load-agent，使用未训练的随机策略作基线对比")
-            agent = TD3ChunkAgent(
-                rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
+            raise FileNotFoundError(
+                f"[eval] 未找到可用权重：{warmup_ckpt_path}。"
+                "请先执行 --step warmup，或通过 --load-agent 指定权重文件。"
             )
         metrics = eval_with_vla_reference(agent, replay, provider, args.max_eval_samples)
         print(
@@ -1194,6 +1273,7 @@ def _execute(args: argparse.Namespace) -> None:
             f"l2={metrics['mean_l2_per_step']:.6f} ref_mse={metrics['ref_mse']:.6f} "
             f"q_mean={metrics['eval_q_mean']:.6f}"
         )
+        print("[eval] ✅ 测试成功：评估完成")
         return
 
     # ---------- 全流程：warmup -> online -> 评估 -> 可选存盘 ----------
@@ -1207,7 +1287,9 @@ def _execute(args: argparse.Namespace) -> None:
             rl_token_dim, cfg.state_dim, cfg.action_dim, args.chunk_len, td3_cfg, device
         )
         all_logs: List[Dict[str, float]] = []
-        all_logs.extend(warmup_train(agent, replay, provider, args.batch_size, warmup_n))
+        all_logs.extend(
+            warmup_train(agent, replay, provider, args.batch_size, warmup_n, args.warmup_update_ratio)
+        )
         all_logs.extend(
             online_train_loop(agent, replay, provider, args.batch_size, args.online_train_episodes)
         )
@@ -1220,6 +1302,9 @@ def _execute(args: argparse.Namespace) -> None:
         )
         if args.save_agent:
             save_td3_agent(Path(args.save_agent), agent, args, cfg)
+        print(
+            f"[full] ✅ 测试成功：全流程完成（warmup={warmup_n}，online_ep={args.online_train_episodes}）"
+        )
         return
 
     raise RuntimeError(f"未知 step: {args.step}")
@@ -1232,7 +1317,15 @@ def main():
     Returns:
         None.
     """
-    _execute(build_argparser().parse_args())
+    # 先解析 --config，再用 config 里的 online_rl.td3 直接作为 argparse 默认值
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default="config.yaml")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    cfg_for_defaults = load_script_config(pre_args.config)
+    td3_defaults = cfg_for_defaults.raw_config["training"]["online_rl"]["td3"]
+
+    _execute(build_argparser(td3_defaults).parse_args())
 
 
 def run_online_td3_sim(args: argparse.Namespace) -> None:
@@ -1254,7 +1347,10 @@ if __name__ == "__main__":
     """
     测试流程：
     python -m test.test_online_td3_sim --step dataset --dataset ./dataset/libero_object
-    
-    
+    python -m test.test_online_td3_sim --step models
+    python -m test.test_online_td3_sim --step replay
+
+    python -m test.test_online_td3_sim --step warmup --save-agent ./checkpoints/agent/agent.pt
+
     """
     main()
