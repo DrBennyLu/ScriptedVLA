@@ -29,6 +29,7 @@ from typing import Deque, Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -44,6 +45,35 @@ from train_rl_token import create_delta_timestamps
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    class LeRobotDatasetSubset(LeRobotDataset):
+        """
+        LeRobotDataset 子类：
+        修复 episodes 传入子集时，内部以原始 episode_index 查询导致的索引不一致问题。
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # 提前构建映射，避免每次 index() 线性查找
+            self._episode_pos_map = None
+            if self.episodes is not None:
+                self._episode_pos_map = {int(ep): i for i, ep in enumerate(self.episodes)}
+
+        def _get_query_indices(self, idx: int, ep_idx: int):
+            """
+            修正子集 episode 下标映射后，再调用父类查询逻辑。
+
+            Args:
+                idx: 数据集中的样本索引。
+                ep_idx: 原始 episode 编号。
+
+            Returns:
+                父类 _get_query_indices 返回的索引结果。
+            """
+            if self._episode_pos_map is not None and ep_idx in self._episode_pos_map:
+                ep_idx = self._episode_pos_map[ep_idx]
+            return super()._get_query_indices(idx, ep_idx)
+
 except ImportError as exc:
     raise ImportError("请先安装 lerobot==0.3.3") from exc
 
@@ -54,6 +84,15 @@ except ImportError as exc:
 
 
 def set_seed(seed: int = 42) -> None:
+    """
+    设置随机种子，尽量保证实验可复现。
+
+    Args:
+        seed: 随机种子值。
+
+    Returns:
+        None.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -61,7 +100,15 @@ def set_seed(seed: int = 42) -> None:
 
 
 def tensor_to_pil_image(img_tensor: torch.Tensor):
-    """LeRobot 图像张量 [C,H,W] 转成 PIL RGB，供 VLA 使用。"""
+    """
+    LeRobot 图像张量 [C,H,W] 转成 PIL RGB，供 VLA 使用。
+
+    Args:
+        img_tensor: 图像张量，形状通常为 [C,H,W] 或 [1,C,H,W]。
+
+    Returns:
+        PIL.Image.Image: RGB 图像对象。
+    """
     from PIL import Image
 
     if img_tensor.dim() == 4:
@@ -83,7 +130,13 @@ def tensor_to_pil_image(img_tensor: torch.Tensor):
 def sample_task_index(sample: Dict) -> int:
     """
     从单帧样本里直接读取 task_index。
-    数据格式约定固定：sample["task_index"] 为标量张量。
+    数据格式约定固定：sample[\"task_index\"] 为标量张量。
+
+    Args:
+        sample: LeRobot 单帧样本字典。
+
+    Returns:
+        int: 当前帧所属任务编号。
     """
     return int(sample["task_index"].item())
 
@@ -91,7 +144,13 @@ def sample_task_index(sample: Dict) -> int:
 def sample_episode_index(sample: Dict) -> int:
     """
     从单帧样本里直接读取 episode_index。
-    数据格式约定固定：sample["episode_index"] 为标量张量。
+    数据格式约定固定：sample[\"episode_index\"] 为标量张量。
+
+    Args:
+        sample: LeRobot 单帧样本字典。
+
+    Returns:
+        int: 当前帧所属 episode 编号。
     """
     return int(sample["episode_index"].item())
 
@@ -102,14 +161,26 @@ def load_lerobot_dataset(
     episodes: Optional[List[int]] = None,
     repo_id: Optional[str] = None,
 ) -> LeRobotDataset:
-    """读 meta/info.json，按 fps 构造 delta_timestamps，打开 LeRobotDataset。"""
+    """
+    读 meta/info.json，按 fps 构造 delta_timestamps，打开 LeRobotDataset。
+    注意：这里统一使用 LeRobotDatasetSubset，保证 episodes 子集索引稳定。
+
+    Args:
+        dataset_path: 本地数据集路径。
+        action_horizon: 动作序列长度。
+        episodes: episode 子集列表；None 表示加载全部。
+        repo_id: 数据集名称；None 时使用目录名。
+
+    Returns:
+        LeRobotDataset: 可按索引访问的 LeRobot 数据集对象。
+    """
     info_file = dataset_path / "meta" / "info.json"
     if not info_file.exists():
         raise FileNotFoundError(f"missing info.json: {info_file}")
     with open(info_file, "r", encoding="utf-8") as f:
         info = json.load(f)
     fps = info.get("fps", 10)
-    return LeRobotDataset(
+    return LeRobotDatasetSubset(
         repo_id=repo_id or dataset_path.name,
         root=str(dataset_path),
         delta_timestamps=create_delta_timestamps(action_horizon, fps),
@@ -118,7 +189,18 @@ def load_lerobot_dataset(
 
 
 def build_single_input(sample: Dict, image_keys: List[str], state_key: str, device: torch.device) -> Dict:
-    """把一帧 LeRobot 样本转成 VLA 前向所需的 images / instructions / states。"""
+    """
+    把一帧 LeRobot 样本转成 VLA 前向所需的 inputs 字典。
+
+    Args:
+        sample: 单帧样本。
+        image_keys: 要读取的图像键列表。
+        state_key: 状态键名。
+        device: 目标设备。
+
+    Returns:
+        Dict: 包含 images / instructions / states(可选) 的输入字典。
+    """
     images = []
     for key in image_keys:
         if key not in sample:
@@ -147,7 +229,19 @@ def load_trained_modules(
     rl_checkpoint: str,
     device: torch.device,
 ):
-    """加载验证过的 VLA 权重与 RL token 编码器（项目既有逻辑）。"""
+    """
+    加载并校验 VLA 权重与 RL token 编码器。
+
+    Args:
+        config_path: 配置文件路径。
+        dataset_path: 数据集路径。
+        vla_checkpoint: VLA 权重路径。
+        rl_checkpoint: RL token 权重路径。
+        device: 目标设备。
+
+    Returns:
+        tuple: (cfg, model, rl_module)。
+    """
     ok, info = validate_checkpoint(vla_checkpoint, config_path, str(device), dataset_path=dataset_path)
     if not ok:
         raise RuntimeError(f"VLA checkpoint validation failed: {info.get('errors', [])}")
@@ -202,22 +296,65 @@ class ReplayBuffer:
     """简单 FIFO，存 transition；sample 随机抽 batch。"""
 
     def __init__(self, capacity: int):
+        """
+        初始化回放缓冲区。
+
+        Args:
+            capacity: 缓冲区最大容量。
+
+        Returns:
+            None.
+        """
         self.buf: Deque[ReplayTransition] = deque(maxlen=capacity)
 
     def add(self, transition: ReplayTransition) -> None:
+        """
+        向缓冲区写入一条 transition。
+
+        Args:
+            transition: 单条经验数据。
+
+        Returns:
+            None.
+        """
         self.buf.append(transition)
 
     def __len__(self) -> int:
+        """
+        返回当前缓冲区长度。
+
+        Returns:
+            int: 当前经验条数。
+        """
         return len(self.buf)
 
     def sample(self, batch_size: int) -> List[ReplayTransition]:
+        """
+        随机采样一个 batch。
+
+        Args:
+            batch_size: 采样数量。
+
+        Returns:
+            List[ReplayTransition]: 采样得到的经验列表。
+        """
         return random.sample(list(self.buf), min(batch_size, len(self.buf)))
 
 
 def collect_task_episode_ids(dataset: LeRobotDataset, task_index: int) -> List[int]:
-    """遍历全量数据，找出属于 task_index 的所有 episode_id。"""
+    """
+    遍历全量数据，找出属于指定 task 的 episode_id 列表。
+
+    Args:
+        dataset: LeRobot 数据集对象。
+        task_index: 目标任务编号。
+
+    Returns:
+        List[int]: 去重且排序后的 episode id 列表。
+    """
+    print(f"[dataset] 正在扫描数据集，筛选 task_index={task_index} 对应的 episode...")
     episode_ids = set()
-    for idx in range(len(dataset)):
+    for idx in tqdm(range(len(dataset)), desc="scan_task_episodes", leave=False):
         sample = dataset[idx]
         if sample_task_index(sample) != task_index:
             continue
@@ -228,7 +365,15 @@ def collect_task_episode_ids(dataset: LeRobotDataset, task_index: int) -> List[i
 
 
 def build_episode_index(dataset: LeRobotDataset) -> Dict[int, List[int]]:
-    """子集数据集上：episode_id -> 该 episode 内全局帧下标列表（已排序）。"""
+    """
+    在子集数据上构建 episode 索引映射。
+
+    Args:
+        dataset: 子集 LeRobot 数据集。
+
+    Returns:
+        Dict[int, List[int]]: episode_id -> 帧索引列表（升序）。
+    """
     episode_to_indices: Dict[int, List[int]] = defaultdict(list)
     for idx in range(len(dataset)):
         sample = dataset[idx]
@@ -250,9 +395,26 @@ def build_replay_from_dataset(
     """
     在每个 episode 内按 stride 取起点，截取 chunk_len 步动作作为监督；
     下一帧用 stride 步后的索引，done/reward 按 episode 末尾给稀疏 1。
+    Args:
+        dataset: 子集 LeRobot 数据集。
+        episode_to_indices: episode 到帧索引列表的映射。
+        state_key: 状态键名。
+        chunk_len: 每次监督使用的动作长度。
+        stride: 同 episode 内采样步长。
+        device: 张量设备。
+        capacity: ReplayBuffer 容量。
+
+    Returns:
+        ReplayBuffer: 构建完成的经验池。
     """
+    print("[replay] 正在按 episode 构建 ReplayBuffer...")
     replay = ReplayBuffer(capacity=capacity)
-    for episode_id, indices in episode_to_indices.items():
+    for episode_id, indices in tqdm(
+        episode_to_indices.items(),
+        total=len(episode_to_indices),
+        desc="build_replay",
+        leave=False,
+    ):
         if len(indices) < chunk_len + 1:
             continue
         for local_start in range(0, len(indices) - 1, stride):
@@ -303,6 +465,21 @@ class OnlineFeatureProvider:
         device: torch.device,
         chunk_len: int,
     ):
+        """
+        初始化特征提供器。
+
+        Args:
+            dataset: 子集 LeRobot 数据集。
+            image_keys: 图像键名列表。
+            state_key: 状态键名。
+            vla_model: VLA 模型实例。
+            rl_encoder: RL token 编码器实例。
+            device: 目标设备。
+            chunk_len: 参考动作长度。
+
+        Returns:
+            None.
+        """
         self.dataset = dataset
         self.image_keys = image_keys
         self.state_key = state_key
@@ -314,6 +491,18 @@ class OnlineFeatureProvider:
 
     @torch.no_grad()
     def get(self, sample_index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        根据样本索引返回 (z_rl, ref_chunk, state)，并使用缓存减少重复计算。
+
+        Args:
+            sample_index: 数据集样本索引。
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor]:
+                z_rl: [1, rl_dim]
+                ref_chunk: [1, chunk_len, action_dim]
+                state: [1, state_dim]
+        """
         if sample_index in self.cache:
             z_rl, ref_chunk, state = self.cache[sample_index]
             return z_rl.clone(), ref_chunk.clone(), state.clone()
@@ -338,7 +527,18 @@ def train_from_batch(
     batch: List[ReplayTransition],
     apply_ref_mask: bool = True,
 ) -> Dict[str, float]:
-    """组一个 batch：现场取 z_rl/ref，与 GT chunk 一起喂 TD3ChunkAgent.train_step。"""
+    """
+    组一个 batch：现场取 z_rl/reference，与 GT chunk 一起喂 TD3 更新。
+
+    Args:
+        agent: TD3 agent。
+        provider: 特征提供器。
+        batch: transition 列表。
+        apply_ref_mask: 是否对 reference action 做随机 mask。
+
+    Returns:
+        Dict[str, float]: 单步训练指标（loss、q 值等）。
+    """
     z_rl = []
     state = []
     ref = []
@@ -382,9 +582,22 @@ def warmup_train(
     batch_size: int,
     warmup_updates: int,
 ) -> List[Dict[str, float]]:
-    """从经验池随机采样，重复 warmup_updates 次梯度步。"""
+    """
+    warmup 阶段训练循环。
+
+    Args:
+        agent: TD3 agent。
+        replay: 经验池。
+        provider: 特征提供器。
+        batch_size: 每步采样 batch 大小。
+        warmup_updates: warmup 更新步数。
+
+    Returns:
+        List[Dict[str, float]]: 每步训练日志。
+    """
+    print(f"[warmup] 开始 warmup 训练，共 {warmup_updates} 次更新...")
     logs: List[Dict[str, float]] = []
-    for step in range(warmup_updates):
+    for step in tqdm(range(warmup_updates), desc="warmup_updates", leave=False):
         batch = replay.sample(batch_size)
         metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
         metrics["phase"] = "warmup"
@@ -400,18 +613,35 @@ def online_train_loop(
     batch_size: int,
     online_train_episodes: int,
 ) -> List[Dict[str, float]]:
-    """按 episode 轮次：每轮选一个 episode 的全部 transition 打乱后按 batch 训练。"""
+    """
+    online 阶段训练循环（按 episode 轮次）。
+
+    Args:
+        agent: TD3 agent。
+        replay: 经验池。
+        provider: 特征提供器。
+        batch_size: 每个 batch 的样本数。
+        online_train_episodes: 在线训练 episode 数。
+
+    Returns:
+        List[Dict[str, float]]: 在线训练日志。
+    """
+    print(f"[online] 开始在线训练，共 {online_train_episodes} 个 episode...")
     logs: List[Dict[str, float]] = []
     transitions = list(replay.buf)
     transitions_by_episode: Dict[int, List[ReplayTransition]] = defaultdict(list)
     for tr in transitions:
         transitions_by_episode[tr.episode_id].append(tr)
     episode_ids = sorted(transitions_by_episode.keys())
-    for ep in range(online_train_episodes):
+    for ep in tqdm(range(online_train_episodes), desc="online_episodes"):
         ep_id = episode_ids[ep % len(episode_ids)]
         ep_transitions = transitions_by_episode[ep_id]
         random.shuffle(ep_transitions)
-        for start in range(0, len(ep_transitions), batch_size):
+        for start in tqdm(
+            range(0, len(ep_transitions), batch_size),
+            desc=f"episode_{ep + 1}_batches",
+            leave=False,
+        ):
             batch = ep_transitions[start : start + batch_size]
             if not batch:
                 continue
@@ -420,7 +650,7 @@ def online_train_loop(
             metrics["episode"] = float(ep + 1)
             logs.append(metrics)
         if (ep + 1) % max(1, online_train_episodes // 10) == 0:
-            print(f"[online] episode {ep + 1}/{online_train_episodes}")
+            print(f"[online] 已完成 episode {ep + 1}/{online_train_episodes}")
     return logs
 
 
@@ -431,7 +661,19 @@ def eval_with_vla_reference(
     provider: OnlineFeatureProvider,
     max_eval_samples: int = 256,
 ) -> Dict[str, float]:
-    """对比 TD3 输出与数据 GT、与 VLA reference 的 MSE，并估 Q 均值。"""
+    """
+    评估 TD3 输出与 GT / VLA reference 的误差，并统计 Q 值。
+
+    Args:
+        agent: TD3 agent。
+        replay: 经验池。
+        provider: 特征提供器。
+        max_eval_samples: 最大评估样本数。
+
+    Returns:
+        Dict[str, float]: mse / mae / l2 / ref_mse / eval_q_mean。
+    """
+    print(f"[eval] 开始评估，最多评估 {max_eval_samples} 条样本...")
     selected = list(replay.buf)[:max_eval_samples]
     mse_vals = []
     mae_vals = []
@@ -439,7 +681,7 @@ def eval_with_vla_reference(
     ref_mse_vals = []
     q_vals = []
 
-    for tr in selected:
+    for tr in tqdm(selected, desc="eval_samples", leave=False):
         z_rl, ref_chunk, state = provider.get(tr.sample_index)
         gt = tr.gt_action_chunk.unsqueeze(0).to(agent.device)
         pred = agent.act(z_rl, state, ref_chunk, deterministic=True, apply_ref_mask=False)
@@ -463,7 +705,17 @@ def eval_with_vla_reference(
 
 
 def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str = "q_curve") -> None:
-    """把训练日志写 CSV；若装了 matplotlib 再画一张 Q 曲线图。"""
+    """
+    把训练日志写 CSV；若装了 matplotlib 再画一张 Q 曲线图。
+
+    Args:
+        logs: 训练日志列表。
+        output_dir: 输出目录。
+        base_name: 输出文件名前缀。
+
+    Returns:
+        None.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"{base_name}.csv"
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -509,7 +761,18 @@ def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str
 
 
 def save_td3_agent(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
-    """保存 actor/critic 与 TD3 超参，便于 --load-agent 续跑。"""
+    """
+    保存 actor/critic 与 TD3 超参，便于 --load-agent 续跑。
+
+    Args:
+        path: 保存路径。
+        agent: TD3 agent。
+        args: 运行参数对象。
+        cfg: 脚本配置对象。
+
+    Returns:
+        None.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rl_token_dim = cfg.raw_config.get("model", {}).get("rl_token", {}).get("rl_token_dim", 256)
@@ -560,7 +823,16 @@ def save_td3_agent(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
 
 
 def load_td3_agent(path: Path, device: torch.device) -> TD3ChunkAgent:
-    """从 save_td3_agent 写出的文件恢复 TD3ChunkAgent。"""
+    """
+    从 save_td3_agent 写出的文件恢复 TD3ChunkAgent。
+
+    Args:
+        path: 权重文件路径。
+        device: 目标设备。
+
+    Returns:
+        TD3ChunkAgent: 恢复后的 agent。
+    """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -593,6 +865,12 @@ def load_td3_agent(path: Path, device: torch.device) -> TD3ChunkAgent:
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    """
+    构建命令行参数解析器。
+
+    Returns:
+        argparse.ArgumentParser: 参数解析器对象。
+    """
     p = argparse.ArgumentParser(description="LeRobot 上 TD3 模拟在线训练")
     p.add_argument(
         "--step",
@@ -632,12 +910,24 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def _execute(args: argparse.Namespace) -> None:
-    """根据 args.step 执行对应阶段（所有分支集中在此，避免再套一层 run_step_*）。"""
+    """
+    根据 args.step 执行对应阶段（分步调试与 full 流程共用）。
+
+    Args:
+        args: 命令行参数命名空间。
+
+    Returns:
+        None.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.output_dir)
+    print("=" * 80)
+    print(f"[main] 启动脚本，step={args.step}, device={device}")
+    print("=" * 80)
 
     # ---------- 只检查数据：task 对应哪些 episode，写 json ----------
     if args.step == "dataset":
+        print("[main] 当前任务：仅检查数据集与 task 对应 episode 列表")
         set_seed(args.seed)
         cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
         full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
@@ -658,6 +948,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 只加载 VLA + RL token，不做训练 ----------
     if args.step == "models":
+        print("[main] 当前任务：仅加载 VLA 与 RL token 模型")
         set_seed(args.seed)
         cfg, _, _ = load_trained_modules(
             args.config, args.dataset, args.vla_checkpoint, args.rl_checkpoint, device
@@ -670,6 +961,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 只构建经验池（不加载大模型）----------
     if args.step == "replay":
+        print("[main] 当前任务：仅构建 ReplayBuffer")
         cfg = load_script_config(args.config, dataset_path=args.dataset, seed=args.seed)
         full_ds = load_lerobot_dataset(Path(args.dataset), cfg.action_horizon)
         selected = collect_task_episode_ids(full_ds, args.task_index)
@@ -694,6 +986,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # 以下步骤需要 VLA + RL + 子集数据 + 经验池；先统一准备好 cfg / 模型 / replay / provider 所需的数据集
     set_seed(args.seed)
+    print("[main] 当前任务：准备训练/评估所需模型与数据...")
     cfg, vla_model, rl_encoder = load_trained_modules(
         args.config, args.dataset, args.vla_checkpoint, args.rl_checkpoint, device
     )
@@ -738,6 +1031,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 只 warmup ----------
     if args.step == "warmup":
+        print("[main] 当前任务：执行 warmup 训练")
         print(
             f"[warmup] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
             f"warmup_updates={warmup_n}"
@@ -753,6 +1047,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 只 online（无权重则先在同进程里 warmup 一遍）----------
     if args.step == "online":
+        print("[main] 当前任务：执行 online 训练")
         if args.load_agent:
             agent = load_td3_agent(Path(args.load_agent), device)
         else:
@@ -771,6 +1066,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 只评估 ----------
     if args.step == "eval":
+        print("[main] 当前任务：执行评估")
         if args.load_agent:
             agent = load_td3_agent(Path(args.load_agent), device)
         else:
@@ -788,6 +1084,7 @@ def _execute(args: argparse.Namespace) -> None:
 
     # ---------- 全流程：warmup -> online -> 评估 -> 可选存盘 ----------
     if args.step == "full":
+        print("[main] 当前任务：执行 full 全流程（warmup -> online -> eval）")
         print(
             f"[full] task={args.task_index}, episodes={len(selected)}, replay={len(replay)}, "
             f"warmup={warmup_n}, online_ep={args.online_train_episodes}"
@@ -815,11 +1112,25 @@ def _execute(args: argparse.Namespace) -> None:
 
 
 def main():
+    """
+    脚本命令行入口。
+
+    Returns:
+        None.
+    """
     _execute(build_argparser().parse_args())
 
 
 def run_online_td3_sim(args: argparse.Namespace) -> None:
-    """兼容旧接口：强制跑完整流程（等同 --step full）。"""
+    """
+    兼容旧接口：强制跑完整流程（等同 --step full）。
+
+    Args:
+        args: 参数命名空间。
+
+    Returns:
+        None.
+    """
     args = argparse.Namespace(**vars(args))
     args.step = "full"
     _execute(args)
