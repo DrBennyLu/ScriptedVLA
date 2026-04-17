@@ -14,24 +14,27 @@ from .pick_place_env import PickPlaceEnv
 
 @dataclass
 class RLArmEnvConfig:
+    """Panda 到达任务 RL 环境配置。"""
+
     use_gui: bool = False
     render: bool = False
     max_steps: int = 80
-    target_tolerance: float = 0.03
+    target_tolerance: float = 0.05
     delta_scale: float = 0.03
-    sim_steps_per_call: int = 8
+    sim_steps_per_call: int = 24
     eef_z_min: float = 0.52
     eef_z_max: float = 0.95
+    target_height_offset: float = 0.10
     gripper_width: float = 0.04
     seed: int | None = None
 
 
 class RLArmEnv:
     """
-    Panda reaching env:
-    - observation: concat([joint_pos(9), target_xyz(3)])
-    - action: delta xyz in [-1, 1], scaled by delta_scale
-    - reward: success=1, else 0
+    Panda 末端到达任务环境：
+    - 观测：concat([joint_pos(9), target_xyz(3)])
+    - 动作：[-1, 1] 范围的 delta xyz，再按 delta_scale 缩放
+    - 奖励：成功为 1，否则为 0
     """
 
     def __init__(self, cfg: RLArmEnvConfig):
@@ -95,7 +98,14 @@ class RLArmEnv:
         self.base_env.close()
 
     def _sample_target_pos(self) -> np.ndarray:
-        z = self.base_env.table_height + self.base_env.cube_size + 0.001
+        """
+        采样可达目标点。
+
+        x/y 复用红色方块生成范围；
+        z 采用与 pick-place 抓取目标相近的“抬高”策略，提升可达性。
+        """
+        z = self.base_env.table_height + self.base_env.cube_size + 0.001 + self.cfg.target_height_offset
+        z = float(np.clip(z, self.cfg.eef_z_min, self.cfg.eef_z_max))
         x = self.rng.uniform(*self.base_env.cube_spawn_range_x)
         y = self.rng.uniform(*self.base_env.cube_spawn_range_y)
         return np.array([x, y, z], dtype=np.float64)

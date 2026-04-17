@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from simulator.rl_env import RLArmEnv, RLArmEnvConfig
 
@@ -21,6 +26,12 @@ from td3_reach_common import (
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    解析在线训练阶段的命令行参数。
+
+    Returns:
+        argparse.Namespace: 在线训练参数对象。
+    """
     parser = argparse.ArgumentParser(description="Online TD3 training from warmup checkpoint")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--headless", action="store_true")
@@ -38,6 +49,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    执行 Online TD3 训练流程：
+    1) 加载 warmup checkpoint；
+    2) 与环境在线交互并写入 replay；
+    3) 按设定频率进行参数更新并记录 Q 值日志；
+    4) 持续保存 latest/best checkpoint。
+
+    Returns:
+        None.
+    """
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)

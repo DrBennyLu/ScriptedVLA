@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from simulator.rl_env import RLArmEnv, RLArmEnvConfig
 
@@ -14,6 +19,12 @@ from td3_reach_common import act_with_agent, load_agent
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    解析推理阶段的命令行参数。
+
+    Returns:
+        argparse.Namespace: 推理参数对象。
+    """
     parser = argparse.ArgumentParser(description="GUI inference for Panda TD3")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episodes", type=int, default=20)
@@ -25,6 +36,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    执行 TD3 推理流程：
+    1) 加载训练好的 checkpoint；
+    2) 在仿真环境中逐回合执行确定性策略；
+    3) 输出成功率与平均步数。
+
+    Returns:
+        None.
+    """
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)

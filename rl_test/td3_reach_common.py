@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,10 @@ from typing import Deque, Dict, List
 
 import numpy as np
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from src.ScriptedVLA.model.td3_chunk import TD3ChunkAgent, TD3ChunkConfig
 
