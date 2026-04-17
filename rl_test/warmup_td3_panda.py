@@ -407,6 +407,7 @@ def main() -> None:
         print(f"[done] prefill demo stats: {log_dir / 'prefill_demo_stats.csv'}")
         print(f"[done] warmup checkpoint: {save_dir / 'warmup_checkpoint.pt'}")
         print(f"[done] warmup logs: {log_dir / 'warmup_q_curve.csv'}")
+        print(f"[done] warmup q curve: {log_dir / 'warmup_q_curve.png'}")
     finally:
         env.close()
 

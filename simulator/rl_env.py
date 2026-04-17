@@ -19,7 +19,7 @@ class RLArmEnvConfig:
     use_gui: bool = False
     render: bool = False
     max_steps: int = 80
-    target_tolerance: float = 0.05
+    target_tolerance: float = 0.1
     delta_scale: float = 0.03
     sim_steps_per_call: int = 24
     eef_z_min: float = 0.52

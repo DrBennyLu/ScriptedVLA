@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     Returns:
         argparse.Namespace: 推理参数对象。
     """
-    parser = argparse.ArgumentParser(description="GUI inference for Panda TD3")
+    parser = argparse.ArgumentParser(description="GUI inference for Panda naive TD3")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=80)

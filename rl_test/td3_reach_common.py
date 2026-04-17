@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import random
 import sys
 from collections import deque
@@ -15,7 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.ScriptedVLA.model.td3_chunk import TD3ChunkAgent, TD3ChunkConfig
+from td3_naive_agent import TD3Agent, TD3Config
 
 
 @dataclass
@@ -55,8 +56,8 @@ def build_td3_agent(
     noise_clip: float,
     policy_delay: int,
     hidden_dim: int,
-) -> TD3ChunkAgent:
-    cfg = TD3ChunkConfig(
+) -> TD3Agent:
+    cfg = TD3Config(
         gamma=gamma,
         tau=tau,
         actor_lr=actor_lr,
@@ -64,76 +65,49 @@ def build_td3_agent(
         policy_noise=policy_noise,
         noise_clip=noise_clip,
         policy_delay=policy_delay,
-        fixed_std=0.1,
         max_action=max_action,
-        ref_mask_prob=0.0,
-        policy_constraint_beta=0.0,
-        use_chunk_return_target=False,
-        hidden_dims=[hidden_dim, hidden_dim],
+        hidden_dim=hidden_dim,
     )
-    return TD3ChunkAgent(
-        rl_token_dim=1,
-        state_dim=obs_dim,
-        action_dim=action_dim,
-        chunk_size=1,
-        cfg=cfg,
-        device=device,
-    )
+    return TD3Agent(obs_dim=obs_dim, action_dim=action_dim, cfg=cfg, device=device)
 
 
 def train_step_from_replay(
-    agent: TD3ChunkAgent,
+    agent: TD3Agent,
     replay: ReplayBuffer,
     batch_size: int,
     device: torch.device,
 ) -> Dict[str, float]:
     batch = replay.sample(batch_size)
     obs = torch.tensor(np.stack([b.obs for b in batch]), dtype=torch.float32, device=device)
-    action = torch.tensor(np.stack([b.action for b in batch]), dtype=torch.float32, device=device).unsqueeze(1)
+    action = torch.tensor(np.stack([b.action for b in batch]), dtype=torch.float32, device=device)
     reward = torch.tensor([[b.reward] for b in batch], dtype=torch.float32, device=device)
     next_obs = torch.tensor(np.stack([b.next_obs for b in batch]), dtype=torch.float32, device=device)
     done = torch.tensor([[b.done] for b in batch], dtype=torch.float32, device=device)
 
-    bs = obs.shape[0]
-    z = torch.zeros((bs, 1), dtype=torch.float32, device=device)
-    next_z = torch.zeros((bs, 1), dtype=torch.float32, device=device)
-    ref = torch.zeros((bs, 1, action.shape[-1]), dtype=torch.float32, device=device)
-    next_ref = torch.zeros((bs, 1, action.shape[-1]), dtype=torch.float32, device=device)
-
     return agent.train_step(
-        z_rl=z,
-        state=obs,
-        ref_actions=ref,
+        obs=obs,
         action=action,
         reward=reward,
-        chunk_return=None,
-        next_z_rl=next_z,
-        next_state=next_obs,
-        next_ref_actions=next_ref,
+        next_obs=next_obs,
         done=done,
-        apply_ref_mask=False,
     )
 
 
 def act_with_agent(
-    agent: TD3ChunkAgent,
+    agent: TD3Agent,
     obs: np.ndarray,
     device: torch.device,
     noise_std: float = 0.1,
 ) -> np.ndarray:
     state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-    z = torch.zeros((1, 1), dtype=torch.float32, device=device)
-    ref = torch.zeros((1, 1, 3), dtype=torch.float32, device=device)
-    deterministic = noise_std <= 0
     with torch.no_grad():
-        action = agent.act(z, state, ref, deterministic=deterministic, apply_ref_mask=False).squeeze(0).squeeze(0)
+        deterministic = noise_std <= 0
+        action = agent.act(state, deterministic=deterministic, noise_std=noise_std).squeeze(0)
     action_np = action.detach().cpu().numpy()
-    if noise_std > 0:
-        action_np = action_np + np.random.normal(0.0, noise_std, size=action_np.shape)
     return np.clip(action_np, -agent.cfg.max_action, agent.cfg.max_action)
 
 
-def save_agent(path: Path, agent: TD3ChunkAgent, extra: Dict[str, float] | None = None) -> None:
+def save_agent(path: Path, agent: TD3Agent, extra: Dict[str, float] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
         "actor": agent.actor.state_dict(),
@@ -150,7 +124,7 @@ def save_agent(path: Path, agent: TD3ChunkAgent, extra: Dict[str, float] | None 
             "noise_clip": agent.cfg.noise_clip,
             "policy_delay": agent.cfg.policy_delay,
             "max_action": agent.cfg.max_action,
-            "hidden_dims": list(agent.cfg.hidden_dims or [256, 256]),
+            "hidden_dim": int(agent.cfg.hidden_dim),
         },
     }
     if extra:
@@ -158,11 +132,10 @@ def save_agent(path: Path, agent: TD3ChunkAgent, extra: Dict[str, float] | None 
     torch.save(ckpt, path)
 
 
-def load_agent(path: Path, obs_dim: int, action_dim: int, device: torch.device) -> TD3ChunkAgent:
+def load_agent(path: Path, obs_dim: int, action_dim: int, device: torch.device) -> TD3Agent:
     ckpt = torch.load(path, map_location=device)
     cfg = ckpt["cfg"]
-    hidden_dims = cfg.get("hidden_dims", [256, 256])
-    hidden_dim = int(hidden_dims[0]) if hidden_dims else 256
+    hidden_dim = int(cfg.get("hidden_dim", 256))
     agent = build_td3_agent(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -207,6 +180,10 @@ def export_q_logs(logs: List[Dict[str, float]], output_dir: Path, base_name: str
             writer.writerow({k: row.get(k, "") for k in fields})
 
     try:
+        # Windows + scientific stack may load duplicated OpenMP runtimes.
+        # Set this before importing matplotlib to avoid hard abort on some setups.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        os.environ.setdefault("MPLBACKEND", "Agg")
         import matplotlib.pyplot as plt
 
         x = np.arange(len(logs))

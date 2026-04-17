@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     Returns:
         argparse.Namespace: 在线训练参数对象。
     """
-    parser = argparse.ArgumentParser(description="Online TD3 training from warmup checkpoint")
+    parser = argparse.ArgumentParser(description="Online naive TD3 training from warmup checkpoint")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--max_steps", type=int, default=80)
