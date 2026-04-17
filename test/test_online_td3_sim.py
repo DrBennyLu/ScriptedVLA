@@ -12,6 +12,9 @@
     python -m test.test_online_td3_sim --step full
 
 默认 --step full 为完整流程。
+
+author: Benny Lu
+license: MIT
 """
 
 from __future__ import annotations
@@ -1350,7 +1353,7 @@ if __name__ == "__main__":
     python -m test.test_online_td3_sim --step models
     python -m test.test_online_td3_sim --step replay
 
-    python -m test.test_online_td3_sim --step warmup --save-agent ./checkpoints/agent/agent.pt
-
+    python -m test.test_online_td3_sim --step warmup 
+    python -m test.test_online_td3_sim --step online
     """
     main()

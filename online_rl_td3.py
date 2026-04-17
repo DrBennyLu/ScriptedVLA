@@ -1,5 +1,8 @@
 """
 Online TD3 training using RL token z_rl as state.
+
+author: Benny Lu
+license: MIT
 """
 
 import argparse

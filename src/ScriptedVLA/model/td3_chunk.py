@@ -7,6 +7,7 @@ This module provides a Gaussian actor and double-Q critic specialized for:
 - reference action chunks (e.g. predicted by VLA)
 
 author: Benny Lu
+license: MIT
 """
 
 from __future__ import annotations

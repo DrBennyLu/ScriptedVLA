@@ -1,5 +1,8 @@
 """
 RL token bottleneck module for compact online RL state.
+
+author: Benny Lu
+license: MIT
 """
 
 from typing import Optional, Dict

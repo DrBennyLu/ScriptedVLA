@@ -290,6 +290,16 @@ python online_simulation_inference.py --instruction "Pick up the blue cube and p
 
 ### Model Architecture
 
+#### RL Token + Online TD3 Warmup (New)
+- **RL token pretraining**: `train_rl_token.py` trains `RLTokenBottleneck` with frozen VLA token embeddings. The RL token `z_rl` is optimized with reconstruction objective and can be reused by online RL scripts.
+- **Chunk TD3 agent**: `src/ScriptedVLA/model/td3_chunk.py` provides a standalone TD3 implementation for chunk actions (`C` steps per decision), including Gaussian actor, double-Q critic, target networks, and reference-action masking.
+- **Warmup optimization alignment** (`test/test_online_td3_sim.py`):
+  - Actor objective: `L_pi = -Q + beta * ||a_pred - a_ref||^2`
+  - Critic target supports chunk return: `Q_hat = chunk_return + gamma^C * Q_target`
+  - Warmup update ratio `G`: multiple gradient updates per warmup outer step
+- **Warmup diagnostics**: exported CSV/curve now include `actor_constraint_loss`, `chunk_return_mean`, `pred_vs_ref_mse`, and Q statistics for easier stability comparison.
+- **Config keys** (`training.online_rl.td3`): `policy_constraint_beta`, `warmup_update_ratio`, `use_chunk_return_target`, `ref_mask_prob`, `output_dir`.
+
 #### VLM Module (Qwen)
 - Based on Qwen-VL model for vision-language understanding
 - Processes image and text inputs, outputs fused features
@@ -816,6 +826,16 @@ python online_simulation_inference.py --instruction "Pick up the blue cube and p
 **说明：** Checkpoint 保存格式为 `checkpoint_step_{step}.pt`（如 `checkpoint_step_5000.pt`）。脚本会在给定目录中自动查找最新 checkpoint。
 
 ### 模型架构
+
+#### RL Token + 在线 TD3 Warmup（新增）
+- **RL token 预训练**：`train_rl_token.py` 在冻结 VLA token 表征的前提下训练 `RLTokenBottleneck`。得到的 RL token `z_rl` 通过重构目标优化，可直接复用于在线强化学习脚本。
+- **Chunk TD3 Agent**：`src/ScriptedVLA/model/td3_chunk.py` 提供独立的 chunk 动作 TD3 实现（每次决策输出 `C` 步动作），包含高斯 actor、双 Q critic、目标网络与 reference action mask。
+- **Warmup 优化对齐**（`test/test_online_td3_sim.py`）：
+  - Actor 目标：`L_pi = -Q + beta * ||a_pred - a_ref||^2`
+  - Critic 目标支持 chunk return：`Q_hat = chunk_return + gamma^C * Q_target`
+  - Warmup 更新比 `G`：每个 warmup 外层 step 内执行多次梯度更新
+- **Warmup 诊断指标**：导出的 CSV/Q 曲线新增 `actor_constraint_loss`、`chunk_return_mean`、`pred_vs_ref_mse` 与 Q 统计，便于稳定性对比。
+- **配置项**（`training.online_rl.td3`）：`policy_constraint_beta`、`warmup_update_ratio`、`use_chunk_return_target`、`ref_mask_prob`、`output_dir`。
 
 #### VLM模块（Qwen）
 - 基于Qwen-VL模型进行视觉-语言理解

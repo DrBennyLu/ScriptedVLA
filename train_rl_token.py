@@ -20,6 +20,9 @@ Demo（在仓库根目录执行）::
 VLA 路径解析顺序：命令行 ``--checkpoint`` > ``training.rl_token_pretrain.vla_checkpoint``
 > ``training.rl_token_pretrain.vla_checkpoint_dir``（兼容别名）> ``checkpoint_dir``（来自
 ``--checkpoint_dir`` 或 config 推导），在目录内选取最新的 ``checkpoint_step_*.pt``。
+
+author: Benny Lu
+license: MIT
 """
 
 import argparse
