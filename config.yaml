@@ -8,6 +8,7 @@ model:
     image_size: 224  # 推荐使用448以获得更好的视觉理解效果
     max_seq_length: 512
     freeze_vlm: true  # 是否冻结VLM参数
+    freeze_text_backbone: false  # 仅冻结文本主干(language_model+lm_head)，Vision Encoder 可训练；freeze_vlm=true 时忽略
     cache_dir: "./cache/models"  # VLM模型本地缓存路径，若指定则优先从缓存加载（完全离线）
     # local_model_path: null  # 可选：直接指定本地模型目录路径，用于完全离线（如 ./cache/models/models--Qwen--Qwen2-VL-2B-Instruct/snapshots/xxx）
     use_state: false  # VLM是否使用机器人状态（可选，未设置时使用 model.vla.use_state_vlm）
@@ -20,7 +21,7 @@ model:
     num_layers: 6
     num_heads: 12
     mlp_ratio: 4.0
-    action_dim: 4  # 动作维度（x, y, z, gripper），与仿真器一致
+    action_dim: 7  # 动作维度（x, y, z, gripper），与仿真器一致
     # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
     # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
     # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
@@ -180,7 +181,7 @@ dataset:
   state_key: "observation.state"
   
   # 动作维度（从配置中直接指定，不再从数据集自动获取）
-  action_dim: 4  # x, y, z, gripper，与仿真器一致
+  action_dim: 7  # x, y, z, gripper，与仿真器一致
   
   # 数据加载器配置
   dataloader:
@@ -197,6 +198,10 @@ dataset:
 
   # episode_slice: 指定使用的 episode 索引列表；null 表示使用全部 episode
   episode_slice: null
+  # task_index: 指定单个任务（0..N-1）；null 表示全部任务混训
+  task_index: null
+  # eval_episode_id: episode 模式评估默认 episode；null 时按 task_index 取首条
+  eval_episode_id: null
 
 # 数据配置（用于获取默认状态维度等）
 data:
@@ -220,7 +225,7 @@ data:
   # 机器人状态配置
   robot_state:
     # 状态维度（从配置中直接指定，与仿真器关节+夹爪一致）
-    state_dim: 9  # 7 臂关节 + 2 夹爪
+    state_dim: 8  # 7 臂关节 + 2 夹爪
     # 是否使用状态信息（VLM 与动作头独立配置，若未设置则从 model.vla 读取）
     use_state_vlm: false          # VLM 是否使用状态
     use_state_action_head: true  # 动作头是否使用状态

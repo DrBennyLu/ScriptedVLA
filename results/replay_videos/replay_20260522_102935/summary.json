@@ -1,0 +1,18 @@
+{
+  "mode": "replay",
+  "success_rate": 1.0,
+  "results": [
+    {
+      "task_id": 0,
+      "init_id": 0,
+      "task_name": "pick_up_the_alphabet_soup_and_place_it_in_the_basket",
+      "instruction": "pick up the alphabet soup and place it in the basket",
+      "steps": 137,
+      "success": true,
+      "mode": "replay",
+      "replay_episode_index": 6,
+      "num_video_frames": 138,
+      "video_path": "results/replay_videos/replay_20260522_102935/task00_pick_up_the_alphabet_soup_and_place_it_i_init000_ep000006_rollout001_success.mp4"
+    }
+  ]
+}

@@ -84,6 +84,7 @@ class QwenGR00TVLAModel(nn.Module):
             image_size=vlm_config.get("image_size", 224),
             max_seq_length=vlm_config.get("max_seq_length", 512),
             freeze=vlm_config.get("freeze_vlm", True),
+            freeze_text_backbone=vlm_config.get("freeze_text_backbone", False),
             cache_dir=vlm_config.get("cache_dir", None),
             use_state=vlm_config.get("use_state", use_state_vlm),
             state_dim=state_dim

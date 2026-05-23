@@ -53,6 +53,7 @@ from src.ScriptedVLA.utils import (
     create_normalizer_from_lerobot_meta,
     Normalizer,
 )
+from libero_dataset_replay import resolve_training_episodes, get_task_description
 from src.ScriptedVLA.cli import add_common_args, parse_common_args
 
 try:
@@ -411,8 +412,9 @@ def create_optimizer(model, config):
         weight_decay = float(weight_decay)
     
     if opt_type.lower() == "adamw":
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         return AdamW(
-            model.parameters(),
+            trainable_params,
             lr=learning_rate,
             weight_decay=weight_decay,
             betas=opt_config.get("betas", [0.9, 0.999]),
@@ -619,6 +621,32 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
     return start_step, loss, normalizer
 
 
+def load_init_checkpoint(
+    checkpoint_path: Path,
+    model,
+    device,
+    *,
+    load_normalizer: bool = True,
+):
+    """
+    暖启动：仅加载 model（及可选 normalizer），不加载 optimizer/scheduler/global_step。
+    用于 pretrain → posttrain 跨目录权重初始化。
+    """
+    print(f"  暖启动 init_checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if "model_state_dict" not in checkpoint:
+        raise KeyError(f"init_checkpoint 缺少 model_state_dict: {checkpoint_path}")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print("  ✓ 模型权重已加载（init_checkpoint，不含 optimizer/scheduler）")
+
+    normalizer = None
+    if load_normalizer and "normalizer" in checkpoint:
+        normalizer = Normalizer.from_dict(checkpoint["normalizer"])
+        print("  ✓ normalizer 已从 init_checkpoint 加载")
+    return normalizer
+
+
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, global_step=None, normalizer=None):
     """保存检查点"""
     checkpoint = {
@@ -723,14 +751,27 @@ def train_with_lerobot_dataset(cfg):
     print(f"  本地数据集路径: {dataset_path_obj}")
     print(f"  数据集名称 (repo_id): {dataset_name}")
 
-    # episode_slice: 从配置读取；null 或空则使用全部 episode
+    # episode 筛选: episode_slice > task_index > 全量
+    task_index = dataset_config.get("task_index")
     episode_slice = dataset_config.get("episode_slice")
+    resolved_episodes = resolve_training_episodes(
+        str(dataset_path_obj), task_index, episode_slice
+    )
     episodes_kw = {}
-    if episode_slice is not None and len(episode_slice) > 0:
-        episodes_kw["episodes"] = episode_slice
-        print(f"  使用 episode_slice: {episode_slice[:10]}..." if len(episode_slice) > 10 else f"  使用 episode_slice: {episode_slice}")
+    if resolved_episodes is not None:
+        episodes_kw["episodes"] = resolved_episodes
+        if episode_slice is not None and len(episode_slice) > 0:
+            preview = episode_slice[:10]
+            suffix = "..." if len(episode_slice) > 10 else ""
+            print(f"  使用 episode_slice: {preview}{suffix}")
+        else:
+            task_desc = get_task_description(str(dataset_path_obj), int(task_index))
+            print(
+                f"  使用 task_index={task_index} ({task_desc!r})，"
+                f"共 {len(resolved_episodes)} 个 episode"
+            )
     else:
-        print(f"  使用全部 episode (episode_slice=null)")
+        print(f"  使用全部 episode (task_index=null, episode_slice=null)")
 
     try:
         # 使用 LeRobotDatasetSubset 以修复 episodes=subset 时 episode_data_index 索引越界
@@ -844,6 +885,20 @@ def train_with_lerobot_dataset(cfg):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  总参数量: {total_params:,} ({total_params / 1e6:.2f}M)")
     print(f"  可训练参数量: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
+
+    vlm_stats = model.qwen_vl_interface.summarize_backbone_trainability()
+    print("  VLM 主干可训练参数 (trainable / total):")
+    for part, (trainable, total) in vlm_stats.items():
+        if total == 0:
+            continue
+        status = "trainable" if trainable == total else ("frozen" if trainable == 0 else "partial")
+        print(f"    {part}: {trainable:,} / {total:,} ({status})")
+    action_head_trainable = sum(p.numel() for p in model.action_model.parameters() if p.requires_grad)
+    action_head_total = sum(p.numel() for p in model.action_model.parameters())
+    print(
+        f"  DiT action head: {action_head_trainable:,} / {action_head_total:,} "
+        f"({'trainable' if action_head_trainable == action_head_total else 'partial/frozen'})"
+    )
     
     # 5. 创建优化器和调度器
     print(f"\n步骤5: 创建优化器和调度器")
@@ -858,12 +913,43 @@ def train_with_lerobot_dataset(cfg):
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"  检查点保存目录: {save_dir}")
     
-    # 6.5. 检查是否有可用的检查点并恢复
-    print(f"\n步骤6.5: 检查断点续训")
+    # 6.5. 检查 init_checkpoint 或断点续训
+    print(f"\n步骤6.5: 检查 init_checkpoint / 断点续训")
+    init_checkpoint_path = merged_training_config.get("init_checkpoint")
+    init_use_ckpt_normalizer = merged_training_config.get("init_checkpoint_normalizer", True)
+
     latest_checkpoint_path, latest_step_from_filename = find_latest_checkpoint(save_dir)
-    
+
     start_step = 0
-    if latest_checkpoint_path is not None:
+    if init_checkpoint_path:
+        init_path = Path(init_checkpoint_path)
+        if not init_path.exists():
+            raise FileNotFoundError(f"init_checkpoint 不存在: {init_path}")
+
+        loaded_init_normalizer = load_init_checkpoint(
+            init_path,
+            model,
+            device,
+            load_normalizer=bool(init_use_ckpt_normalizer),
+        )
+        if loaded_init_normalizer is not None and use_normalizer:
+            normalizer = loaded_init_normalizer
+            print("  使用 init_checkpoint 中的归一化器")
+            custom_collate_fn = create_collate_fn(
+                image_keys=image_keys,
+                state_key=state_key,
+                image_size=image_size,
+                use_batch_task=use_batch_task,
+                normalizer=normalizer,
+                normalize_action=normalize_action,
+                normalize_state=normalize_state,
+                augmentation_config=augmentation_config,
+            )
+            dataloader_kwargs["collate_fn"] = custom_collate_fn
+            train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
+
+        print("  init_checkpoint 暖启动，从 step 0 开始（不加载 optimizer/scheduler）")
+    elif latest_checkpoint_path is not None:
         print(f"  发现检查点: {latest_checkpoint_path}")
         print(f"  文件名中的步数: {latest_step_from_filename}")
         
@@ -1068,6 +1154,12 @@ def main():
     )
     parser.add_argument("--max_steps", type=int, default=None, help="Maximum training steps")
     parser.add_argument("--save_steps", type=int, default=None, help="Steps interval for saving checkpoints")
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help="Warm-start from checkpoint (model + optional normalizer only; step resets to 0)",
+    )
     args = parser.parse_args()
 
     common = parse_common_args(args)
@@ -1078,6 +1170,8 @@ def main():
         save_steps=args.save_steps,
         seed=common.seed,
     )
+    if args.init_checkpoint:
+        cfg.raw_config.setdefault("training", {})["init_checkpoint"] = args.init_checkpoint
 
     try:
         model, losses = train_with_lerobot_dataset(cfg)

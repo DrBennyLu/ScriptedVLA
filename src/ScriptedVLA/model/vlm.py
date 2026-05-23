@@ -96,6 +96,7 @@ class QwenVLM(nn.Module):
         image_size: int = 224,
         max_seq_length: int = 512,
         freeze: bool = False,
+        freeze_text_backbone: bool = False,
         cache_dir: str = None,
         use_state: bool = True,
         state_dim: int = 7,
@@ -108,7 +109,9 @@ class QwenVLM(nn.Module):
             model_name: HuggingFace模型名称（默认：Qwen/Qwen2-VL-2B-Instruct）
             image_size: 输入图像尺寸
             max_seq_length: 最大序列长度
-            freeze: 是否冻结模型参数
+            freeze: 是否冻结整个 VLM 参数
+            freeze_text_backbone: 是否仅冻结文本主干（language_model + lm_head），
+                Vision Encoder 保持可训练；仅在 freeze=False 时生效
             cache_dir: 模型缓存目录，如果指定则从缓存加载
             use_state: 是否使用机器人本体信息（关节角度等）
             state_dim: 机器人状态维度
@@ -123,6 +126,7 @@ class QwenVLM(nn.Module):
             image_size = config.get("image_size", image_size)
             max_seq_length = config.get("max_seq_length", max_seq_length)
             freeze = config.get("freeze_vlm", freeze)
+            freeze_text_backbone = config.get("freeze_text_backbone", freeze_text_backbone)
             cache_dir = config.get("cache_dir", cache_dir)
             local_model_path = config.get("local_model_path", None)
             use_state = config.get("use_state", use_state)
@@ -284,11 +288,7 @@ class QwenVLM(nn.Module):
                 print(f"⚠ 使用 AutoModel 加载，可能不支持 generate 方法")
                 self._use_device_map = False
         
-        # 冻结参数（如果需要）
-        if freeze:
-            for param in self.model.parameters():
-                param.requires_grad = False
-            print("VLM parameters frozen")
+        self.apply_vlm_freeze_policy(freeze_vlm=freeze, freeze_text_backbone=freeze_text_backbone)
         
         # 获取隐藏层维度
         if hasattr(self.model.config, 'hidden_size'):
@@ -324,10 +324,87 @@ class QwenVLM(nn.Module):
             image_size=config.get("image_size", 224),
             max_seq_length=config.get("max_seq_length", 512),
             freeze=config.get("freeze_vlm", False),
+            freeze_text_backbone=config.get("freeze_text_backbone", False),
             cache_dir=config.get("cache_dir", None),
             use_state=config.get("use_state", use_state),
             state_dim=config.get("state_dim", state_dim)
         )
+
+    @staticmethod
+    def _set_module_requires_grad(module: Optional[nn.Module], requires_grad: bool) -> None:
+        if module is None:
+            return
+        for param in module.parameters():
+            param.requires_grad = requires_grad
+
+    def apply_vlm_freeze_policy(
+        self,
+        freeze_vlm: bool = False,
+        freeze_text_backbone: bool = False,
+    ) -> None:
+        """
+        应用 VLM 参数冻结策略。
+
+        - freeze_vlm=True: 冻结整个 Qwen2-VL（含 Vision Encoder 与文本主干）
+        - freeze_vlm=False 且 freeze_text_backbone=True: 仅冻结 language_model 与 lm_head，
+          Vision Encoder 保持可训练（tokenizer/processor 本身无可训练参数）
+        - 两者均为 False: VLM 全量可训练
+        """
+        if freeze_vlm:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            print("VLM: all parameters frozen")
+            return
+
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        if not freeze_text_backbone:
+            print("VLM: all backbone parameters trainable")
+            return
+
+        frozen_parts = []
+        backbone = getattr(self.model, "model", None)
+        if backbone is not None:
+            if hasattr(backbone, "language_model"):
+                self._set_module_requires_grad(backbone.language_model, False)
+                frozen_parts.append("language_model")
+            if hasattr(backbone, "visual"):
+                self._set_module_requires_grad(backbone.visual, True)
+        if hasattr(self.model, "lm_head") and self.model.lm_head is not None:
+            self._set_module_requires_grad(self.model.lm_head, False)
+            frozen_parts.append("lm_head")
+
+        if not frozen_parts:
+            print("Warning: freeze_text_backbone=True but no language modules found; VLM left fully trainable")
+        else:
+            print(f"VLM: frozen {', '.join(frozen_parts)}; visual encoder trainable")
+
+    def summarize_backbone_trainability(self) -> Dict[str, Tuple[int, int]]:
+        """返回各主干子模块 (trainable_params, total_params) 统计。"""
+        groups = {
+            "visual": 0,
+            "language_model": 0,
+            "lm_head": 0,
+            "other": 0,
+        }
+        group_totals = dict(groups)
+
+        for name, param in self.model.named_parameters():
+            trainable = int(param.numel()) if param.requires_grad else 0
+            total = int(param.numel())
+            if name.startswith("model.visual."):
+                key = "visual"
+            elif name.startswith("model.language_model."):
+                key = "language_model"
+            elif name.startswith("lm_head."):
+                key = "lm_head"
+            else:
+                key = "other"
+            groups[key] += trainable
+            group_totals[key] += total
+
+        return {k: (groups[k], group_totals[k]) for k in groups}
         
     def forward(
         self,

@@ -51,6 +51,7 @@ from inference import (
     load_dataset_episode,
     find_latest_checkpoint,
 )
+from libero_dataset_replay import resolve_eval_episode_id
 from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import load_config, load_script_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter
@@ -1446,7 +1447,7 @@ def main():
   python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./test_temp/test_checkpoint.pt --episode_id 0 --output episode_trajectory.png
 
     # 推理测试：
-  python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_50000.pt --episode_id 4 --output episode_4_trajectory.png
+  python test/test_inference.py --mode episode --dataset ./dada/libero-object --checkpoint ./checkpoints/libero_object/checkpoint_step_100000.pt --episode_id 0 --output episode_0_trajectory.png
   python test/test_inference.py --mode episode --dataset ./dataset/libero_object --checkpoint ./checkpoints/checkpoint_step_100000.pt --episode_id 0 --output episode_0_trajectory_10k.png
         """
     )
@@ -1484,8 +1485,8 @@ def main():
     parser.add_argument(
         "--episode_id",
         type=int,
-        default=0,
-        help="要测试的episode ID（仅用于episode模式，默认0）"
+        default=None,
+        help="要测试的episode ID（仅用于episode模式；未指定时从 config dataset.task_index / eval_episode_id 解析）"
     )
     parser.add_argument(
         "--device",
@@ -1526,6 +1527,15 @@ def main():
     
     # 根据模式运行测试
     try:
+        if args.mode in ("episode", "episode_lora") and args.episode_id is None:
+            ds_cfg = cfg.raw_config.get("dataset", {})
+            args.episode_id = resolve_eval_episode_id(
+                str(dataset_path),
+                task_index=ds_cfg.get("task_index"),
+                eval_episode_id=ds_cfg.get("eval_episode_id"),
+            )
+            print(f"  从配置解析 eval episode_id={args.episode_id}")
+
         if args.mode == "single":
             # 单帧测试
             result = test_inference_from_dataset(

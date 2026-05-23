@@ -1,0 +1,64 @@
+{
+  "timestamp": "20260523_100825",
+  "checkpoint": "checkpoints/libero_object_t0_freezelm/checkpoint_step_60000.pt",
+  "ws_url": "ws://127.0.0.1:8765",
+  "num_rollouts": 5,
+  "success_rate": 0.0,
+  "results": [
+    {
+      "task_id": 9,
+      "init_id": 0,
+      "task_name": "pick_up_the_orange_juice_and_place_it_in_the_basket",
+      "instruction": "pick up the orange juice and place it in the basket",
+      "steps": 600,
+      "success": false,
+      "num_video_frames": 601,
+      "video_path": "results/rollout_videos/20260523_100825/task09_pick_up_the_orange_juice_and_place_it_in_init000_rollout001_fail.mp4",
+      "rollout_index": 1
+    },
+    {
+      "task_id": 9,
+      "init_id": 1,
+      "task_name": "pick_up_the_orange_juice_and_place_it_in_the_basket",
+      "instruction": "pick up the orange juice and place it in the basket",
+      "steps": 600,
+      "success": false,
+      "num_video_frames": 601,
+      "video_path": "results/rollout_videos/20260523_100825/task09_pick_up_the_orange_juice_and_place_it_in_init001_rollout002_fail.mp4",
+      "rollout_index": 2
+    },
+    {
+      "task_id": 9,
+      "init_id": 2,
+      "task_name": "pick_up_the_orange_juice_and_place_it_in_the_basket",
+      "instruction": "pick up the orange juice and place it in the basket",
+      "steps": 600,
+      "success": false,
+      "num_video_frames": 601,
+      "video_path": "results/rollout_videos/20260523_100825/task09_pick_up_the_orange_juice_and_place_it_in_init002_rollout003_fail.mp4",
+      "rollout_index": 3
+    },
+    {
+      "task_id": 9,
+      "init_id": 3,
+      "task_name": "pick_up_the_orange_juice_and_place_it_in_the_basket",
+      "instruction": "pick up the orange juice and place it in the basket",
+      "steps": 600,
+      "success": false,
+      "num_video_frames": 601,
+      "video_path": "results/rollout_videos/20260523_100825/task09_pick_up_the_orange_juice_and_place_it_in_init003_rollout004_fail.mp4",
+      "rollout_index": 4
+    },
+    {
+      "task_id": 9,
+      "init_id": 4,
+      "task_name": "pick_up_the_orange_juice_and_place_it_in_the_basket",
+      "instruction": "pick up the orange juice and place it in the basket",
+      "steps": 600,
+      "success": false,
+      "num_video_frames": 601,
+      "video_path": "results/rollout_videos/20260523_100825/task09_pick_up_the_orange_juice_and_place_it_in_init004_rollout005_fail.mp4",
+      "rollout_index": 5
+    }
+  ]
+}
