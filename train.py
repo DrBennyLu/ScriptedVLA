@@ -245,6 +245,7 @@ def create_collate_fn(
     normalizer=None,
     normalize_action=True,
     normalize_state=True,
+    clip_normalized_state=True,
     augmentation_config=None,
 ):
     """
@@ -258,6 +259,7 @@ def create_collate_fn(
         normalizer: 归一化器（可选）
         normalize_action: 是否对 action 做归一化（需 normalizer）
         normalize_state: 是否对 state 做归一化（需 normalizer）
+        clip_normalized_state: normalize_state 是否 clip 到 [-1, 1]
         augmentation_config: 数据增强配置（可选），enabled=true 时对图像应用 ColorJitter + RandomAffine
     """
     # 构建图像增强变换（抓取泛化）
@@ -346,7 +348,7 @@ def create_collate_fn(
             if isinstance(states, torch.Tensor):
                 if states.numel() > 0 and states.abs().sum().item() > 1e-6:
                     if normalize_state and normalizer is not None:
-                        states = normalizer.normalize_state(states)
+                        states = normalizer.normalize_state(states, clip=clip_normalized_state)
                 else:
                     # 如果状态全为0，可能是数据问题，打印警告
                     import warnings
@@ -354,7 +356,7 @@ def create_collate_fn(
                     states = None
             else:
                 if normalize_state and normalizer is not None:
-                    states = normalizer.normalize_state(states)
+                    states = normalizer.normalize_state(states, clip=clip_normalized_state)
         else:
             # 如果state_key不在batch_dict中，尝试查找可能的键名
             possible_state_keys = [k for k in batch_dict.keys() if 'state' in k.lower()]
@@ -366,7 +368,7 @@ def create_collate_fn(
                     print(f"[警告] 尝试使用可能的状态键: {possible_state_keys[0]}")
                     states = batch_dict[possible_state_keys[0]]
                     if normalize_state and normalizer is not None:
-                        states = normalizer.normalize_state(states)
+                        states = normalizer.normalize_state(states, clip=clip_normalized_state)
             else:
                 import warnings
                 warnings.warn(f"配置的状态键 '{state_key}' 不在batch中，且没有找到任何包含'state'的键。可用键: {list(batch_dict.keys())}")
@@ -819,6 +821,7 @@ def train_with_lerobot_dataset(cfg):
         normalizer = None
     normalize_action = data_config.get("normalize_action", False) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", False) if use_normalizer else False
+    clip_normalized_state = data_config.get("clip_normalized_state", True) if use_normalizer else False
     augmentation_config = data_config.get("augmentation")
     use_batch_task = task_description_config.get("use_batch_task", True)
     augmentation_config = data_config.get("augmentation")
@@ -830,6 +833,7 @@ def train_with_lerobot_dataset(cfg):
         normalizer=normalizer,
         normalize_action=normalize_action,
         normalize_state=normalize_state,
+        clip_normalized_state=clip_normalized_state,
         augmentation_config=augmentation_config,
     )
     
@@ -943,6 +947,7 @@ def train_with_lerobot_dataset(cfg):
                 normalizer=normalizer,
                 normalize_action=normalize_action,
                 normalize_state=normalize_state,
+                clip_normalized_state=clip_normalized_state,
                 augmentation_config=augmentation_config,
             )
             dataloader_kwargs["collate_fn"] = custom_collate_fn
@@ -971,6 +976,7 @@ def train_with_lerobot_dataset(cfg):
                 normalizer=normalizer,
                 normalize_action=normalize_action,
                 normalize_state=normalize_state,
+                clip_normalized_state=clip_normalized_state,
                 augmentation_config=augmentation_config,
             )
             dataloader_kwargs["collate_fn"] = custom_collate_fn

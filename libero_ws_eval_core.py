@@ -28,6 +28,8 @@ async def run_eval_episode(
     debug_ranges: bool,
     video_recorder: Optional[RolloutVideoRecorder] = None,
     rollout_label: str = "",
+    align_joint_angles: bool = True,
+    clip_normalized_state: bool = True,
 ) -> dict:
     label = rollout_label or f"task_id={task_id} init_id={init_id}"
     created = await client.create_episode(
@@ -70,6 +72,8 @@ async def run_eval_episode(
                     image_size=image_size,
                     normalize_action=normalize_action,
                     normalize_state=normalize_state,
+                    align_joint_angles=align_joint_angles,
+                    clip_normalized_state=clip_normalized_state,
                 )
                 action_chunk = np.asarray(action_chunk, dtype=np.float32)
                 if action_chunk.ndim == 1:

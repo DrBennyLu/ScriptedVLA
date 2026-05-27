@@ -19,6 +19,8 @@ from .normalization import (
     create_normalizer_from_lerobot_meta,
     compute_normalization_stats_from_episodes_stats,
     compute_normalization_stats_from_episodes_stats_items,
+    iter_episodes_stats_from_jsonl,
+    clamp_action_stats_to_unit_bounds,
 )
 
 __all__ = [
@@ -37,5 +39,7 @@ __all__ = [
     "create_normalizer_from_lerobot_meta",
     "compute_normalization_stats_from_episodes_stats",
     "compute_normalization_stats_from_episodes_stats_items",
+    "iter_episodes_stats_from_jsonl",
+    "clamp_action_stats_to_unit_bounds",
 ]
 

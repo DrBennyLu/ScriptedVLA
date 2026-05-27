@@ -41,6 +41,8 @@ async def run_benchmark(
     use_model: bool,
     mock_mode: str,
     dataset_path: Optional[str],
+    align_joint_angles: bool = True,
+    clip_normalized_state: bool = True,
 ) -> List[dict]:
     from libero_ws_mock_client import run_episode as run_mock_episode
 
@@ -60,6 +62,8 @@ async def run_benchmark(
                         image_size=image_size,
                         normalize_action=normalize_action,
                         normalize_state=normalize_state,
+                        align_joint_angles=align_joint_angles,
+                        clip_normalized_state=clip_normalized_state,
                         task_id=task_id,
                         init_id=init_id,
                         max_steps=max_steps,
@@ -200,6 +204,8 @@ async def main_async(args):
     use_normalizer = data_config.get("use_normalizer", True)
     normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+    align_joint_angles = data_config.get("align_joint_angles", True) if use_normalizer else False
+    clip_normalized_state = data_config.get("clip_normalized_state", True) if use_normalizer else False
 
     task_ids = list(range(10)) if args.task_ids is None else args.task_ids
     if args.dataset_task_ids is not None and len(args.dataset_task_ids) > 0:
@@ -233,6 +239,8 @@ async def main_async(args):
         image_size=image_size,
         normalize_action=normalize_action,
         normalize_state=normalize_state,
+        align_joint_angles=align_joint_angles,
+        clip_normalized_state=clip_normalized_state,
         task_ids=task_ids,
         n_eval=args.n_eval,
         max_steps=args.max_steps,

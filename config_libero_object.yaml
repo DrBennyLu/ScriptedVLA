@@ -29,7 +29,7 @@ model:
     num_heads: 12
     mlp_ratio: 4.0
     action_dim: 7
-    action_horizon: 15
+    action_horizon: 10
     num_inference_timesteps: 10
     patch_size: 8
     num_patches: 196
@@ -40,14 +40,14 @@ model:
     cross_attention_layers: 3
     use_state_vlm: false
     use_state_action_head: true
-    future_action_window_size: 14
+    future_action_window_size: 9
 
 seed: 42
 
 training:
   batch_size: 8
   num_epochs: 100
-  learning_rate: 1e-4
+  learning_rate: 4e-5
   weight_decay: 0.01
   warmup_steps: 1000
   gradient_accumulation_steps: 1
@@ -60,24 +60,25 @@ training:
     type: "cosine"
     warmup_ratio: 0.05
     min_lr_ratio: 0.01
-  save_dir: "./checkpoints/libero_object_task0_posttrain"
-  save_steps: 20000
-  eval_steps: 20000
+  save_dir: "./checkpoints/libero_object_task0_0526_200K"
+  save_steps: 100000
+  eval_steps: 100000
   max_eval_batches: 1
   logging_steps: 100
-  max_steps: 60000
+  max_steps: 200000
   fp16: false
   bf16: false
   lora:
     enabled: false
   # posttrain 暖启动：设为 pretrain 最新 checkpoint；null 则从 Qwen base 随机初始化动作头
   init_checkpoint: null
-  # 默认 true：沿用 pretrain checkpoint 中的 normalizer（与预训练权重一致）
+  # true: 沿用 pretrain checkpoint 内 normalizer（全数据集 episodes_stats，与 pretrain 权重一致）
+  # false: 按当前 dataset.task_index / episode_slice 子集重算 normalizer（需配合修复后的 subset 聚合）
   init_checkpoint_normalizer: true
 
 dataset:
   local_path: "./dada/libero-object"
-  action_horizon: 15
+  action_horizon: 10
   image_keys:
     - "observation.images.image"
     - "observation.images.wrist_image"
@@ -98,12 +99,18 @@ dataset:
 
 data:
   use_normalizer: true
-  normalize_action: true
+  # LeRobot libero-object action 已是 7-dim OSC [-1,1]；训练时不应再 min-max 归一化（见 normalization.py）。
+  # false = GT/模型输出均在 [-1,1]（推荐新训练）。已有 normalize_action=true 的 checkpoint 推理时请改回 true。
+  normalize_action: false
   normalize_state: true
+  # 仿真推理：关节角 2π 对齐到 normalizer stats，再归一化
+  align_joint_angles: true
+  # normalize_state 输出 clip 到 [-1,1]，防止仿真 OOD state 送入模型
+  clip_normalized_state: true
   augmentation:
     enabled: false
   robot_state:
-    state_dim: 8
+    state_dim: 8  # 6 arm joints + 2 gripper finger qpos (LeRobot libero-object convention)
     use_state_vlm: false
     use_state_action_head: true
 

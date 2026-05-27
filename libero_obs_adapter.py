@@ -11,13 +11,27 @@ import torch
 from PIL import Image
 
 
-def decode_b64_image(b64_str: str, flip_vertical: bool = True) -> np.ndarray:
+def decode_b64_image(
+    b64_str: str,
+    flip_vertical: bool = True,
+    flip_horizontal: bool = True,
+) -> np.ndarray:
+    """Decode a JPEG base64 camera frame from libero_ws_server.
+
+    Applies orientation fixes to match the libero-object training dataset:
+      - vertical flip (``arr[::-1]``): LIBERO / video_utils convention
+      - horizontal flip (``arr[:, ::-1]``): align agentview/wrist with LeRobot dataset
+
+    The WebSocket server sends raw MuJoCo images without flipping.
+    """
     raw = base64.b64decode(b64_str)
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     arr = np.asarray(img, dtype=np.uint8)
     if flip_vertical:
-        arr = arr[::-1].copy()
-    return arr
+        arr = arr[::-1]
+    if flip_horizontal:
+        arr = arr[:, ::-1]
+    return arr.copy()
 
 
 def b64_to_tensor(b64_str: str, image_size: Optional[int] = None) -> torch.Tensor:

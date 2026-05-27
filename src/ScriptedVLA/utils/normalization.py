@@ -131,15 +131,20 @@ class Normalizer:
         else:
             return denormalized
     
-    def normalize_state(self, state: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    def normalize_state(
+        self,
+        state: Union[np.ndarray, torch.Tensor],
+        clip: bool = True,
+    ) -> Union[np.ndarray, torch.Tensor]:
         """
         按维度归一化 state：每个元素用该维的 min/max 映射到 [-1, 1]。
 
         Args:
             state: 原始 state [..., state_dim]
+            clip: 是否将输出裁剪到 [-1, 1]（推理 OOD 保护；训练集在 stats 内时无影响）
 
         Returns:
-            归一化后的 state，每维在 [-1, 1]
+            归一化后的 state，clip=True 时每维在 [-1, 1]
         """
         if self.state_min is None or self.state_max is None:
             return state
@@ -154,7 +159,9 @@ class Normalizer:
 
         # 每维独立: (x - min_i) / range_i -> [-1, 1]
         normalized = 2.0 * (state_np - self.state_min) / self.state_range - 1.0
-        
+        if clip:
+            normalized = np.clip(normalized, -1.0, 1.0)
+
         if is_tensor:
             return torch.from_numpy(normalized).to(device=device, dtype=dtype)
         else:
@@ -260,8 +267,39 @@ class Normalizer:
         return cls.from_dict(data)
 
 
+def iter_episodes_stats_from_jsonl(
+    episodes_stats_path: Union[str, Path],
+    episode_indices: Optional[Iterable[int]] = None,
+) -> Iterable[Tuple[int, Dict]]:
+    """
+    Yield (episode_index, stats_dict) from episodes_stats.jsonl.
+
+    Args:
+        episodes_stats_path: Path to meta/episodes_stats.jsonl.
+        episode_indices: If set, only yield episodes in this collection.
+    """
+    episodes_stats_path = Path(episodes_stats_path)
+    if not episodes_stats_path.exists():
+        raise FileNotFoundError(f"无法找到episodes_stats.jsonl文件: {episodes_stats_path}")
+
+    allowed = set(episode_indices) if episode_indices is not None else None
+    with open(episodes_stats_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            try:
+                episode_stats = json.loads(line.strip())
+                ep_idx = int(episode_stats["episode_index"])
+                if allowed is not None and ep_idx not in allowed:
+                    continue
+                yield ep_idx, episode_stats.get("stats", {})
+            except json.JSONDecodeError as e:
+                print(f"警告: 第{line_num}行JSON解析失败: {e}")
+            except Exception as e:
+                print(f"警告: 第{line_num}行处理失败: {e}")
+
+
 def compute_normalization_stats_from_episodes_stats(
-    episodes_stats_path: Union[str, Path]
+    episodes_stats_path: Union[str, Path],
+    episode_indices: Optional[Iterable[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     从 episodes_stats.jsonl 按**每个维度**聚合 min/max（不做全局单一标量）。
@@ -274,44 +312,33 @@ def compute_normalization_stats_from_episodes_stats(
             形状 [action_dim] / [state_dim]，每个元素对应该维度的 min/max。
     """
     episodes_stats_path = Path(episodes_stats_path)
-    
-    if not episodes_stats_path.exists():
-        raise FileNotFoundError(f"无法找到episodes_stats.jsonl文件: {episodes_stats_path}")
-    
+    scope = (
+        f"{len(set(episode_indices))} episodes"
+        if episode_indices is not None
+        else "all episodes"
+    )
+    print(f"正在从 {episodes_stats_path} 读取归一化统计信息 ({scope})...")
+
     action_mins = []
     action_maxs = []
     state_mins = []
     state_maxs = []
-    
-    print(f"正在从 {episodes_stats_path} 读取归一化统计信息...")
-    
-    with open(episodes_stats_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                episode_stats = json.loads(line.strip())
-                stats = episode_stats.get("stats", {})
-                
-                # 读取action的min和max
-                if "action" in stats:
-                    action_stats = stats["action"]
-                    if "min" in action_stats and "max" in action_stats:
-                        action_mins.append(np.array(action_stats["min"]))
-                        action_maxs.append(np.array(action_stats["max"]))
-                
-                # 读取observation.state的min和max
-                if "observation.state" in stats:
-                    state_stats = stats["observation.state"]
-                    if "min" in state_stats and "max" in state_stats:
-                        state_mins.append(np.array(state_stats["min"]))
-                        state_maxs.append(np.array(state_stats["max"]))
-            
-            except json.JSONDecodeError as e:
-                print(f"警告: 第{line_num}行JSON解析失败: {e}")
-                continue
-            except Exception as e:
-                print(f"警告: 第{line_num}行处理失败: {e}")
-                continue
-    
+
+    for _ep_idx, stats in iter_episodes_stats_from_jsonl(
+        episodes_stats_path, episode_indices=episode_indices
+    ):
+        if "action" in stats:
+            action_stats = stats["action"]
+            if "min" in action_stats and "max" in action_stats:
+                action_mins.append(np.array(action_stats["min"]))
+                action_maxs.append(np.array(action_stats["max"]))
+
+        if "observation.state" in stats:
+            state_stats = stats["observation.state"]
+            if "min" in state_stats and "max" in state_stats:
+                state_mins.append(np.array(state_stats["min"]))
+                state_maxs.append(np.array(state_stats["max"]))
+
     if not action_mins:
         raise ValueError("未找到action统计信息")
 
@@ -381,6 +408,42 @@ def compute_normalization_stats_from_episodes_stats_items(
     return action_min, action_max, state_min, state_max
 
 
+def clamp_action_stats_to_unit_bounds(
+    action_min: Optional[np.ndarray],
+    action_max: Optional[np.ndarray],
+    unit_low: float = -1.0,
+    unit_high: float = 1.0,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Expand action min/max to at least [unit_low, unit_high] per dimension.
+
+    LeRobot libero-object actions are OSC controls in [-1, 1]. Episodes_stats
+    min/max can be narrower; without clamping, saturate actions roundtrip poorly.
+    """
+    if action_min is None or action_max is None:
+        return action_min, action_max
+    action_min = np.minimum(np.asarray(action_min, dtype=np.float64).flatten(), unit_low)
+    action_max = np.maximum(np.asarray(action_max, dtype=np.float64).flatten(), unit_high)
+    return action_min, action_max
+
+
+def _episodes_stats_items_for_dataset(
+    lerobot_dataset: Any,
+) -> Iterable[Tuple[int, Dict]]:
+    """Return episodes_stats items, filtered to lerobot_dataset.episodes when set."""
+    try:
+        episodes_stats = lerobot_dataset.meta.episodes_stats
+    except AttributeError as exc:
+        raise AttributeError(
+            "lerobot_dataset.meta 没有 episodes_stats；请使用支持 meta.episodes_stats 的 LeRobot 数据集"
+        ) from exc
+
+    subset = getattr(lerobot_dataset, "episodes", None)
+    if subset is not None:
+        return [(int(ep_idx), episodes_stats[ep_idx]) for ep_idx in subset]
+    return episodes_stats.items()
+
+
 def create_normalizer_from_lerobot_meta(
     lerobot_dataset: Any,
     state_key: str = "observation.state",
@@ -391,6 +454,9 @@ def create_normalizer_from_lerobot_meta(
 
     用于：仅对传入动作头的 state 做归一化；对模型输出的 action 做反归一化。
     LeRobot 中读取的 action 通常已是 [-1, 1]，训练时无需再归一化。
+    action min/max 会钳位到至少 [-1, 1]，避免饱和指令 roundtrip 失真。
+
+    若 lerobot_dataset.episodes 为子集，仅聚合该子集的 episode 统计（与 LeRobot self.stats 一致）。
 
     Args:
         lerobot_dataset: 已加载的 LeRobotDataset 实例（需有 meta.episodes_stats）。
@@ -400,15 +466,11 @@ def create_normalizer_from_lerobot_meta(
     Returns:
         Normalizer 实例（含 state 与 action 的 min/max，用于 state 归一化与 action 反归一化）。
     """
-    try:
-        items = lerobot_dataset.meta.episodes_stats.items()
-    except AttributeError:
-        raise AttributeError(
-            "lerobot_dataset.meta 没有 episodes_stats；请使用支持 meta.episodes_stats 的 LeRobot 数据集"
-        ) from None
+    items = _episodes_stats_items_for_dataset(lerobot_dataset)
     action_min, action_max, state_min, state_max = compute_normalization_stats_from_episodes_stats_items(
         items, state_key=state_key, action_key=action_key
     )
+    action_min, action_max = clamp_action_stats_to_unit_bounds(action_min, action_max)
     return Normalizer(
         action_min=action_min,
         action_max=action_max,
@@ -419,7 +481,8 @@ def create_normalizer_from_lerobot_meta(
 
 def create_normalizer_from_dataset(
     dataset_path: Union[str, Path],
-    episodes_stats_filename: str = "episodes_stats.jsonl"
+    episodes_stats_filename: str = "episodes_stats.jsonl",
+    episode_indices: Optional[Iterable[int]] = None,
 ) -> Normalizer:
     """
     从数据集创建归一化器
@@ -427,6 +490,7 @@ def create_normalizer_from_dataset(
     Args:
         dataset_path: 数据集路径
         episodes_stats_filename: episodes_stats文件名（默认为episodes_stats.jsonl）
+        episode_indices: 若指定，仅聚合这些 episode 的统计
         
     Returns:
         Normalizer实例
@@ -435,9 +499,11 @@ def create_normalizer_from_dataset(
     episodes_stats_path = dataset_path / "meta" / episodes_stats_filename
     
     action_min, action_max, state_min, state_max = compute_normalization_stats_from_episodes_stats(
-        episodes_stats_path
+        episodes_stats_path,
+        episode_indices=episode_indices,
     )
-    
+    action_min, action_max = clamp_action_stats_to_unit_bounds(action_min, action_max)
+
     return Normalizer(
         action_min=action_min,
         action_max=action_max,

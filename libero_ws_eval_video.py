@@ -5,6 +5,17 @@ WebSocket eval client with configurable rollouts and per-rollout MP4 recording.
 Same closed-loop inference as libero_ws_eval.py, plus:
   - --num-rollouts: how many episodes to run per task
   - --video-dir: save one MP4 per rollout for visual debugging
+
+
+python libero_ws_eval_video.py \
+  --config config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object_task0_posttrain \
+  --task-id 0 \
+  --num-rollouts 5 \
+  --video-dir ./results/rollout_videos \
+  --camera both \
+  --chunk-steps 10
+  
 """
 
 from __future__ import annotations
@@ -32,6 +43,8 @@ async def main_async(args):
     use_normalizer = data_config.get("use_normalizer", True)
     normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+    align_joint_angles = data_config.get("align_joint_angles", True) if use_normalizer else False
+    clip_normalized_state = data_config.get("clip_normalized_state", True) if use_normalizer else False
 
     ckpt_path = args.checkpoint
     if ckpt_path is None:
@@ -76,6 +89,8 @@ async def main_async(args):
                     image_size=image_size,
                     normalize_action=normalize_action,
                     normalize_state=normalize_state,
+                    align_joint_angles=align_joint_angles,
+                    clip_normalized_state=clip_normalized_state,
                     task_id=tid,
                     init_id=init_id,
                     max_steps=args.max_steps,

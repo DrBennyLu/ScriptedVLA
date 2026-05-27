@@ -423,6 +423,8 @@ def run_inference(
     image_size: Optional[int] = None,
     normalize_action: bool = True,
     normalize_state: bool = True,
+    align_joint_angles: bool = True,
+    clip_normalized_state: bool = True,
 ) -> np.ndarray:
     """
     运行推理
@@ -437,10 +439,14 @@ def run_inference(
         image_size: int, 可选，目标图像尺寸（如果指定，会将图像resize到此尺寸）
         normalize_action: 是否对模型输出的 action 做反归一化（需 normalizer）
         normalize_state: 是否对输入 state 做归一化后再送入模型（需 normalizer）
-        
+        align_joint_angles: 仿真推理前是否将关节角 2π 对齐到 normalizer stats
+        clip_normalized_state: normalize_state 是否 clip 到 [-1, 1]
+
     Returns:
         np.ndarray: 预测的动作
     """
+    from libero_state_utils import prepare_raw_state_for_inference
+
     device = next(model.parameters()).device
     
     # 准备图像输入：将0-1归一化的tensor转换为PIL.Image（0-255范围），并resize到指定尺寸
@@ -468,7 +474,15 @@ def run_inference(
         if states.dim() == 1:
             states = states.unsqueeze(0)
         if normalize_state and normalizer is not None:
-            states = normalizer.normalize_state(states)
+            state_rows = []
+            for row in states.detach().cpu().numpy():
+                state_rows.append(
+                    prepare_raw_state_for_inference(
+                        row, normalizer, align_joint_angles=align_joint_angles
+                    )
+                )
+            states = torch.tensor(np.stack(state_rows), dtype=torch.float32, device=device)
+            states = normalizer.normalize_state(states, clip=clip_normalized_state)
     elif model.use_state:
         states = torch.zeros(1, model.state_dim, device=device)
     
@@ -609,6 +623,8 @@ def main():
     use_normalizer = data_config.get("use_normalizer", True)
     normalize_action = data_config.get("normalize_action", True) if use_normalizer else False
     normalize_state = data_config.get("normalize_state", True) if use_normalizer else False
+    align_joint_angles = data_config.get("align_joint_angles", True) if use_normalizer else False
+    clip_normalized_state = data_config.get("clip_normalized_state", True) if use_normalizer else False
     normalizer_to_use = normalizer if use_normalizer else None
     print("\n[Step 4] 运行推理...")
     predicted_actions = run_inference(
@@ -621,6 +637,8 @@ def main():
         image_size=image_size,
         normalize_action=normalize_action,
         normalize_state=normalize_state,
+        align_joint_angles=align_joint_angles,
+        clip_normalized_state=clip_normalized_state,
     )
     print(f"  ✓ 推理成功")
     print(f"    预测action chunk形状: {predicted_actions.shape}")

@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # Stage 2: posttrain on task_index=0, warm-start from pretrain checkpoint
+"""
+python train.py \
+  --config config_libero_object.yaml \
+  --dataset_path ./dada/libero-object \
+  --init_checkpoint ./checkpoints/libero_object_pretrain/checkpoint_step_100000.pt
+"""
+
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 uv sync

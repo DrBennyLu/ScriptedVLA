@@ -58,7 +58,7 @@ training:
   eval_steps: 20000
   max_eval_batches: 1
   logging_steps: 100
-  max_steps: 60000
+  max_steps: 100000
   fp16: false
   bf16: false
   lora:
@@ -86,8 +86,11 @@ dataset:
 
 data:
   use_normalizer: true
-  normalize_action: true
+  # LeRobot libero-object action 已是 OSC [-1,1]；训练时不应再归一化。新训练用 false；action stats 创建时已钳位到 [-1,1]。
+  normalize_action: false
   normalize_state: true
+  align_joint_angles: true
+  clip_normalized_state: true
   augmentation:
     enabled: false
   robot_state:
