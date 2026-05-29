@@ -445,7 +445,7 @@ def run_inference(
     Returns:
         np.ndarray: 预测的动作
     """
-    from libero_state_utils import prepare_raw_state_for_inference
+    from libero.libero_state_utils import prepare_raw_state_for_inference
 
     device = next(model.parameters()).device
     

@@ -52,6 +52,14 @@ ScriptedVLA/
 │   ├── test_image_save.py       # Simulation image capture (top/wrist cameras)
 │   ├── test_episode_data_collection.py  # Episode collection (LeRobot format or step folders)
 │   └── evaluate_vlm_capabilities.py # VLM capability evaluation script
+├── libero/                      # LIBERO-Object training & WebSocket eval (see below)
+│   ├── config_libero_object.yaml
+│   ├── config_libero_object_pretrain.yaml
+│   ├── libero_ws_eval.py        # WebSocket closed-loop eval
+│   ├── libero_ws_eval_video.py  # Eval + per-rollout MP4 recording
+│   ├── libero_benchmark_eval.py # Full benchmark + baseline report
+│   ├── libero_dataset_replay.py # Dataset episode / task helpers
+│   └── scripts/                 # train_libero_object*.sh
 ├── simulator/                   # Simulation (PyBullet)
 │   ├── __init__.py
 │   └── pick_place_env.py        # Pick-and-place env (Franka, cubes, box)
@@ -187,6 +195,86 @@ python train.py --config config.yaml --max_steps 20000 --save_steps 5000
 python train.py --config config.yaml
 # Checkpoints are saved as checkpoint_step_{step}.pt in save_dir
 ```
+
+#### LIBERO Object (training & WebSocket eval)
+
+LIBERO-Object–specific configs, helpers, and eval clients live under **`libero/`**. Run all commands from the **ScriptedVLA repo root**. Config paths use the `libero/` prefix (e.g. `libero/config_libero_object.yaml`, not the old root-level `config_libero_object.yaml`).
+
+**Directory layout:**
+
+```
+libero/
+├── config_libero_object.yaml          # Single-task posttrain + eval
+├── config_libero_object_pretrain.yaml # 10-task pretrain
+├── libero_ws_eval.py                  # WebSocket closed-loop eval
+├── libero_ws_eval_video.py            # Eval + MP4 per rollout
+├── libero_ws_eval_core.py             # Shared eval loop
+├── libero_benchmark_eval.py           # Full benchmark + baselines
+├── libero_obs_input_compare.py        # Train vs sim input comparison
+├── libero_normalizer_audit.py         # Normalizer stats audit
+├── libero_dataset_replay.py           # Episode / task_index helpers
+└── scripts/
+    ├── train_libero_object_pretrain.sh
+    ├── train_libero_object_posttrain.sh
+    └── train_libero_object.sh
+```
+
+`train.py` and `inference.py` stay at the repo root; they import helpers via `from libero.libero_dataset_replay import ...`. The generic LIBERO adapter in the package remains at `src/ScriptedVLA/data/libero_dataset.py`.
+
+**Training (LeRobot `libero-object` under `./dada/libero-object`):**
+
+```bash
+# Stage 1: pretrain on all 10 tasks
+bash libero/scripts/train_libero_object_pretrain.sh
+
+# Stage 2: posttrain on task 0 (warm-start from pretrain ckpt)
+bash libero/scripts/train_libero_object_posttrain.sh [path/to/checkpoint_step_*.pt]
+
+# Or call train.py directly
+uv run python train.py --config libero/config_libero_object_pretrain.yaml --dataset_path ./dada/libero-object
+uv run python train.py --config libero/config_libero_object.yaml --dataset_path ./dada/libero-object \
+  --init_checkpoint ./checkpoints/libero_object_pretrain/checkpoint_step_60000.pt
+```
+
+**WebSocket eval (LIBERO sim server required):**
+
+Terminal 1 — start the WebSocket server in your LIBERO environment (example):
+
+```bash
+python scripts/libero_ws_server.py --suite libero_object
+```
+
+Terminal 2 — ScriptedVLA eval (recommended: module form):
+
+```bash
+# Closed-loop eval
+uv run python -m libero.libero_ws_eval \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object
+
+# Eval with rollout videos
+uv run python -m libero.libero_ws_eval_video \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object_full_0527_200K \
+  --task-id 0 \
+  --num-rollouts 5 \
+  --video-dir ./results/rollout_videos \
+  --camera both \
+  --chunk-steps 10
+
+# Full benchmark + baseline comparison
+uv run python -m libero.libero_benchmark_eval \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object
+```
+
+Equivalent direct script path (also supported):
+
+```bash
+python libero/libero_ws_eval_video.py --config libero/config_libero_object.yaml --checkpoint-dir ./checkpoints/libero_object
+```
+
+**Common eval flags:** `--ws-url` (default `ws://127.0.0.1:8765`), `--checkpoint` (single `.pt`), `--task-id` / `--num-rollouts`, `--video-dir`, `--camera` (`agentview` | `wrist` | `both`).
 
 #### 5. Download Models
 
@@ -589,6 +677,14 @@ ScriptedVLA/
 │   ├── test_image_save.py       # 仿真图像采集（顶视/腕部相机）
 │   ├── test_episode_data_collection.py  # Episode 采集（LeRobot 格式或按步保存）
 │   └── evaluate_vlm_capabilities.py # VLM能力测评脚本
+├── libero/                      # LIBERO-Object 训练与 WebSocket 评测（见下文）
+│   ├── config_libero_object.yaml
+│   ├── config_libero_object_pretrain.yaml
+│   ├── libero_ws_eval.py        # WebSocket 闭环评测
+│   ├── libero_ws_eval_video.py  # 评测并保存每条 rollout 的 MP4
+│   ├── libero_benchmark_eval.py # 全 benchmark + 基线对比
+│   ├── libero_dataset_replay.py # 数据集 episode / task 工具
+│   └── scripts/                 # train_libero_object*.sh
 ├── simulator/                   # 仿真模块（PyBullet）
 │   ├── __init__.py
 │   └── pick_place_env.py        # 抓取-放置环境（Franka、方块、盒子）
@@ -724,6 +820,86 @@ python train.py --config config.yaml --max_steps 20000 --save_steps 5000
 python train.py --config config.yaml
 # Checkpoint 保存格式为 checkpoint_step_{step}.pt，保存在 save_dir
 ```
+
+#### LIBERO Object（训练与 WebSocket 评测）
+
+与 LIBERO-Object 相关的配置、工具脚本和 WebSocket 评测客户端统一放在 **`libero/`** 目录。请在 **ScriptedVLA 仓库根目录** 下执行命令。配置文件路径需带 `libero/` 前缀（例如 `libero/config_libero_object.yaml`，不再使用根目录下的 `config_libero_object.yaml`）。
+
+**目录结构：**
+
+```
+libero/
+├── config_libero_object.yaml          # 单 task posttrain + 评测
+├── config_libero_object_pretrain.yaml # 10 个 task 预训练
+├── libero_ws_eval.py                  # WebSocket 闭环评测
+├── libero_ws_eval_video.py            # 评测并录制 MP4
+├── libero_ws_eval_core.py             # 共享评测循环
+├── libero_benchmark_eval.py           # 全 benchmark + 基线对比
+├── libero_obs_input_compare.py        # 训练数据 vs 仿真输入对比
+├── libero_normalizer_audit.py         # 归一化统计审计
+├── libero_dataset_replay.py           # episode / task_index 工具
+└── scripts/
+    ├── train_libero_object_pretrain.sh
+    ├── train_libero_object_posttrain.sh
+    └── train_libero_object.sh
+```
+
+`train.py`、`inference.py` 仍在仓库根目录，通过 `from libero.libero_dataset_replay import ...` 引用工具模块。包内的通用 LIBERO 适配器仍在 `src/ScriptedVLA/data/libero_dataset.py`。
+
+**训练（LeRobot 格式数据默认路径 `./dada/libero-object`）：**
+
+```bash
+# 阶段 1：10 个 task 预训练
+bash libero/scripts/train_libero_object_pretrain.sh
+
+# 阶段 2：task 0 posttrain（从预训练 checkpoint 暖启动）
+bash libero/scripts/train_libero_object_posttrain.sh [path/to/checkpoint_step_*.pt]
+
+# 或直接调用 train.py
+uv run python train.py --config libero/config_libero_object_pretrain.yaml --dataset_path ./dada/libero-object
+uv run python train.py --config libero/config_libero_object.yaml --dataset_path ./dada/libero-object \
+  --init_checkpoint ./checkpoints/libero_object_pretrain/checkpoint_step_60000.pt
+```
+
+**WebSocket 评测（需先启动 LIBERO 仿真 WebSocket 服务）：**
+
+终端 1 — 在 LIBERO 环境中启动服务（示例）：
+
+```bash
+python scripts/libero_ws_server.py --suite libero_object
+```
+
+终端 2 — ScriptedVLA 评测（推荐使用模块方式）：
+
+```bash
+# 闭环评测
+uv run python -m libero.libero_ws_eval \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object
+
+# 评测并保存 rollout 视频
+uv run python -m libero.libero_ws_eval_video \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object_full_0527_200K \
+  --task-id 0 \
+  --num-rollouts 5 \
+  --video-dir ./results/rollout_videos \
+  --camera both \
+  --chunk-steps 10
+
+# 全 benchmark + 基线对比报告
+uv run python -m libero.libero_benchmark_eval \
+  --config libero/config_libero_object.yaml \
+  --checkpoint-dir ./checkpoints/libero_object
+```
+
+也可直接运行脚本路径（同样支持）：
+
+```bash
+python libero/libero_ws_eval_video.py --config libero/config_libero_object.yaml --checkpoint-dir ./checkpoints/libero_object
+```
+
+**常用评测参数：** `--ws-url`（默认 `ws://127.0.0.1:8765`）、`--checkpoint`（指定单个 `.pt`）、`--task-id` / `--num-rollouts`、`--video-dir`、`--camera`（`agentview` | `wrist` | `both`）。
 
 #### 5. 下载模型
 

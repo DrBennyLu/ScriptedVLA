@@ -1,0 +1,109 @@
+# LIBERO Object 预训练：全部 10 个 task（454 episodes）
+# 用法:
+#   uv run python train.py --config libero/config_libero_object_pretrain.yaml --dataset_path ./dada/libero-object
+#   bash libero/scripts/train_libero_object_pretrain.sh
+#
+# 预训练完成后，用 libero/config_libero_object.yaml 做单 task posttrain（见 libero/scripts/train_libero_object_posttrain.sh）
+
+model:
+  vlm:
+    model_name: "Qwen/Qwen2-VL-2B-Instruct"
+    image_size: 224
+    max_seq_length: 512
+    freeze_vlm: false
+    freeze_text_backbone: true  # 冻结 language_model + lm_head，Vision Encoder 可训练
+    cache_dir: "./cache/models"
+    use_state: false
+  action_head:
+    type: "flow_matching"
+    use_state: true
+    hidden_dim: 1536
+    num_layers: 6
+    num_heads: 12
+    mlp_ratio: 4.0
+    action_dim: 7
+    action_horizon: 15
+    num_inference_timesteps: 10
+    patch_size: 8
+    num_patches: 196
+    norm_type: "ada_norm"
+    first_step_loss_weight: 0.0
+  vla:
+    use_cross_attention: true
+    cross_attention_layers: 3
+    use_state_vlm: false
+    use_state_action_head: true
+    future_action_window_size: 14
+
+seed: 42
+
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer:
+    type: "adamw"
+    betas: [0.95, 0.999]
+    eps: 1e-8
+  scheduler:
+    type: "cosine"
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.01
+  save_dir: "./checkpoints/libero_object_pretrain"
+  save_steps: 20000
+  eval_steps: 20000
+  max_eval_batches: 1
+  logging_steps: 100
+  max_steps: 100000
+  fp16: false
+  bf16: false
+  lora:
+    enabled: false
+
+dataset:
+  local_path: "./dada/libero-object"
+  action_horizon: 15
+  image_keys:
+    - "observation.images.image"
+    - "observation.images.wrist_image"
+  state_key: "observation.state"
+  action_dim: 7
+  dataloader:
+    num_workers: 0
+    pin_memory: false
+    shuffle: true
+  task_description:
+    use_batch_task: true
+    use_tasks_jsonl: true
+  # null = 全部 10 个 task
+  task_index: null
+  eval_episode_id: null
+  episode_slice: null
+
+data:
+  use_normalizer: true
+  # LeRobot libero-object action 已是 OSC [-1,1]；训练时不应再归一化。新训练用 false；action stats 创建时已钳位到 [-1,1]。
+  normalize_action: false
+  normalize_state: true
+  align_joint_angles: true
+  clip_normalized_state: true
+  augmentation:
+    enabled: false
+  robot_state:
+    state_dim: 8
+    use_state_vlm: false
+    use_state_action_head: true
+
+inference:
+  batch_size: 1
+  max_new_tokens: 50
+
+logging:
+  use_wandb: false
+  wandb_project: "vla-libero-object-pretrain"
+  use_tensorboard: true
+  log_dir: "./logs/libero_object_pretrain"

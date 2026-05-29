@@ -3,6 +3,16 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
+_entry_path = Path(__file__).resolve().parent / "_entry.py"
+_spec = importlib.util.spec_from_file_location("libero_entry", _entry_path)
+_entry = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_entry)
+_entry.maybe_reroute_main(__name__, __package__, __file__)
+
 import argparse
 import json
 from pathlib import Path
@@ -11,9 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from libero_action_utils import action_dim_labels
-from libero_dataset_replay import resolve_training_episodes
-from libero_state_utils import state_dim_labels, state_normalization_diagnostics
+from .libero_action_utils import action_dim_labels
+from .libero_dataset_replay import resolve_training_episodes
+from .libero_state_utils import state_dim_labels, state_normalization_diagnostics
 from src.ScriptedVLA.utils import (
     Normalizer,
     clamp_action_stats_to_unit_bounds,

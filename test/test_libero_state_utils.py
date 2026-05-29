@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from libero_state_utils import align_joint_angles_to_stats, state_normalization_diagnostics
+from libero.libero_state_utils import align_joint_angles_to_stats, state_normalization_diagnostics
 from src.ScriptedVLA.utils import create_normalizer_from_dataset
 from pathlib import Path
 

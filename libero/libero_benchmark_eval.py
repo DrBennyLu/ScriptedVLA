@@ -3,6 +3,16 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
+_entry_path = Path(__file__).resolve().parent / "_entry.py"
+_spec = importlib.util.spec_from_file_location("libero_entry", _entry_path)
+_entry = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_entry)
+_entry.maybe_reroute_main(__name__, __package__, __file__)
+
 import argparse
 import asyncio
 import csv
@@ -11,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from libero_benchmark_baselines import (
+from .libero_benchmark_baselines import (
     BC_TRANSFORMER_MULTITASK,
     LIBERO_OBJECT_TASK_NAMES,
     OPENVLA_LIBERO_OBJECT,
@@ -19,9 +29,9 @@ from libero_benchmark_baselines import (
     confidence_interval,
     mean_rate,
 )
-from libero_task_mapping import map_dataset_task_indices
-from libero_ws_eval import run_eval_episode
-from libero_ws_client import LiberoWSClient
+from .libero_task_mapping import map_dataset_task_indices
+from .libero_ws_eval_core import run_eval_episode
+from .libero_ws_client import LiberoWSClient
 from inference import find_latest_checkpoint, load_model_from_checkpoint
 from src.ScriptedVLA.utils import get_data_config, load_config
 
@@ -44,7 +54,7 @@ async def run_benchmark(
     align_joint_angles: bool = True,
     clip_normalized_state: bool = True,
 ) -> List[dict]:
-    from libero_ws_mock_client import run_episode as run_mock_episode
+    from .libero_ws_mock_client import run_episode as run_mock_episode
 
     results = []
     async with LiberoWSClient(ws_url) as client:
@@ -257,7 +267,7 @@ async def main_async(args):
 def main():
     parser = argparse.ArgumentParser(description="LIBERO-Object WebSocket benchmark")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8765")
-    parser.add_argument("--config", default="config_libero_object.yaml")
+    parser.add_argument("--config", default="libero/config_libero_object.yaml")
     parser.add_argument("--checkpoint-dir", default="./checkpoints/libero_object")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default=None)

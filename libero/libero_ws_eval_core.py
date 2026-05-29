@@ -7,10 +7,10 @@ from typing import Optional
 import numpy as np
 
 from inference import run_inference
-from libero_action_adapter import model_action_to_libero
-from libero_obs_adapter import ws_obs_to_model_inputs
-from libero_rollout_video import RolloutVideoRecorder
-from libero_ws_client import LiberoWSClient
+from .libero_action_adapter import model_action_to_libero
+from .libero_obs_adapter import ws_obs_to_model_inputs
+from .libero_rollout_video import RolloutVideoRecorder
+from .libero_ws_client import LiberoWSClient
 
 
 async def run_eval_episode(

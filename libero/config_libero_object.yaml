@@ -1,0 +1,204 @@
+# LIBERO Object 单 task posttrain 与 WebSocket 评测配置
+# 用法:
+#   # Stage 2 posttrain（从 pretrain 权重暖启动，推荐）:
+#   uv run python train.py --config libero/config_libero_object.yaml --dataset_path ./dada/libero-object \
+#     --init_checkpoint ./checkpoints/libero_object_pretrain/checkpoint_step_60000.pt
+#   bash libero/scripts/train_libero_object_posttrain.sh [pretrain_ckpt_path]
+#
+#   # 或直接在下方 training.init_checkpoint 填写 pretrain ckpt 路径
+#   uv run python train.py --config libero/config_libero_object.yaml --dataset_path ./dada/libero-object
+#
+#   uv run python -m libero.libero_ws_eval --config libero/config_libero_object.yaml --checkpoint-dir ./checkpoints/libero_object_task0_posttrain
+#   python -m libero.libero_ws_eval_video --config libero/config_libero_object.yaml --checkpoint-dir ./checkpoints/libero_object_task0_posttrain --num-rollouts 5 --video-dir ./results/rollout_videos --camera both --chunk-steps 10
+#   (--task-id 默认读取 config dataset.task_index，并按数据集 task_index 映射到 LIBERO benchmark task_id)
+
+model:
+  vlm:
+    model_name: "Qwen/Qwen2-VL-2B-Instruct"
+    image_size: 224
+    max_seq_length: 512
+    freeze_vlm: false
+    freeze_text_backbone: false  # 冻结 language_model + lm_head，Vision Encoder 可训练
+    cache_dir: "./cache/models"
+    use_state: false
+  action_head:
+    type: "flow_matching"
+    use_state: true
+    hidden_dim: 1536
+    num_layers: 6
+    num_heads: 12
+    mlp_ratio: 4.0
+    action_dim: 7
+    action_horizon: 10
+    num_inference_timesteps: 10
+    patch_size: 8
+    num_patches: 196
+    norm_type: "ada_norm"
+    first_step_loss_weight: 0.0
+  vla:
+    use_cross_attention: true
+    cross_attention_layers: 3
+    use_state_vlm: false
+    use_state_action_head: true
+    future_action_window_size: 9
+
+seed: 42
+
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 3e-5
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer:
+    type: "adamw"
+    betas: [0.95, 0.999]
+    eps: 1e-8
+  scheduler:
+    type: "cosine"
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.01
+  save_dir: "./checkpoints/libero_object_full_0527_200K"
+  save_steps: 100000
+  eval_steps: 100000
+  max_eval_batches: 1
+  logging_steps: 100
+  max_steps: 200000
+  fp16: false
+  bf16: false
+  lora:
+    enabled: false
+  # posttrain 暖启动：设为 pretrain 最新 checkpoint；null 则从 Qwen base 随机初始化动作头
+  init_checkpoint: null
+  # true: 沿用 pretrain checkpoint 内 normalizer（全数据集 episodes_stats，与 pretrain 权重一致）
+  # false: 按当前 dataset.task_index / episode_slice 子集重算 normalizer（需配合修复后的 subset 聚合）
+  init_checkpoint_normalizer: true
+
+dataset:
+  local_path: "./dada/libero-object"
+  action_horizon: 10
+  image_keys:
+    - "observation.images.image"
+    - "observation.images.wrist_image"
+  state_key: "observation.state"
+  action_dim: 7
+  dataloader:
+    num_workers: 0
+    pin_memory: false
+    shuffle: true
+  task_description:
+    use_batch_task: true
+    use_tasks_jsonl: true
+  # 任务筛选：null 表示全部任务；设为 0-9 则只使用该 task_index 的 episode
+  task_index: null
+  # 评估默认 episode；null 且指定 task_index 时，自动取该任务第一个 episode
+  eval_episode_id: 0
+  episode_slice: null
+
+data:
+  use_normalizer: true
+  # LeRobot libero-object action 已是 7-dim OSC [-1,1]；训练时不应再 min-max 归一化（见 normalization.py）。
+  # false = GT/模型输出均在 [-1,1]（推荐新训练）。已有 normalize_action=true 的 checkpoint 推理时请改回 true。
+  normalize_action: false
+  normalize_state: true
+  # 仿真推理：关节角 2π 对齐到 normalizer stats，再归一化
+  align_joint_angles: true
+  # normalize_state 输出 clip 到 [-1,1]，防止仿真 OOD state 送入模型
+  clip_normalized_state: true
+  augmentation:
+    enabled: false
+  robot_state:
+    state_dim: 8  # 6 arm joints + 2 gripper finger qpos (LeRobot libero-object convention)
+    use_state_vlm: false
+    use_state_action_head: true
+
+inference:
+  batch_size: 1
+  max_new_tokens: 50
+
+logging:
+  use_wandb: false
+  wandb_project: "vla-libero-object"
+  use_tensorboard: true
+  log_dir: "./logs/libero_object_task0_posttrain"
+
+# RL token 提取器预训练（train_rl_token.py 唯一读取此块）
+# 用法: uv run python train_rl_token.py
+train_rl_token:
+  vla_checkpoint: "./checkpoints/libero_object_full_0527_200K/checkpoint_step_200000.pt"
+  # vla_checkpoint_dir: null
+
+  dataset:
+    local_path: "./dada/libero-object"
+    task_index: 6
+    episode_slice: null
+
+  save_dir: "./checkpoints/libero_object_rl_token_task6"
+
+  device: "cuda"
+  seed: null
+  validate_vla_checkpoint: true
+
+  align_dims_to_vla: true
+  network:
+    model_dim: null
+    rl_token_dim: null  # 1536
+    num_encoder_layers: 2
+    num_decoder_layers: 2
+    num_heads: 8
+    ffn_dim: null
+    dropout: 0.1
+
+  training:
+    batch_size: 8
+    learning_rate: 1e-4 # 1e-5
+    weight_decay: 0.0
+    max_steps: 10000
+    save_steps: 2000
+    logging_steps: 50
+    num_workers: 0
+
+# RL TD3 离线训练（train_rl_td3.py 唯一读取此块）
+# 用法: uv run python train_rl_td3.py
+train_rl_td3:
+  vla_checkpoint: "./checkpoints/libero_object_full_0527_200K/checkpoint_step_200000.pt"
+  rl_token_checkpoint: "./checkpoints/libero_object_rl_token_task6/rl_token_step_10000.pt"
+  rl_chunk_size: 10
+
+  dataset:
+    local_path: "./dada/libero-object"
+    task_index: 6
+    episode_slice: null
+
+  save_dir: "./checkpoints/libero_object_rl_td3_task6"
+  device: "cuda"
+  seed: 42
+  validate_vla_checkpoint: true
+
+  replay:
+    capacity: 4000000
+    stride: 2
+
+  training:
+    batch_size: 32
+    num_updates: 100000
+    update_ratio: 3
+    logging_steps: 50
+    save_steps: 0
+
+  td3:
+    gamma: 0.99
+    tau: 0.005
+    actor_lr: 1.0e-4
+    critic_lr: 1.0e-3
+    policy_noise: 0.2
+    noise_clip: 0.5
+    policy_delay: 2
+    actor_std: 0.1
+    max_action: 1.0
+    ref_mask_prob: 0.5
+    policy_constraint_beta: 0.1
+    use_chunk_return_target: true
+    hidden_dims: [256, 256]

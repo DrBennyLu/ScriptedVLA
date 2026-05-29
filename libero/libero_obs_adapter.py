@@ -16,7 +16,7 @@ def decode_b64_image(
     flip_vertical: bool = True,
     flip_horizontal: bool = True,
 ) -> np.ndarray:
-    """Decode a JPEG base64 camera frame from libero_ws_server.
+    """Decode a JPEG base64 camera frame from .libero_ws_server.
 
     Applies orientation fixes to match the libero-object training dataset:
       - vertical flip (``arr[::-1]``): LIBERO / video_utils convention

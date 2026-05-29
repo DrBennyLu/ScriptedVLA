@@ -3,6 +3,16 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
+_entry_path = Path(__file__).resolve().parent / "_entry.py"
+_spec = importlib.util.spec_from_file_location("libero_entry", _entry_path)
+_entry = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_entry)
+_entry.maybe_reroute_main(__name__, __package__, __file__)
+
 import argparse
 import asyncio
 import json
@@ -12,15 +22,15 @@ from typing import List, Optional
 
 import numpy as np
 
-from libero_action_adapter import random_action, validate_action, zero_action
-from libero_dataset_replay import (
+from .libero_action_adapter import random_action, validate_action, zero_action
+from .libero_dataset_replay import (
     find_episode_by_instruction,
     find_first_episode_for_task,
     load_episode_actions,
 )
-from libero_task_mapping import add_task_id_cli_arguments, resolve_benchmark_task_ids
-from libero_rollout_video import RolloutVideoRecorder, rollout_video_path
-from libero_ws_client import LiberoWSClient
+from .libero_task_mapping import add_task_id_cli_arguments, resolve_benchmark_task_ids
+from .libero_rollout_video import RolloutVideoRecorder, rollout_video_path
+from .libero_ws_client import LiberoWSClient
 
 
 async def run_episode(

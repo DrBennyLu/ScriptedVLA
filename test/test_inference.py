@@ -51,7 +51,7 @@ from inference import (
     load_dataset_episode,
     find_latest_checkpoint,
 )
-from libero_dataset_replay import resolve_eval_episode_id
+from libero.libero_dataset_replay import resolve_eval_episode_id
 from src.ScriptedVLA.model import QwenGR00TVLAModel
 from src.ScriptedVLA.utils import load_config, load_script_config, get_data_config, get_model_config, Normalizer
 from src.ScriptedVLA.data.lerobot_dataset_adapter import LeRobotDatasetAdapter

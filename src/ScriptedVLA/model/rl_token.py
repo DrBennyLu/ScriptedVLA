@@ -99,24 +99,25 @@ class RLTokenBottleneck(nn.Module):
         Returns:
             pred_z: [B, M, input_dim]
         """
-        if z_tokens.dim() != 3:
+        if z_tokens.dim() != 3: # 批次， vla的token数， vla的特征维度
             raise ValueError(f"Expected z_tokens with shape [B, M, D], got {tuple(z_tokens.shape)}")
         bsz, seq_len, _ = z_tokens.shape
-        if z_rl.dim() != 2 or z_rl.shape[0] != bsz:
+        if z_rl.dim() != 2 or z_rl.shape[0] != bsz: # encoder 输出的rl token
             raise ValueError(f"Expected z_rl with shape [B, D_rl], got {tuple(z_rl.shape)}")
 
-        z_rl = self.rl_in_proj(z_rl)
+        z_rl = self.rl_in_proj(z_rl)    # 将rl token投影[B,model_dim]
 
-        memory = z_rl.unsqueeze(1)  # [B, 1, model_dim]
+        memory = z_rl.unsqueeze(1)  # [B, 1, model_dim]， decoder全程只看 memory， 用它还原整个序列
 
-        z_shift = z_tokens.detach()
-        z_shift = self.target_input_proj(z_shift)
-        start = self.decoder_input_start.expand(bsz, 1, -1)
-        dec_in = torch.cat([start, z_shift[:, :-1, :]], dim=1)
+        # 构造decoder输入， 自回归+教师强制
+        z_shift = z_tokens.detach() # 只当作decoder的输入，不参与训练，vla的原始输出。冻结梯度，不更新vla
+        z_shift = self.target_input_proj(z_shift)   # 投影[B,M,model_dim]
+        start = self.decoder_input_start.expand(bsz, 1, -1)  # [B,1,model_dim]，起始符
+        dec_in = torch.cat([start, z_shift[:, :-1, :]], dim=1)  # 拼接 b,M+1, model_dim
 
-        mask = _causal_mask(seq_len, dec_in.device)
-        dec_out = self.decoder(tgt=dec_in, memory=memory, tgt_mask=mask)
-        return self.recon_out_proj(dec_out)
+        mask = _causal_mask(seq_len, dec_in.device) # 因果掩码，上三角，只能看以前的输入token
+        dec_out = self.decoder(tgt=dec_in, memory=memory, tgt_mask=mask)    # dec_in 带起始符的移位序列
+        return self.recon_out_proj(dec_out) # 输出重建的vla的token，可以和输入进行对比，计算mse loss
 
     def reconstruction_loss(self, z_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

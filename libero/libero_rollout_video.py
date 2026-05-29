@@ -8,7 +8,7 @@ from typing import List, Literal, Optional
 import imageio
 import numpy as np
 
-from libero_obs_adapter import decode_b64_image
+from .libero_obs_adapter import decode_b64_image
 
 CameraMode = Literal["agentview", "wrist", "both"]
 

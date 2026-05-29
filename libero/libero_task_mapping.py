@@ -7,8 +7,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from libero_benchmark_baselines import LIBERO_OBJECT_TASK_NAMES
-from libero_dataset_replay import normalize_instruction
+from .libero_benchmark_baselines import LIBERO_OBJECT_TASK_NAMES
+from .libero_dataset_replay import normalize_instruction
 
 
 def benchmark_task_language(task_id: int) -> str:
@@ -76,7 +76,7 @@ def map_dataset_task_indices(dataset_path: str, dataset_task_indices: Sequence[i
 
 def format_task_mapping_line(dataset_path: str, dataset_task_index: int) -> str:
     benchmark_id = dataset_task_index_to_benchmark_task_id(dataset_path, dataset_task_index)
-    from libero_dataset_replay import get_task_description
+    from .libero_dataset_replay import get_task_description
 
     text = get_task_description(dataset_path, dataset_task_index)
     return (

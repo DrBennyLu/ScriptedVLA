@@ -8,8 +8,8 @@ Inference path: LiberoWSClient.create_episode -> ws_obs_to_model_inputs -> prepa
 Usage:
   # Terminal 1 (LIBERO env): python scripts/libero_ws_server.py --suite libero_object
   # Terminal 2 (ScriptedVLA env):
-  python libero_obs_input_compare.py \\
-    --config config_libero_object.yaml \\
+  python -m libero.libero_obs_input_compare \\
+    --config libero/config_libero_object.yaml \\
     --dataset-path ./dada/libero-object \\
     --ws-url ws://127.0.0.1:8765 \\
     --task-index 0 \\
@@ -19,11 +19,20 @@ Usage:
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
+_entry_path = Path(__file__).resolve().parent / "_entry.py"
+_spec = importlib.util.spec_from_file_location("libero_entry", _entry_path)
+_entry = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_entry)
+_entry.maybe_reroute_main(__name__, __package__, __file__)
+
 import argparse
 import asyncio
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -32,12 +41,12 @@ import torch
 from PIL import Image
 
 from inference import find_latest_checkpoint, load_model_from_checkpoint, prepare_images_input, run_inference
-from libero_action_utils import action_dim_labels
-from libero_dataset_replay import get_task_description, resolve_eval_episode_id
-from libero_state_utils import state_normalization_diagnostics
-from libero_obs_adapter import decode_b64_image, ws_obs_to_model_inputs
-from libero_task_mapping import dataset_task_index_to_benchmark_task_id
-from libero_ws_client import LiberoWSClient
+from .libero_action_utils import action_dim_labels
+from .libero_dataset_replay import get_task_description, resolve_eval_episode_id
+from .libero_state_utils import state_normalization_diagnostics
+from .libero_obs_adapter import decode_b64_image, ws_obs_to_model_inputs
+from .libero_task_mapping import dataset_task_index_to_benchmark_task_id
+from .libero_ws_client import LiberoWSClient
 from src.ScriptedVLA.utils import get_data_config, load_config
 from src.ScriptedVLA.utils.normalization import (
     create_normalizer_from_dataset,
@@ -870,7 +879,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compare dataset vs sim obs at VLA model input boundary"
     )
-    parser.add_argument("--config", default="config_libero_object.yaml")
+    parser.add_argument("--config", default="libero/config_libero_object.yaml")
     parser.add_argument("--dataset-path", default="./dada/libero-object")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8765")
     parser.add_argument("--suite", default="libero_object")

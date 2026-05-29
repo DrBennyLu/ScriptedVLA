@@ -3,14 +3,23 @@
 
 from __future__ import annotations
 
-import argparse
-import asyncio
+import importlib.util
 from pathlib import Path
 
+_entry_path = Path(__file__).resolve().parent / "_entry.py"
+_spec = importlib.util.spec_from_file_location("libero_entry", _entry_path)
+_entry = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_entry)
+_entry.maybe_reroute_main(__name__, __package__, __file__)
+
+import argparse
+import asyncio
+
 from inference import find_latest_checkpoint, load_model_from_checkpoint
-from libero_task_mapping import add_task_id_cli_arguments, resolve_task_ids_from_args
-from libero_ws_client import LiberoWSClient
-from libero_ws_eval_core import run_eval_episode
+from .libero_task_mapping import add_task_id_cli_arguments, resolve_task_ids_from_args
+from .libero_ws_client import LiberoWSClient
+from .libero_ws_eval_core import run_eval_episode
 from src.ScriptedVLA.utils import get_data_config, load_config
 
 
@@ -78,7 +87,7 @@ async def main_async(args):
 def main():
     parser = argparse.ArgumentParser(description="LIBERO WebSocket VLA eval client")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8765")
-    parser.add_argument("--config", default="config_libero_object.yaml")
+    parser.add_argument("--config", default="libero/config_libero_object.yaml")
     parser.add_argument("--checkpoint-dir", default="./checkpoints/libero_object")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default=None)

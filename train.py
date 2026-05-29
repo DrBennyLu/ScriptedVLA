@@ -53,7 +53,7 @@ from src.ScriptedVLA.utils import (
     create_normalizer_from_lerobot_meta,
     Normalizer,
 )
-from libero_dataset_replay import resolve_training_episodes, get_task_description
+from libero.libero_dataset_replay import resolve_training_episodes, get_task_description
 from src.ScriptedVLA.cli import add_common_args, parse_common_args
 
 try:
