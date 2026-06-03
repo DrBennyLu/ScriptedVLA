@@ -8,6 +8,7 @@ license: MIT
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import random
 from collections import defaultdict, deque
@@ -242,15 +243,24 @@ def load_trained_modules(
 
 @dataclass
 class ReplayTransition:
+    """Offline transition: (x_t, a_t, a_t_hat, r_t, x_{t+C}) with precomputed z_rl."""
+
     sample_index: int
     next_sample_index: int
     episode_id: int
+    z_rl: torch.Tensor
     state: torch.Tensor
-    next_state: torch.Tensor
-    gt_action_chunk: torch.Tensor
+    action: torch.Tensor
+    ref_action: torch.Tensor
     reward: float
     chunk_return: float
     done: float
+    next_z_rl: torch.Tensor
+    next_state: torch.Tensor
+    next_ref_action: torch.Tensor
+
+
+REPLAY_CACHE_VERSION = 1
 
 
 class ReplayBuffer:
@@ -265,6 +275,187 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int) -> List[ReplayTransition]:
         return random.sample(list(self.buf), min(batch_size, len(self.buf)))
+
+
+def sample_mixed_batch(
+    online_replay: ReplayBuffer,
+    offline_replay: Optional[ReplayBuffer],
+    batch_size: int,
+    online_sample_ratio: float,
+) -> List[ReplayTransition]:
+    """
+    Build a training batch by Bernoulli mixing per slot:
+    P(sample from online) = online_sample_ratio, else offline replay_cache.
+    Falls back to the non-empty buffer when the other is empty.
+    """
+    ratio = float(np.clip(online_sample_ratio, 0.0, 1.0))
+    batch_size = max(1, int(batch_size))
+    has_online = len(online_replay) > 0
+    has_offline = offline_replay is not None and len(offline_replay) > 0
+
+    if not has_online and not has_offline:
+        return []
+    if not has_offline:
+        return online_replay.sample(batch_size)
+    if not has_online:
+        return offline_replay.sample(batch_size)
+
+    online_list = list(online_replay.buf)
+    offline_list = list(offline_replay.buf)
+    batch: List[ReplayTransition] = []
+    for _ in range(batch_size):
+        if random.random() < ratio:
+            batch.append(random.choice(online_list))
+        else:
+            batch.append(random.choice(offline_list))
+    return batch
+
+
+def sample_mixed_batch_with_sources(
+    online_replay: ReplayBuffer,
+    offline_replay: Optional[ReplayBuffer],
+    batch_size: int,
+    online_sample_ratio: float,
+) -> tuple[List[ReplayTransition], List[str]]:
+    """
+    Like sample_mixed_batch but tags each slot as 'online' or 'offline' for split metrics.
+    """
+    ratio = float(np.clip(online_sample_ratio, 0.0, 1.0))
+    batch_size = max(1, int(batch_size))
+    has_online = len(online_replay) > 0
+    has_offline = offline_replay is not None and len(offline_replay) > 0
+
+    if not has_online and not has_offline:
+        return [], []
+    if not has_offline:
+        batch = online_replay.sample(batch_size)
+        return batch, ["online"] * len(batch)
+    if not has_online:
+        batch = offline_replay.sample(batch_size)
+        return batch, ["offline"] * len(batch)
+
+    online_list = list(online_replay.buf)
+    offline_list = list(offline_replay.buf)
+    batch: List[ReplayTransition] = []
+    sources: List[str] = []
+    for _ in range(batch_size):
+        if random.random() < ratio:
+            batch.append(random.choice(online_list))
+            sources.append("online")
+        else:
+            batch.append(random.choice(offline_list))
+            sources.append("offline")
+    return batch, sources
+
+
+def online_chunk_reward_fields(
+    *,
+    episode_done: bool,
+    episode_success: bool,
+    gamma: float = 0.99,
+    chunk_size: int = 10,
+) -> tuple[float, float, float]:
+    """
+    Align online WS rewards with offline replay semantics.
+
+    Offline: reward/chunk_return are nonzero only on terminal chunks (episode end).
+    Online (legacy): reward=1 for any step after success with done=0 — inflates Q targets.
+    """
+    terminal = 1.0 if episode_done else 0.0
+    if episode_done and episode_success:
+        reward = 1.0
+        chunk_return = float(gamma ** 0)
+    else:
+        reward = 0.0
+        chunk_return = 0.0
+    return reward, chunk_return, terminal
+
+
+def transition_action_ref_mse(tr: ReplayTransition) -> float:
+    """Mean squared error between stored action chunk and ref_action."""
+    if tr.action.numel() == 0 or tr.ref_action.numel() == 0:
+        return 0.0
+    return float(torch.mean((tr.action - tr.ref_action) ** 2).item())
+
+
+def summarize_replay_buffer(replay: ReplayBuffer, *, label: str, max_samples: int = 5000) -> Dict[str, float]:
+    """Aggregate reward/ref/action stats for offline vs online replay audit."""
+    if len(replay) == 0:
+        return {"label": label, "size": 0.0}
+
+    buf = list(replay.buf)
+    if len(buf) > max_samples:
+        buf = random.sample(buf, max_samples)
+
+    rewards = [float(tr.reward) for tr in buf]
+    chunk_returns = [float(tr.chunk_return) for tr in buf]
+    dones = [float(tr.done) for tr in buf]
+    ref_mses = [transition_action_ref_mse(tr) for tr in buf]
+    action_norms = [float(tr.action.norm().item()) for tr in buf if tr.action.numel() > 0]
+
+    states = [tr.state for tr in buf if tr.state is not None and tr.state.numel() > 0]
+    state_min = state_max = state_mean = float("nan")
+    if states:
+        stacked = torch.stack(states, dim=0).float()
+        state_min = float(stacked.min().item())
+        state_max = float(stacked.max().item())
+        state_mean = float(stacked.mean().item())
+
+    mid_success = sum(
+        1 for tr in buf if float(tr.reward) > 0.0 and float(tr.done) < 0.5
+    )
+
+    return {
+        "label": label,
+        "size": float(len(replay)),
+        "sampled": float(len(buf)),
+        "positive_reward_rate": float(sum(1 for r in rewards if r > 0.0) / len(buf)),
+        "chunk_return_mean": float(np.mean(chunk_returns)),
+        "done_rate": float(np.mean(dones)),
+        "mid_episode_success_reward_count": float(mid_success),
+        "action_ref_mse_mean": float(np.mean(ref_mses)) if ref_mses else 0.0,
+        "action_norm_mean": float(np.mean(action_norms)) if action_norms else 0.0,
+        "state_min": state_min,
+        "state_max": state_max,
+        "state_mean": state_mean,
+    }
+
+
+def train_from_batch_with_diagnostics(
+    agent: TD3ChunkAgent,
+    batch: List[ReplayTransition],
+    sources: Optional[List[str]] = None,
+    apply_ref_mask: bool = True,
+    provider: Optional[OnlineFeatureProvider] = None,
+) -> Dict[str, float]:
+    """train_from_batch plus per-source action-ref MSE when sources are provided."""
+    metrics = train_from_batch(agent, batch, apply_ref_mask=apply_ref_mask, provider=provider)
+    if not sources or len(sources) != len(batch):
+        return metrics
+
+    online_mses = []
+    offline_mses = []
+    for tr, src in zip(batch, sources):
+        mse = transition_action_ref_mse(tr)
+        if src == "online":
+            online_mses.append(mse)
+        else:
+            offline_mses.append(mse)
+    if online_mses:
+        metrics["online_action_ref_mse"] = float(np.mean(online_mses))
+    if offline_mses:
+        metrics["offline_action_ref_mse"] = float(np.mean(offline_mses))
+    metrics["batch_online_frac"] = float(sum(1 for s in sources if s == "online") / len(sources))
+    return metrics
+
+
+def replay_positive_reward_stats(replay: ReplayBuffer) -> Dict[str, float]:
+    """Fraction of transitions with reward > 0 (for logging)."""
+    if len(replay) == 0:
+        return {"size": 0.0, "positive_reward_rate": 0.0}
+    positive = sum(1 for tr in replay.buf if float(tr.reward) > 0.0)
+    size = len(replay)
+    return {"size": float(size), "positive_reward_rate": float(positive / size)}
 
 
 def collect_task_episode_ids(dataset: LeRobotDataset, task_index: int) -> List[int]:
@@ -290,6 +481,225 @@ def build_episode_index(dataset: LeRobotDataset) -> Dict[int, List[int]]:
     return dict(episode_to_indices)
 
 
+def _proprio_from_sample(sample: Dict, state_key: str, fallback: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if state_key in sample:
+        state = sample[state_key]
+    elif fallback is not None:
+        state = fallback
+    else:
+        raise KeyError(f"sample missing state key: {state_key}")
+    if isinstance(state, torch.Tensor):
+        if state.dim() > 1:
+            state = state.reshape(-1)
+        return state.to(dtype=torch.float32).detach().cpu()
+    return torch.as_tensor(state, dtype=torch.float32)
+
+
+@dataclass
+class _ReplayBuildRow:
+    sample_index: int
+    next_sample_index: int
+    episode_id: int
+    state: torch.Tensor
+    next_state: torch.Tensor
+    action: torch.Tensor
+    ref_action: torch.Tensor
+    next_ref_action: torch.Tensor
+    reward: float
+    chunk_return: float
+    done: float
+
+
+def _collect_replay_rows(
+    dataset: LeRobotDataset,
+    episode_to_indices: Dict[int, List[int]],
+    state_key: str,
+    chunk_len: int,
+    stride: int,
+    gamma: float,
+) -> List[_ReplayBuildRow]:
+    rows: List[_ReplayBuildRow] = []
+    for episode_id, indices in episode_to_indices.items():
+        if len(indices) < chunk_len + 1:
+            continue
+        for local_start in range(0, len(indices) - chunk_len, stride):
+            current_idx = indices[local_start]
+            next_local = local_start + chunk_len
+            next_idx = indices[next_local]
+            sample = dataset[current_idx]
+            next_sample = dataset[next_idx]
+            actions = sample["action"]
+            if actions.shape[0] < chunk_len:
+                continue
+            action_chunk = actions[:chunk_len].to(dtype=torch.float32).detach().cpu()
+            next_actions = next_sample["action"]
+            if next_actions.shape[0] < chunk_len:
+                continue
+            next_action_chunk = next_actions[:chunk_len].to(dtype=torch.float32).detach().cpu()
+            state = _proprio_from_sample(sample, state_key)
+            next_state = _proprio_from_sample(
+                next_sample,
+                state_key,
+                fallback=state,
+            )
+            terminal = 1.0 if next_local >= len(indices) - 1 else 0.0
+            reward = 1.0 if terminal > 0.5 else 0.0
+            episode_last_local = len(indices) - 1
+            chunk_end_local = min(local_start + chunk_len - 1, episode_last_local)
+            if local_start <= episode_last_local <= chunk_end_local:
+                reward_step_offset = episode_last_local - local_start
+                chunk_return = float((gamma ** reward_step_offset) * 1.0)
+            else:
+                chunk_return = 0.0
+            rows.append(
+                _ReplayBuildRow(
+                    sample_index=current_idx,
+                    next_sample_index=next_idx,
+                    episode_id=episode_id,
+                    state=state,
+                    next_state=next_state,
+                    action=action_chunk,
+                    ref_action=action_chunk.clone(),
+                    next_ref_action=next_action_chunk,
+                    reward=reward,
+                    chunk_return=chunk_return,
+                    done=terminal,
+                )
+            )
+    return rows
+
+
+@torch.no_grad()
+def precompute_frame_features(
+    dataset: LeRobotDataset,
+    sample_indices: List[int],
+    image_keys: List[str],
+    state_key: str,
+    vla_model,
+    rl_encoder,
+    device: torch.device,
+    batch_size: int = 8,
+) -> Dict[int, torch.Tensor]:
+    unique = sorted(set(sample_indices))
+    z_by_index: Dict[int, torch.Tensor] = {}
+    for start in tqdm(range(0, len(unique), batch_size), desc="precompute_z_rl", leave=False):
+        batch_indices = unique[start : start + batch_size]
+        for idx in batch_indices:
+            sample = dataset[idx]
+            inputs = build_single_input(sample, image_keys, state_key, device)
+            z_tokens = vla_model.extract_vla_tokens(inputs)
+            z_rl = rl_encoder.encode(z_tokens).float().squeeze(0).detach().cpu()
+            z_by_index[idx] = z_rl
+    return z_by_index
+
+
+def resolve_rl_token_dim_for_meta(
+    rl_token_checkpoint: str | Path,
+    raw_config: Dict[str, Any],
+    rl_token_network_cfg: Optional[Dict[str, Any]] = None,
+    default: int = 256,
+) -> int:
+    """Resolve RL token dim for replay cache meta (config -> RL checkpoint -> default)."""
+    token_block = raw_config.get("train_rl_token") or {}
+    network_cfg = rl_token_network_cfg if rl_token_network_cfg is not None else (token_block.get("network") or {})
+    dim = network_cfg.get("rl_token_dim")
+    if dim is not None:
+        return int(dim)
+
+    model_rl = (raw_config.get("model") or {}).get("rl_token") or {}
+    dim = model_rl.get("rl_token_dim")
+    if dim is not None:
+        return int(dim)
+
+    rl_path = Path(rl_token_checkpoint).expanduser().resolve()
+    if rl_path.is_file():
+        try:
+            ckpt = torch.load(rl_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(rl_path, map_location="cpu")
+        ckpt_dim = ckpt.get("rl_token_dim") or ckpt.get("model_dim")
+        if ckpt_dim is not None:
+            return int(ckpt_dim)
+    return int(default)
+
+
+def build_replay_cache_meta(
+    *,
+    chunk_len: int,
+    stride: int,
+    gamma: float,
+    state_dim: int,
+    rl_token_dim: int,
+    dataset_path: str,
+    episodes: Optional[List[int]],
+    vla_checkpoint: str,
+    rl_token_checkpoint: str,
+    config_path: str,
+    task_index: Optional[int],
+) -> Dict[str, Any]:
+    ep_payload = json.dumps(sorted(episodes) if episodes is not None else "all", sort_keys=True)
+    return {
+        "version": REPLAY_CACHE_VERSION,
+        "chunk_len": int(chunk_len),
+        "stride": int(stride),
+        "gamma": float(gamma),
+        "state_dim": int(state_dim),
+        "rl_token_dim": int(rl_token_dim),
+        "dataset_path": str(Path(dataset_path).resolve()),
+        "episodes_hash": hashlib.sha256(ep_payload.encode()).hexdigest()[:16],
+        "vla_checkpoint": str(Path(vla_checkpoint).resolve()),
+        "rl_token_checkpoint": str(Path(rl_token_checkpoint).resolve()),
+        "config_path": str(Path(config_path).resolve()),
+        "task_index": task_index,
+    }
+
+
+def replay_cache_matches(expected: Dict[str, Any], cached: Dict[str, Any]) -> Tuple[bool, str]:
+    keys = (
+        "version",
+        "chunk_len",
+        "stride",
+        "gamma",
+        "state_dim",
+        "rl_token_dim",
+        "dataset_path",
+        "episodes_hash",
+        "vla_checkpoint",
+        "rl_token_checkpoint",
+        "config_path",
+        "task_index",
+    )
+    for key in keys:
+        if expected.get(key) != cached.get(key):
+            return False, f"mismatch on {key}: expected={expected.get(key)!r}, cached={cached.get(key)!r}"
+    return True, "ok"
+
+
+def save_replay_buffer(path: Path, replay: ReplayBuffer, meta: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"meta": meta, "transitions": list(replay.buf)}, path)
+    print(f"[replay] saved cache: {path} ({len(replay)} transitions)")
+
+
+def load_replay_buffer(path: Path, capacity: int) -> Tuple[ReplayBuffer, Dict[str, Any]]:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    meta = payload["meta"]
+    replay = ReplayBuffer(capacity=capacity)
+    for tr in payload["transitions"]:
+        if isinstance(tr, dict):
+            tr = ReplayTransition(**tr)
+        replay.add(tr)
+    print(f"[replay] loaded cache: {path} ({len(replay)} transitions)")
+    return replay, meta
+
+
 def build_replay_from_dataset(
     dataset: LeRobotDataset,
     episode_to_indices: Dict[int, List[int]],
@@ -299,52 +709,57 @@ def build_replay_from_dataset(
     gamma: float,
     device: torch.device,
     capacity: int,
+    vla_model,
+    rl_encoder,
+    image_keys: List[str],
+    feature_batch_size: int = 8,
 ) -> ReplayBuffer:
     print("[replay] building ReplayBuffer from dataset...")
-    replay = ReplayBuffer(capacity=capacity)
-    for episode_id, indices in tqdm(
-        episode_to_indices.items(),
-        total=len(episode_to_indices),
-        desc="build_replay",
-        leave=False,
-    ):
-        if len(indices) < chunk_len + 1:
-            continue
-        for local_start in range(0, len(indices) - 1, stride):
-            current_idx = indices[local_start]
-            next_idx = indices[min(local_start + 1, len(indices) - 1)]
-            sample = dataset[current_idx]
-            next_sample = dataset[next_idx]
-            actions = sample["action"]
-            if actions.shape[0] < chunk_len:
-                continue
-            action_chunk = actions[:chunk_len].to(dtype=torch.float32)
-            state = sample[state_key] if state_key in sample else torch.zeros_like(next_sample[state_key])
-            next_state = next_sample[state_key] if state_key in next_sample else state
-            terminal = 1.0 if local_start + stride >= len(indices) - 1 else 0.0
-            reward = 1.0 if terminal > 0.5 else 0.0
-            episode_last_local = len(indices) - 1
-            chunk_end_local = min(local_start + chunk_len - 1, episode_last_local)
-            if local_start <= episode_last_local <= chunk_end_local:
-                reward_step_offset = episode_last_local - local_start
-                chunk_return = float((gamma ** reward_step_offset) * 1.0)
-            else:
-                chunk_return = 0.0
-            replay.add(
-                ReplayTransition(
-                    sample_index=current_idx,
-                    next_sample_index=next_idx,
-                    episode_id=episode_id,
-                    state=state.to(device=device, dtype=torch.float32).detach().cpu(),
-                    next_state=next_state.to(device=device, dtype=torch.float32).detach().cpu(),
-                    gt_action_chunk=action_chunk.detach().cpu(),
-                    reward=reward,
-                    chunk_return=chunk_return,
-                    done=terminal,
-                )
-            )
-    if len(replay) == 0:
+    rows = _collect_replay_rows(
+        dataset,
+        episode_to_indices,
+        state_key,
+        chunk_len,
+        stride,
+        gamma,
+    )
+    if not rows:
         raise RuntimeError("ReplayBuffer is empty: check task, chunk_len, stride, or episode length.")
+
+    frame_indices: List[int] = []
+    for row in rows:
+        frame_indices.append(row.sample_index)
+        frame_indices.append(row.next_sample_index)
+    z_by_index = precompute_frame_features(
+        dataset,
+        frame_indices,
+        image_keys,
+        state_key,
+        vla_model,
+        rl_encoder,
+        device,
+        batch_size=feature_batch_size,
+    )
+
+    replay = ReplayBuffer(capacity=capacity)
+    for row in tqdm(rows, desc="assemble_replay", leave=False):
+        replay.add(
+            ReplayTransition(
+                sample_index=row.sample_index,
+                next_sample_index=row.next_sample_index,
+                episode_id=row.episode_id,
+                z_rl=z_by_index[row.sample_index],
+                state=row.state,
+                action=row.action,
+                ref_action=row.ref_action,
+                reward=row.reward,
+                chunk_return=row.chunk_return,
+                done=row.done,
+                next_z_rl=z_by_index[row.next_sample_index],
+                next_state=row.next_state,
+                next_ref_action=row.next_ref_action,
+            )
+        )
     return replay
 
 
@@ -385,7 +800,9 @@ class OnlineFeatureProvider:
         z_tokens = self.vla_model.extract_vla_tokens(inputs).clone()
         z_rl = self.rl_encoder.encode(z_tokens).float()
         pred = self.vla_model.predict_action(inputs)["normalized_actions"]
-        ref_chunk = pred[:, : self.chunk_len, :].to(dtype=torch.float32, device=self.device)
+        ref_chunk = torch.as_tensor(
+            pred[:, : self.chunk_len, :], dtype=torch.float32, device=self.device
+        )
         state = sample[self.state_key] if self.state_key in sample else torch.zeros((1, 0), device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
@@ -394,11 +811,23 @@ class OnlineFeatureProvider:
         return z_rl, ref_chunk, state
 
 
+def _transition_has_precomputed_features(tr: ReplayTransition) -> bool:
+    return tr.z_rl is not None and tr.z_rl.numel() > 0
+
+
+def apply_online_td3_lr_scale(agent: TD3ChunkAgent, actor_lr_scale: float, critic_lr_scale: float) -> None:
+    """Scale TD3 optimizer LRs in-place (e.g. 0.1 for conservative online fine-tuning)."""
+    for group in agent.actor_opt.param_groups:
+        group["lr"] = float(agent.cfg.actor_lr) * float(actor_lr_scale)
+    for group in agent.critic_opt.param_groups:
+        group["lr"] = float(agent.cfg.critic_lr) * float(critic_lr_scale)
+
+
 def train_from_batch(
     agent: TD3ChunkAgent,
-    provider: OnlineFeatureProvider,
     batch: List[ReplayTransition],
     apply_ref_mask: bool = True,
+    provider: Optional[OnlineFeatureProvider] = None,
 ) -> Dict[str, float]:
     z_rl = []
     state = []
@@ -411,29 +840,39 @@ def train_from_batch(
     next_ref = []
     done = []
     for tr in batch:
-        curr_z, curr_ref, curr_state = provider.get(tr.sample_index)
-        nxt_z, nxt_ref, nxt_state = provider.get(tr.next_sample_index)
-        z_rl.append(curr_z.squeeze(0))
-        state.append(curr_state.squeeze(0))
-        ref.append(curr_ref.squeeze(0))
-        action.append(tr.gt_action_chunk)
+        if _transition_has_precomputed_features(tr):
+            z_rl.append(tr.z_rl)
+            state.append(tr.state)
+            ref.append(tr.ref_action)
+            next_z_rl.append(tr.next_z_rl)
+            next_state.append(tr.next_state)
+            next_ref.append(tr.next_ref_action)
+        else:
+            if provider is None:
+                raise RuntimeError("transition missing z_rl and no OnlineFeatureProvider given")
+            curr_z, curr_ref, curr_state = provider.get(tr.sample_index)
+            nxt_z, nxt_ref, nxt_state = provider.get(tr.next_sample_index)
+            z_rl.append(curr_z.squeeze(0))
+            state.append(curr_state.squeeze(0))
+            ref.append(curr_ref.squeeze(0))
+            next_z_rl.append(nxt_z.squeeze(0))
+            next_state.append(nxt_state.squeeze(0))
+            next_ref.append(nxt_ref.squeeze(0))
+        action.append(tr.action)
         reward.append([tr.reward])
         chunk_return.append([tr.chunk_return])
-        next_z_rl.append(nxt_z.squeeze(0))
-        next_state.append(nxt_state.squeeze(0))
-        next_ref.append(nxt_ref.squeeze(0))
         done.append([tr.done])
 
     return agent.train_step(
-        z_rl=torch.stack(z_rl, dim=0),
-        state=torch.stack(state, dim=0),
-        ref_actions=torch.stack(ref, dim=0),
+        z_rl=torch.stack(z_rl, dim=0).to(agent.device),
+        state=torch.stack(state, dim=0).to(agent.device),
+        ref_actions=torch.stack(ref, dim=0).to(agent.device),
         action=torch.stack(action, dim=0).to(agent.device),
         reward=torch.tensor(reward, dtype=torch.float32, device=agent.device),
         chunk_return=torch.tensor(chunk_return, dtype=torch.float32, device=agent.device),
-        next_z_rl=torch.stack(next_z_rl, dim=0),
-        next_state=torch.stack(next_state, dim=0),
-        next_ref_actions=torch.stack(next_ref, dim=0),
+        next_z_rl=torch.stack(next_z_rl, dim=0).to(agent.device),
+        next_state=torch.stack(next_state, dim=0).to(agent.device),
+        next_ref_actions=torch.stack(next_ref, dim=0).to(agent.device),
         done=torch.tensor(done, dtype=torch.float32, device=agent.device),
         apply_ref_mask=apply_ref_mask,
     )
@@ -442,10 +881,10 @@ def train_from_batch(
 def warmup_train(
     agent: TD3ChunkAgent,
     replay: ReplayBuffer,
-    provider: OnlineFeatureProvider,
     batch_size: int,
     warmup_updates: int,
     warmup_update_ratio: int,
+    provider: Optional[OnlineFeatureProvider] = None,
 ) -> List[Dict[str, float]]:
     print(
         f"[warmup] starting warmup: {warmup_updates} outer steps, "
@@ -455,7 +894,7 @@ def warmup_train(
     for step in tqdm(range(warmup_updates), desc="warmup_updates", leave=False):
         for g in range(warmup_update_ratio):
             batch = replay.sample(batch_size)
-            metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
+            metrics = train_from_batch(agent, batch, apply_ref_mask=True, provider=provider)
             metrics["phase"] = "warmup"
             metrics["step"] = float(step + 1)
             metrics["warmup_inner_g"] = float(g + 1)
@@ -466,9 +905,9 @@ def warmup_train(
 def online_train_loop(
     agent: TD3ChunkAgent,
     replay: ReplayBuffer,
-    provider: OnlineFeatureProvider,
     batch_size: int,
     online_train_episodes: int,
+    provider: Optional[OnlineFeatureProvider] = None,
 ) -> List[Dict[str, float]]:
     print(f"[online] starting online training for {online_train_episodes} episodes...")
     logs: List[Dict[str, float]] = []
@@ -489,7 +928,7 @@ def online_train_loop(
             batch = ep_transitions[start : start + batch_size]
             if not batch:
                 continue
-            metrics = train_from_batch(agent, provider, batch, apply_ref_mask=True)
+            metrics = train_from_batch(agent, batch, apply_ref_mask=True, provider=provider)
             metrics["phase"] = "online"
             metrics["episode"] = float(ep + 1)
             logs.append(metrics)
@@ -502,7 +941,7 @@ def online_train_loop(
 def eval_with_vla_reference(
     agent: TD3ChunkAgent,
     replay: ReplayBuffer,
-    provider: OnlineFeatureProvider,
+    provider: Optional[OnlineFeatureProvider] = None,
     max_eval_samples: int = 256,
 ) -> Dict[str, float]:
     print(f"[eval] evaluating up to {max_eval_samples} samples...")
@@ -514,15 +953,25 @@ def eval_with_vla_reference(
     q_vals = []
 
     for tr in tqdm(selected, desc="eval_samples", leave=False):
-        z_rl, ref_chunk, state = provider.get(tr.sample_index)
-        gt = tr.gt_action_chunk.unsqueeze(0).to(agent.device)
+        if _transition_has_precomputed_features(tr):
+            z_rl = tr.z_rl.unsqueeze(0).to(agent.device)
+            state = tr.state.unsqueeze(0).to(agent.device)
+        else:
+            if provider is None:
+                raise RuntimeError("transition missing z_rl and no OnlineFeatureProvider given")
+            z_rl, _, state = provider.get(tr.sample_index)
+        if provider is not None:
+            _, ref_chunk, _ = provider.get(tr.sample_index)
+        else:
+            ref_chunk = tr.ref_action.unsqueeze(0).to(agent.device)
+        gt = tr.action.unsqueeze(0).to(agent.device)
         pred = agent.act(z_rl, state, ref_chunk, deterministic=True, apply_ref_mask=False)
-        q1, q2 = agent.critic(z_rl.to(agent.device), state.to(agent.device), pred.to(agent.device))
+        q1, q2 = agent.critic(z_rl, state, pred)
         q_vals.append(torch.min(q1, q2).mean().item())
         mse_vals.append(F.mse_loss(pred, gt).item())
         mae_vals.append(F.l1_loss(pred, gt).item())
         l2_vals.append((pred - gt).pow(2).sum(dim=-1).sqrt().mean().item())
-        ref_mse_vals.append(F.mse_loss(ref_chunk.to(agent.device), gt).item())
+        ref_mse_vals.append(F.mse_loss(ref_chunk, gt).item())
 
     if not mse_vals:
         raise RuntimeError("no samples available for evaluation")
@@ -716,7 +1165,7 @@ def save_td3_agent(
 
 def save_td3_agent_from_args(path: Path, agent: TD3ChunkAgent, args, cfg) -> None:
     """Backward-compatible saver for test_online_td3_sim CLI."""
-    rl_token_dim = cfg.raw_config.get("model", {}).get("rl_token", {}).get("rl_token_dim", 256)
+    rl_token_dim = int(agent.actor.rl_token_dim)
     td3_cfg = TD3ChunkConfig(
         gamma=args.gamma,
         tau=args.tau,
@@ -768,3 +1217,44 @@ def load_td3_agent(path: Path, device: torch.device) -> TD3ChunkAgent:
     agent.total_updates = int(payload.get("total_updates", 0))
     print(f"loaded TD3 checkpoint: {path}, total_updates={agent.total_updates}")
     return agent
+
+
+def save_online_step_buffer(
+    buffer_dir: Path,
+    step: int,
+    transition: ReplayTransition,
+) -> Path:
+    """
+    Save one online transition snapshot for debugging/auditing.
+    """
+    buffer_dir = Path(buffer_dir)
+    buffer_dir.mkdir(parents=True, exist_ok=True)
+    out_path = buffer_dir / f"step_buffer_{int(step):08d}.pt"
+    torch.save(
+        {
+            "step": int(step),
+            "transition": transition,
+        },
+        out_path,
+    )
+    return out_path
+
+
+def prune_old_buffer_files(
+    buffer_dir: Path,
+    max_files: int,
+) -> List[Path]:
+    """
+    Keep at most `max_files` step buffer files, deleting oldest by filename order.
+    """
+    if max_files <= 0:
+        return []
+    buffer_dir = Path(buffer_dir)
+    files = sorted(buffer_dir.glob("step_buffer_*.pt"))
+    if len(files) <= max_files:
+        return []
+    removed: List[Path] = []
+    for p in files[: len(files) - max_files]:
+        p.unlink(missing_ok=True)
+        removed.append(p)
+    return removed

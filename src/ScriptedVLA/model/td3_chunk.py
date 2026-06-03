@@ -311,18 +311,25 @@ class TD3ChunkAgent:
 
     def mask_reference_actions(self, ref_actions: torch.Tensor) -> torch.Tensor:
         """
-        按配置概率对参考动作进行随机 mask（置零）。
+        按配置概率对「整条」参考动作序列做 dropout（整条置零或整条保留）。
 
         Args:
             ref_actions: 参考动作 chunk，形状一般为 [B, C, action_dim]。
 
         Returns:
-            torch.Tensor: mask 后的参考动作，形状与输入一致。
+            torch.Tensor: dropout 后的参考动作，形状与输入一致。
         """
-        if self.cfg.ref_mask_prob <= 0:
+        p_drop = float(self.cfg.ref_mask_prob)
+        if p_drop <= 0.0:
             return ref_actions
-        mask = (torch.rand_like(ref_actions[..., :1]) >= self.cfg.ref_mask_prob).to(ref_actions.dtype)
-        return ref_actions * mask
+        if p_drop >= 1.0:
+            return torch.zeros_like(ref_actions)
+
+        # 以 batch 维为单位，对整条参考 chunk 做 dropout：每个样本独立决定是否将整条 ref_actions 置零。
+        batch_size = ref_actions.shape[0]
+        # mask shape: [B, 1, 1]，广播到 [B, C, action_dim]
+        keep_mask = (torch.rand(batch_size, 1, 1, device=ref_actions.device) >= p_drop).to(ref_actions.dtype)
+        return ref_actions * keep_mask
 
     def act(
         self,
@@ -426,7 +433,7 @@ class TD3ChunkAgent:
             actor_constraint_loss = F.mse_loss(pred_action, masked_ref_actions)
             pred_vs_ref_mse = actor_constraint_loss.detach()
             actor_loss = -self.critic.q1_only(z_rl, state, pred_action).mean()
-            actor_loss = actor_loss + self.cfg.policy_constraint_beta * actor_constraint_loss
+            actor_loss = actor_loss + self.cfg.policy_constraint_beta * actor_constraint_loss   # 最终loss =  critic_loss + actor_constraint_loss
             self.actor_opt.zero_grad()
             actor_loss.backward()
             self.actor_opt.step()

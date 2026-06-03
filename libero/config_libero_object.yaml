@@ -92,7 +92,7 @@ dataset:
     use_batch_task: true
     use_tasks_jsonl: true
   # 任务筛选：null 表示全部任务；设为 0-9 则只使用该 task_index 的 episode
-  task_index: null
+  task_index: 6
   # 评估默认 episode；null 且指定 task_index 时，自动取该任务第一个 episode
   eval_episode_id: 0
   episode_slice: null
@@ -162,6 +162,8 @@ train_rl_token:
 
 # RL TD3 离线训练（train_rl_td3.py 唯一读取此块）
 # 用法: uv run python train_rl_td3.py
+# WebSocket 仿真 rollout 视频（VLA + RL token + TD3）:
+#   python -m libero.libero_ws_eval_td3_video --config libero/config_libero_object.yaml --task-id 6 --num-rollouts 5
 train_rl_td3:
   vla_checkpoint: "./checkpoints/libero_object_full_0527_200K/checkpoint_step_200000.pt"
   rl_token_checkpoint: "./checkpoints/libero_object_rl_token_task6/rl_token_step_10000.pt"
@@ -172,7 +174,19 @@ train_rl_td3:
     task_index: 6
     episode_slice: null
 
-  save_dir: "./checkpoints/libero_object_rl_td3_task6"
+  save_dir: "./checkpoints/libero_object_rl_td3_task6_0602"  # 兼容旧字段，等同 checkpoint.save_dir
+
+  checkpoint:
+    save_dir: "./checkpoints/libero_object_rl_td3_task6_0602"
+    final_name: "td3_agent_final.pt"
+    step_name_template: "td3_agent_step_{step}.pt"
+
+  # WebSocket rollout（libero_ws_eval_td3_video.py）可选 TD3 权重
+  # 优先级: --td3-checkpoint > --td3-step > eval.td3_checkpoint > eval.td3_step > final_name
+  eval:
+    td3_checkpoint: null
+    td3_step: null
+
   device: "cuda"
   seed: 42
   validate_vla_checkpoint: true
@@ -180,25 +194,55 @@ train_rl_td3:
   replay:
     capacity: 4000000
     stride: 2
+    cache_path: "./data/replay_buffers/libero_object_task6/replay_cache.pt"
+    rebuild_cache: false
+    feature_batch_size: 8
 
   training:
     batch_size: 32
-    num_updates: 100000
+    num_updates: 10000
     update_ratio: 3
     logging_steps: 50
-    save_steps: 0
+    save_steps: 2000
 
   td3:
     gamma: 0.99
     tau: 0.005
-    actor_lr: 1.0e-4
-    critic_lr: 1.0e-3
+    actor_lr: 1.0e-4    # 离线warm up 1.0e-5
+    critic_lr: 1.0e-3    # 离线warm up 4.0e-5 
     policy_noise: 0.2
     noise_clip: 0.5
     policy_delay: 2
     actor_std: 0.1
     max_action: 1.0
     ref_mask_prob: 0.5
-    policy_constraint_beta: 0.1
+    policy_constraint_beta: 0.0001
     use_chunk_return_target: true
-    hidden_dims: [256, 256]
+    hidden_dims: [512, 512]
+
+# WebSocket 在线增量TD3训练（libero_ws_online_td3.py 读取）
+Online_ws_rl_training:
+  # 优先读取yaml，CLI传参时覆盖
+  max_train_steps: 10000
+  save_every_steps: 1000
+  # 每 env step 梯度次数；原 5 易导致 ~5x 离线更新量
+  train_updates_per_step: 1
+  replay_capacity: 20000
+  buffer_dir: "./data/replay_buffers/online_ws_task6"
+  buffer_max_files: 2000
+  batch_size: 32
+  logging_steps: 50
+  td3_checkpoint: "./checkpoints/libero_object_rl_td3_task6_0602/td3_agent_step_10000.pt"
+  online_checkpoint_dir: "./checkpoints/libero_object_online_ws_td3_task6_0603"
+  # 与 eval 一致：确定性 rollout、不 mask ref
+  rollout_deterministic: true
+  rollout_apply_ref_mask: false
+  # 在线微调 LR = 离线 LR * scale
+  actor_lr_scale: 0.1
+  critic_lr_scale: 0.1
+  # 终端成功才给 reward（对齐离线 replay_cache）
+  align_online_rewards: true
+  # 每个 batch slot 从在线 buffer 采样的概率；失败轨迹多时建议 0.1
+  online_sample_ratio: 0.1
+  replay_cache_path: "./data/replay_buffers/libero_object_task6/replay_cache.pt"
+  offline_replay_capacity: 40000

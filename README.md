@@ -8,6 +8,8 @@ A clear and easy-to-understand VLA (Vision-Language-Action) training and inferen
 
 一个清晰易懂的VLA（Vision-Language-Action）训练和推理项目，基于Qwen开源小VLM模型和Flow Matching动作头。不玩套路，不做过度封装，不做过度模块化设计，旨在提供一个清晰、易于理解的VLA模型实现。Script is all you need.  --- author: @Benny Lu (hitlxg@gmail.com)
 
+> 最近更新（2026-06-02）：README 新增“强化学习 & 数据管线近期改动总结”小节，汇总 RL Token/TD3、WebSocket 评测链路与数据一致性改动。
+
 ---
 
 ## English Version
@@ -1012,6 +1014,16 @@ python online_simulation_inference.py --instruction "Pick up the blue cube and p
   - Warmup 更新比 `G`：每个 warmup 外层 step 内执行多次梯度更新
 - **Warmup 诊断指标**：导出的 CSV/Q 曲线新增 `actor_constraint_loss`、`chunk_return_mean`、`pred_vs_ref_mse` 与 Q 统计，便于稳定性对比。
 - **配置项**（`training.online_rl.td3`）：`policy_constraint_beta`、`warmup_update_ratio`、`use_chunk_return_target`、`ref_mask_prob`、`output_dir`。
+
+#### 近期改动总结（强化学习 & 数据管线，2026-06）
+
+- **强化学习评测链路补齐**：新增/完善 `libero/libero_ws_eval_td3_video.py` 与相关评测流程，支持在 WebSocket 闭环中执行 TD3 rollout 并按任务保存成功/失败视频，便于策略行为对比与回归分析。
+- **在线 RL 训练-评测一致性增强**：延续 RL Token + Chunk TD3 warmup 方案，将约束项、chunk return 与关键诊断指标统一到训练/评测观察口径，降低“训练有效但线上不稳”的排查成本。
+- **LIBERO WebSocket 服务能力增强**：`scripts/libero_ws_server.py` 增加可配置 `--camera-height`、`--camera-width`、`--jpeg-quality`，默认切换到 `256x256` 与更高质量 JPEG，减少图像压缩噪声与分辨率偏移带来的策略退化。
+- **观测对齐修正**：服务端状态抽取改为与 LeRobot `observation.state` 一致（`6` 维关节 + `2` 维夹爪），并避免重复图像翻转，确保训练数据与在线观测分布一致。
+- **数据/环境健壮性检查补充**：新增 `scripts/smoke_test_libero_object.py` 与 `test_libero.py`，用于快速验证 `libero_object` 任务集的 reset、init_state 与 step 基础可用性。
+- **依赖与目录规范更新**：`requirements.txt` 补充 `websockets>=10.0`；`.gitignore` 增加 `libero_dataset/`、`assets/`，减少数据与资源文件误提交风险。
+- **建议的最小自检顺序**：先执行 `python scripts/smoke_test_libero_object.py` 验证环境，再启动 `python scripts/libero_ws_server.py --suite libero_object`，最后运行 `uv run python -m libero.libero_ws_eval_td3_video ...` 做端到端回归。
 
 #### VLM模块（Qwen）
 - 基于Qwen-VL模型进行视觉-语言理解
