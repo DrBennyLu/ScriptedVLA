@@ -432,7 +432,7 @@ class TD3ChunkAgent:
             pred_action = self.actor(z_rl, state, masked_ref_actions)
             actor_constraint_loss = F.mse_loss(pred_action, masked_ref_actions)
             pred_vs_ref_mse = actor_constraint_loss.detach()
-            actor_loss = -self.critic.q1_only(z_rl, state, pred_action).mean()
+            actor_loss = -self.critic.q1_only(z_rl, state, pred_action).mean() 
             actor_loss = actor_loss + self.cfg.policy_constraint_beta * actor_constraint_loss   # 最终loss =  critic_loss + actor_constraint_loss
             self.actor_opt.zero_grad()
             actor_loss.backward()

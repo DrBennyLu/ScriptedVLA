@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WebSocket eval with VLA + RL token + TD3 actor and per-rollout MP4 recording.
+WebSocket eval with VLA + RL token + TD3 actor, per-rollout MP4, and per-step critic Q curves.
 
 示例::
 
@@ -29,7 +29,7 @@ python -m libero.libero_ws_eval_td3_video \
 
 python -m libero.libero_ws_eval_td3_video \
   --config libero/config_libero_object.yaml \
-  --td3-checkpoint ./checkpoints/libero_object_online_ws_td3_task6_0603/td3_agent_step_10000.pt \
+  --td3-checkpoint ./checkpoints/libero_object_rl_td3_task6_0603/td3_agent_step_10000.pt \
   --task-id 6 --num-rollouts 5 --video-dir ./results/rl_td3_rollout_videos_0603 --camera both --chunk-steps 10
 
 """
@@ -54,7 +54,7 @@ from pathlib import Path
 
 import torch
 
-from .libero_rollout_video import RolloutVideoRecorder, rollout_video_path
+from .libero_rollout_video import RolloutVideoRecorder, rollout_video_path, save_rollout_q_curve
 from .libero_task_mapping import add_task_id_cli_arguments, resolve_task_ids_from_args
 from .libero_ws_client import LiberoWSClient
 from .libero_ws_td3_eval_core import run_td3_eval_episode
@@ -159,7 +159,7 @@ async def main_async(args):
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     video_root = Path(args.video_dir) / run_ts
     video_root.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_td3_video] saving videos under: {video_root}")
+    print(f"[eval_td3_video] saving videos and per-step Q curves under: {video_root}")
 
     async with LiberoWSClient(args.ws_url) as client:
         await client.ping()
@@ -208,6 +208,15 @@ async def main_async(args):
                 )
                 saved = recorder.save(out_path)
                 result["video_path"] = str(saved) if saved else None
+                q_png_path = q_csv_path = None
+                if saved and result.get("q_history"):
+                    q_png_path, q_csv_path = save_rollout_q_curve(
+                        Path(saved),
+                        result["q_history"],
+                        success=result["success"],
+                    )
+                result["q_curve_png"] = str(q_png_path) if q_png_path else None
+                result["q_curve_csv"] = str(q_csv_path) if q_csv_path else None
                 result["rollout_index"] = rollout_counter
                 result["policy"] = "td3"
                 results.append(result)
@@ -215,7 +224,8 @@ async def main_async(args):
                 print(
                     f"[eval_td3_video] {label} steps={result['steps']} "
                     f"success={result['success']} frames={result['num_video_frames']} "
-                    f"video={result['video_path']}"
+                    f"video={result['video_path']} "
+                    f"q_curve={result.get('q_curve_png')}"
                 )
 
         summary_path = video_root / "summary.json"

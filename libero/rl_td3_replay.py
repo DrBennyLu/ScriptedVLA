@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.ScriptedVLA.model import RLTokenBottleneck, TD3ChunkAgent, TD3ChunkConfig
-from src.ScriptedVLA.utils import load_script_config
+from src.ScriptedVLA.utils import Normalizer, load_script_config
 from test.test_inference import (
     get_test_model_config,
     load_model_from_checkpoint_with_lora_support,
@@ -103,6 +103,20 @@ def load_lerobot_dataset(
         delta_timestamps=create_delta_timestamps(action_horizon, fps),
         episodes=episodes,
     )
+
+
+def load_normalizer_from_vla_checkpoint(vla_checkpoint: str) -> Optional[Normalizer]:
+    """Load normalizer saved in a VLA checkpoint (for WebSocket eval/collect)."""
+    path = Path(vla_checkpoint).expanduser().resolve()
+    if not path.is_file():
+        return None
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location="cpu")
+    if not isinstance(ckpt, dict) or "normalizer" not in ckpt:
+        return None
+    return Normalizer.from_dict(ckpt["normalizer"])
 
 
 def build_single_input(
@@ -348,6 +362,47 @@ def sample_mixed_batch_with_sources(
     return batch, sources
 
 
+def sample_mixed_batch_multi(
+    buffers: List[Tuple[ReplayBuffer, float, str]],
+    batch_size: int,
+) -> tuple[List[ReplayTransition], List[str]]:
+    """
+    Sample from multiple replay buffers with normalized weights.
+
+    Args:
+        buffers: list of (ReplayBuffer, weight, source_name); zero-weight or empty buffers skipped.
+        batch_size: batch size.
+
+    Returns:
+        (transitions, source_name per slot)
+    """
+    active = [(buf, float(w), name) for buf, w, name in buffers if len(buf) > 0 and float(w) > 0]
+    batch_size = max(1, int(batch_size))
+    if not active:
+        return [], []
+
+    total_w = sum(w for _, w, _ in active)
+    lists = {name: list(buf.buf) for buf, _, name in active}
+    thresholds: List[Tuple[float, str]] = []
+    cum = 0.0
+    for _, w, name in active:
+        cum += w / total_w
+        thresholds.append((cum, name))
+
+    batch: List[ReplayTransition] = []
+    sources: List[str] = []
+    for _ in range(batch_size):
+        r = random.random()
+        chosen = thresholds[-1][1]
+        for threshold, name in thresholds:
+            if r <= threshold:
+                chosen = name
+                break
+        batch.append(random.choice(lists[chosen]))
+        sources.append(chosen)
+    return batch, sources
+
+
 def online_chunk_reward_fields(
     *,
     episode_done: bool,
@@ -496,6 +551,16 @@ def _proprio_from_sample(sample: Dict, state_key: str, fallback: Optional[torch.
 
 
 @dataclass
+class WSRolloutFrame:
+    """One env step recorded during VLA WebSocket rollout."""
+
+    local_index: int
+    obs_msg: dict
+    action: np.ndarray
+    ref_chunk: np.ndarray
+
+
+@dataclass
 class _ReplayBuildRow:
     sample_index: int
     next_sample_index: int
@@ -567,6 +632,217 @@ def _collect_replay_rows(
                 )
             )
     return rows
+
+
+def _state_from_ws_obs(obs_msg: dict, state_dim: int) -> torch.Tensor:
+    if obs_msg.get("state"):
+        return torch.as_tensor(
+            np.asarray(obs_msg["state"], dtype=np.float32).reshape(-1),
+            dtype=torch.float32,
+        )
+    return torch.zeros((state_dim,), dtype=torch.float32)
+
+
+def collect_replay_rows_from_ws_episode(
+    frames: List[WSRolloutFrame],
+    episode_id: int,
+    chunk_len: int,
+    stride: int,
+    gamma: float,
+    state_dim: int,
+    global_index_base: int,
+) -> List[_ReplayBuildRow]:
+    """Build replay rows from a successful WS episode (mirrors _collect_replay_rows)."""
+    if len(frames) < chunk_len + 1:
+        return []
+
+    rows: List[_ReplayBuildRow] = []
+    num_frames = len(frames)
+    for local_start in range(0, num_frames - chunk_len, stride):
+        next_local = local_start + chunk_len
+        start_frame = frames[local_start]
+        next_frame = frames[next_local]
+
+        action_parts = []
+        for j in range(chunk_len):
+            action_parts.append(
+                torch.as_tensor(frames[local_start + j].action, dtype=torch.float32).reshape(-1)
+            )
+        action_chunk = torch.stack(action_parts, dim=0)
+
+        next_action_parts = []
+        if next_local + chunk_len <= num_frames:
+            for j in range(chunk_len):
+                next_action_parts.append(
+                    torch.as_tensor(frames[next_local + j].action, dtype=torch.float32).reshape(-1)
+                )
+            next_action_chunk = torch.stack(next_action_parts, dim=0)
+        else:
+            next_action_chunk = torch.as_tensor(start_frame.ref_chunk, dtype=torch.float32).clone()
+            if next_action_chunk.dim() == 1:
+                next_action_chunk = next_action_chunk.unsqueeze(0).repeat(chunk_len, 1)
+
+        ref_chunk = torch.as_tensor(start_frame.ref_chunk, dtype=torch.float32)
+        if ref_chunk.dim() == 1:
+            ref_chunk = ref_chunk.unsqueeze(0)
+        if ref_chunk.shape[0] < chunk_len:
+            pad = ref_chunk[-1:].repeat(chunk_len - ref_chunk.shape[0], 1)
+            ref_chunk = torch.cat([ref_chunk, pad], dim=0)
+        ref_chunk = ref_chunk[:chunk_len].clone()
+
+        next_ref = torch.as_tensor(next_frame.ref_chunk, dtype=torch.float32)
+        if next_ref.dim() == 1:
+            next_ref = next_ref.unsqueeze(0)
+        if next_ref.shape[0] < chunk_len:
+            pad = next_ref[-1:].repeat(chunk_len - next_ref.shape[0], 1)
+            next_ref = torch.cat([next_ref, pad], dim=0)
+        next_ref = next_ref[:chunk_len].clone()
+
+        state = _state_from_ws_obs(start_frame.obs_msg, state_dim)
+        next_state = _state_from_ws_obs(next_frame.obs_msg, state_dim)
+
+        terminal = 1.0 if next_local >= num_frames - 1 else 0.0
+        reward = 1.0 if terminal > 0.5 else 0.0
+        episode_last_local = num_frames - 1
+        chunk_end_local = min(local_start + chunk_len - 1, episode_last_local)
+        if local_start <= episode_last_local <= chunk_end_local:
+            reward_step_offset = episode_last_local - local_start
+            chunk_return = float((gamma ** reward_step_offset) * 1.0)
+        else:
+            chunk_return = 0.0
+
+        sample_index = global_index_base + local_start
+        next_sample_index = global_index_base + next_local
+        rows.append(
+            _ReplayBuildRow(
+                sample_index=sample_index,
+                next_sample_index=next_sample_index,
+                episode_id=episode_id,
+                state=state,
+                next_state=next_state,
+                action=action_chunk,
+                ref_action=ref_chunk,
+                next_ref_action=next_action_chunk,
+                reward=reward,
+                chunk_return=chunk_return,
+                done=terminal,
+            )
+        )
+    return rows
+
+
+@torch.no_grad()
+def precompute_ws_frame_features(
+    frames: List[WSRolloutFrame],
+    frame_indices: List[int],
+    vla_model,
+    rl_encoder,
+    image_keys: List[str],
+    image_size: int,
+    device: torch.device,
+    instruction: str,
+    ws_infer=None,
+) -> Dict[int, torch.Tensor]:
+    unique = sorted(set(frame_indices))
+    z_by_index: Dict[int, torch.Tensor] = {}
+    index_to_frame = {f.local_index: f for f in frames}
+    for idx in tqdm(unique, desc="precompute_ws_z_rl", leave=False):
+        frame = index_to_frame[idx]
+        if ws_infer is not None:
+            from .libero_ws_vla_collect_core import ws_obs_to_normalized_vla_inputs
+
+            inputs = ws_obs_to_normalized_vla_inputs(
+                frame.obs_msg,
+                image_keys=image_keys,
+                image_size=image_size,
+                device=device,
+                instruction=instruction,
+                ws_infer=ws_infer,
+            )
+        else:
+            from .libero_ws_td3_eval_core import ws_obs_to_vla_model_inputs
+
+            inputs, _ = ws_obs_to_vla_model_inputs(
+                frame.obs_msg,
+                image_keys=image_keys,
+                image_size=image_size,
+                device=device,
+                instruction=instruction,
+            )
+        z_tokens = vla_model.extract_vla_tokens(inputs)
+        z_rl = rl_encoder.encode(z_tokens).float().squeeze(0).detach().cpu()
+        z_by_index[idx] = z_rl
+    return z_by_index
+
+
+def append_ws_episode_to_replay(
+    replay: ReplayBuffer,
+    frames: List[WSRolloutFrame],
+    *,
+    episode_id: int,
+    chunk_len: int,
+    stride: int,
+    gamma: float,
+    state_dim: int,
+    global_index_base: int,
+    vla_model,
+    rl_encoder,
+    image_keys: List[str],
+    image_size: int,
+    device: torch.device,
+    instruction: str,
+    ws_infer=None,
+) -> int:
+    """Convert one successful WS episode to ReplayTransitions and append to buffer."""
+    rows = collect_replay_rows_from_ws_episode(
+        frames,
+        episode_id,
+        chunk_len,
+        stride,
+        gamma,
+        state_dim,
+        global_index_base,
+    )
+    if not rows:
+        return 0
+
+    frame_indices: List[int] = []
+    for row in rows:
+        frame_indices.append(row.sample_index - global_index_base)
+        frame_indices.append(row.next_sample_index - global_index_base)
+    z_by_local = precompute_ws_frame_features(
+        frames,
+        frame_indices,
+        vla_model,
+        rl_encoder,
+        image_keys,
+        image_size,
+        device,
+        instruction,
+        ws_infer=ws_infer,
+    )
+
+    for row in rows:
+        local_curr = row.sample_index - global_index_base
+        local_next = row.next_sample_index - global_index_base
+        replay.add(
+            ReplayTransition(
+                sample_index=row.sample_index,
+                next_sample_index=row.next_sample_index,
+                episode_id=row.episode_id,
+                z_rl=z_by_local[local_curr],
+                state=row.state,
+                action=row.action,
+                ref_action=row.ref_action,
+                reward=row.reward,
+                chunk_return=row.chunk_return,
+                done=row.done,
+                next_z_rl=z_by_local[local_next],
+                next_state=row.next_state,
+                next_ref_action=row.next_ref_action,
+            )
+        )
+    return len(rows)
 
 
 @torch.no_grad()
@@ -652,6 +928,63 @@ def build_replay_cache_meta(
         "config_path": str(Path(config_path).resolve()),
         "task_index": task_index,
     }
+
+
+def build_vla_success_replay_meta(
+    *,
+    chunk_len: int,
+    stride: int,
+    gamma: float,
+    state_dim: int,
+    rl_token_dim: int,
+    dataset_path: str,
+    vla_checkpoint: str,
+    rl_token_checkpoint: str,
+    config_path: str,
+    task_index: Optional[int],
+    num_success_episodes: int,
+    total_attempts: int,
+) -> Dict[str, Any]:
+    base = build_replay_cache_meta(
+        chunk_len=chunk_len,
+        stride=stride,
+        gamma=gamma,
+        state_dim=state_dim,
+        rl_token_dim=rl_token_dim,
+        dataset_path=dataset_path,
+        episodes=None,
+        vla_checkpoint=vla_checkpoint,
+        rl_token_checkpoint=rl_token_checkpoint,
+        config_path=config_path,
+        task_index=task_index,
+    )
+    base["source"] = "vla_ws_success"
+    base["num_success_episodes"] = int(num_success_episodes)
+    base["total_attempts"] = int(total_attempts)
+    base["success_rate"] = (
+        float(num_success_episodes) / float(total_attempts) if total_attempts > 0 else 0.0
+    )
+    base["episodes_hash"] = "vla_ws_success"
+    return base
+
+
+def vla_success_cache_compatible(meta: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate VLA success cache against expected TD3 replay hyperparams."""
+    keys = (
+        "chunk_len",
+        "stride",
+        "gamma",
+        "state_dim",
+        "rl_token_dim",
+        "vla_checkpoint",
+        "rl_token_checkpoint",
+    )
+    for key in keys:
+        if expected.get(key) != meta.get(key):
+            return False, f"mismatch on {key}: expected={expected.get(key)!r}, cached={meta.get(key)!r}"
+    if meta.get("source") != "vla_ws_success":
+        return False, f"not a vla_ws_success cache (source={meta.get('source')!r})"
+    return True, "ok"
 
 
 def replay_cache_matches(expected: Dict[str, Any], cached: Dict[str, Any]) -> Tuple[bool, str]:

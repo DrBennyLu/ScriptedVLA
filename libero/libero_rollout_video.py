@@ -93,3 +93,69 @@ def rollout_video_path(
         f"rollout{rollout_index:03d}_{status}.mp4"
     )
     return video_dir / filename
+
+
+def rollout_q_curve_paths(video_path: Path) -> tuple[Path, Path]:
+    """PNG/CSV paths alongside rollout MP4 (same stem + _q_curve)."""
+    stem = video_path.with_suffix("")
+    return stem.with_name(stem.name + "_q_curve.png"), stem.with_name(stem.name + "_q_curve.csv")
+
+
+def save_rollout_q_curve(
+    video_path: Path,
+    q_history: List[dict],
+    *,
+    success: bool,
+) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    Plot per-env-step critic Q (q1, q2, min) and write CSV next to rollout video.
+
+    Each entry in q_history: {"step", "q1", "q2", "q_min"}.
+    """
+    if not q_history:
+        return None, None
+
+    png_path, csv_path = rollout_q_curve_paths(video_path)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+
+    steps = [int(row["step"]) for row in q_history]
+    q1_vals = [float(row["q1"]) for row in q_history]
+    q2_vals = [float(row["q2"]) for row in q_history]
+    q_min_vals = [float(row["q_min"]) for row in q_history]
+
+    import csv
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["step", "q1", "q2", "q_min"])
+        writer.writeheader()
+        for row in q_history:
+            writer.writerow(
+                {
+                    "step": int(row["step"]),
+                    "q1": float(row["q1"]),
+                    "q2": float(row["q2"]),
+                    "q_min": float(row["q_min"]),
+                }
+            )
+
+    try:
+        import matplotlib.pyplot as plt
+
+        status = "success" if success else "fail"
+        plt.figure(figsize=(10, 5))
+        plt.plot(steps, q1_vals, label="Q1", alpha=0.9)
+        plt.plot(steps, q2_vals, label="Q2", alpha=0.9)
+        plt.plot(steps, q_min_vals, label="min(Q1,Q2)", linewidth=2.0)
+        plt.xlabel("Environment step")
+        plt.ylabel("Critic Q (chunk action)")
+        plt.title(f"TD3 critic Q per step ({status})")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(png_path, dpi=150)
+        plt.close()
+    except Exception as exc:
+        print(f"[warn] failed to save Q curve PNG {png_path}: {exc}")
+        png_path = None
+
+    return png_path, csv_path

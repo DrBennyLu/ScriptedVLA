@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -60,6 +60,40 @@ def ws_obs_to_vla_model_inputs(
     return inputs, state_raw
 
 
+def _state_tensor_from_raw(
+    state_raw: Optional[np.ndarray],
+    td3_agent,
+    device: torch.device,
+) -> torch.Tensor:
+    if state_raw is None:
+        return torch.zeros(
+            (1, td3_agent.actor.state_dim), dtype=torch.float32, device=device
+        )
+    return torch.as_tensor(
+        np.asarray(state_raw, dtype=np.float32).reshape(1, -1),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+@torch.no_grad()
+def critic_q_for_chunk(
+    td3_agent,
+    z_rl: torch.Tensor,
+    state_tensor: torch.Tensor,
+    action_chunk: torch.Tensor,
+) -> Tuple[float, float, float]:
+    """Evaluate twin critic on (z_rl, state, action_chunk); returns q1, q2, min."""
+    if z_rl.dim() == 1:
+        z_rl = z_rl.unsqueeze(0)
+    if action_chunk.dim() == 2:
+        action_chunk = action_chunk.unsqueeze(0)
+    q1, q2 = td3_agent.critic(z_rl, state_tensor, action_chunk)
+    q1v = float(q1.squeeze().item())
+    q2v = float(q2.squeeze().item())
+    return q1v, q2v, min(q1v, q2v)
+
+
 @torch.no_grad()
 def predict_td3_action_chunk(
     vla_model,
@@ -69,7 +103,9 @@ def predict_td3_action_chunk(
     state_raw: Optional[np.ndarray],
     chunk_size: int,
     device: torch.device,
-) -> np.ndarray:
+    *,
+    return_q: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, Tuple[float, float, float]]]:
     """Run VLA + RL token + TD3 to produce an action chunk [T, action_dim]."""
     z_tokens = vla_model.extract_vla_tokens(inputs)
     z_rl = rl_encoder.encode(z_tokens).float()
@@ -84,16 +120,7 @@ def predict_td3_action_chunk(
         ref_tensor = ref_tensor.unsqueeze(0)
     ref_chunk = ref_tensor[:, :chunk_size, :]
 
-    if state_raw is None:
-        state_tensor = torch.zeros(
-            (1, td3_agent.actor.state_dim), dtype=torch.float32, device=device
-        )
-    else:
-        state_tensor = torch.as_tensor(
-            np.asarray(state_raw, dtype=np.float32).reshape(1, -1),
-            dtype=torch.float32,
-            device=device,
-        )
+    state_tensor = _state_tensor_from_raw(state_raw, td3_agent, device)
 
     action_chunk = td3_agent.act(
         z_rl,
@@ -102,8 +129,11 @@ def predict_td3_action_chunk(
         deterministic=True,
         apply_ref_mask=False,
     )
-    actions = action_chunk.squeeze(0).detach().cpu().numpy()
-    return np.asarray(actions, dtype=np.float32)
+    actions = np.asarray(action_chunk.squeeze(0).detach().cpu().numpy(), dtype=np.float32)
+    if not return_q:
+        return actions
+    q1, q2, q_min = critic_q_for_chunk(td3_agent, z_rl, state_tensor, action_chunk)
+    return actions, (q1, q2, q_min)
 
 
 async def run_td3_eval_episode(
@@ -137,6 +167,9 @@ async def run_td3_eval_episode(
     success = False
     action_buffer: List[list] = []
     buffer_idx = 0
+    q_history: List[dict] = []
+    current_chunk_q: Optional[Tuple[float, float, float]] = None
+    record_q = bool(getattr(td3_agent, "critic", None) is not None)
 
     if video_recorder is not None:
         video_recorder.reset()
@@ -158,15 +191,27 @@ async def run_td3_eval_episode(
                         f"  [debug] state min={state_raw.min():.4f} max={state_raw.max():.4f}"
                     )
 
-                action_chunk = predict_td3_action_chunk(
-                    vla_model=vla_model,
-                    rl_encoder=rl_encoder,
-                    td3_agent=td3_agent,
-                    inputs=inputs,
-                    state_raw=state_raw,
-                    chunk_size=chunk_size,
-                    device=device,
-                )
+                if record_q:
+                    action_chunk, current_chunk_q = predict_td3_action_chunk(
+                        vla_model=vla_model,
+                        rl_encoder=rl_encoder,
+                        td3_agent=td3_agent,
+                        inputs=inputs,
+                        state_raw=state_raw,
+                        chunk_size=chunk_size,
+                        device=device,
+                        return_q=True,
+                    )
+                else:
+                    action_chunk = predict_td3_action_chunk(
+                        vla_model=vla_model,
+                        rl_encoder=rl_encoder,
+                        td3_agent=td3_agent,
+                        inputs=inputs,
+                        state_raw=state_raw,
+                        chunk_size=chunk_size,
+                        device=device,
+                    )
                 if action_chunk.ndim == 1:
                     action_chunk = action_chunk.reshape(1, -1)
 
@@ -175,6 +220,11 @@ async def run_td3_eval_episode(
                         f"  [debug] action_chunk min={action_chunk.min():.4f} "
                         f"max={action_chunk.max():.4f} shape={action_chunk.shape}"
                     )
+                    if current_chunk_q is not None:
+                        print(
+                            f"  [debug] chunk Q q1={current_chunk_q[0]:.4f} "
+                            f"q2={current_chunk_q[1]:.4f} min={current_chunk_q[2]:.4f}"
+                        )
 
                 action_buffer = [
                     model_action_to_libero(action_chunk[i])
@@ -190,6 +240,15 @@ async def run_td3_eval_episode(
                 if video_recorder is not None:
                     video_recorder.append_obs(obs_msg)
                 step_count += 1
+                if record_q and current_chunk_q is not None:
+                    q_history.append(
+                        {
+                            "step": step_count,
+                            "q1": current_chunk_q[0],
+                            "q2": current_chunk_q[1],
+                            "q_min": current_chunk_q[2],
+                        }
+                    )
                 done = bool(obs_msg.get("done"))
                 success = bool(obs_msg.get("success"))
                 if done or step_count >= max_steps:
@@ -206,4 +265,5 @@ async def run_td3_eval_episode(
         "steps": step_count,
         "success": final_success,
         "num_video_frames": len(video_recorder.frames) if video_recorder else 0,
+        "q_history": q_history,
     }

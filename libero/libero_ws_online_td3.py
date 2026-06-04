@@ -52,6 +52,7 @@ from .rl_td3_replay import (
     online_chunk_reward_fields,
     prune_old_buffer_files,
     replay_positive_reward_stats,
+    sample_mixed_batch_multi,
     sample_mixed_batch_with_sources,
     save_online_step_buffer,
     save_td3_agent,
@@ -82,6 +83,9 @@ class OnlineWSRLSettings:
     critic_lr_scale: float
     align_online_rewards: bool
     logging_steps: int
+    vla_success_cache_path: Optional[Path]
+    vla_success_sample_ratio: float
+    vla_success_capacity: int
 
 
 def _resolve_td3_checkpoint_path(config: dict, args) -> Path:
@@ -144,6 +148,11 @@ def _resolve_online_ws_settings(raw_config: dict, args) -> OnlineWSRLSettings:
         Path(replay_cache_raw).expanduser().resolve() if replay_cache_raw else None
     )
     default_offline_cap = int(replay_cfg.get("capacity", 4_000_000))
+    default_vla_success = replay_cfg.get("vla_success_cache_path")
+    vla_success_raw = choose("vla_success_cache_path", args.vla_success_cache_path, default_vla_success)
+    vla_success_cache_path = (
+        Path(vla_success_raw).expanduser().resolve() if vla_success_raw else None
+    )
 
     rollout_deterministic = choose(
         "rollout_deterministic",
@@ -182,6 +191,13 @@ def _resolve_online_ws_settings(raw_config: dict, args) -> OnlineWSRLSettings:
         offline_replay_capacity=int(
             choose("offline_replay_capacity", args.offline_replay_capacity, default_offline_cap)
         ),
+        vla_success_cache_path=vla_success_cache_path,
+        vla_success_sample_ratio=float(
+            choose("vla_success_sample_ratio", args.vla_success_sample_ratio, replay_cfg.get("vla_success_sample_ratio", 0.0))
+        ),
+        vla_success_capacity=int(
+            choose("vla_success_capacity", args.vla_success_capacity, replay_cfg.get("vla_success_capacity", 500000))
+        ),
         rollout_deterministic=bool(rollout_deterministic),
         rollout_apply_ref_mask=bool(rollout_apply_ref_mask),
         actor_lr_scale=float(choose("actor_lr_scale", args.actor_lr_scale, 0.1)),
@@ -194,24 +210,69 @@ def _resolve_online_ws_settings(raw_config: dict, args) -> OnlineWSRLSettings:
 def _load_offline_replay_cache(
     cache_path: Optional[Path],
     capacity: int,
-    online_sample_ratio: float,
 ) -> Optional[ReplayBuffer]:
-    if online_sample_ratio >= 1.0:
-        return None
     if cache_path is None:
-        print("[online_ws_td3] offline replay disabled (no replay_cache_path)")
+        print("[online_ws_td3] expert replay disabled (no replay_cache_path)")
         return None
     if not cache_path.is_file():
-        print(f"[online_ws_td3] warn: replay cache not found: {cache_path}, using online only")
+        print(f"[online_ws_td3] warn: expert replay cache not found: {cache_path}")
         return None
     offline_replay, meta = load_replay_buffer(cache_path, capacity=capacity)
     stats = replay_positive_reward_stats(offline_replay)
     print(
-        f"[online_ws_td3] loaded offline replay: {cache_path} "
+        f"[online_ws_td3] loaded expert replay: {cache_path} "
         f"(size={int(stats['size'])}, positive_reward_rate={stats['positive_reward_rate']:.2%})"
     )
-    print(f"[online_ws_td3] offline cache meta: chunk_len={meta.get('chunk_len')}, stride={meta.get('stride')}")
+    print(f"[online_ws_td3] expert cache meta: chunk_len={meta.get('chunk_len')}, stride={meta.get('stride')}")
     return offline_replay
+
+
+def _load_vla_success_replay_cache(
+    cache_path: Optional[Path],
+    capacity: int,
+) -> Optional[ReplayBuffer]:
+    if cache_path is None:
+        return None
+    if not cache_path.is_file():
+        print(f"[online_ws_td3] warn: VLA success cache not found: {cache_path}")
+        return None
+    vla_replay, meta = load_replay_buffer(cache_path, capacity=capacity)
+    stats = replay_positive_reward_stats(vla_replay)
+    print(
+        f"[online_ws_td3] loaded VLA success replay: {cache_path} "
+        f"(size={int(stats['size'])}, positive_reward_rate={stats['positive_reward_rate']:.2%})"
+    )
+    return vla_replay
+
+
+def _sample_training_batch(
+    online_replay: ReplayBuffer,
+    offline_replay: Optional[ReplayBuffer],
+    vla_success_replay: Optional[ReplayBuffer],
+    settings: OnlineWSRLSettings,
+) -> tuple[list, list]:
+    r_online = float(np.clip(settings.online_sample_ratio, 0.0, 1.0))
+    r_vla = float(settings.vla_success_sample_ratio) if vla_success_replay is not None else 0.0
+    r_vla = max(0.0, min(r_vla, 1.0 - r_online))
+    r_expert = max(0.0, 1.0 - r_online - r_vla)
+
+    if vla_success_replay is not None and settings.vla_success_sample_ratio > 0:
+        buffers = []
+        if len(online_replay) > 0 and r_online > 0:
+            buffers.append((online_replay, r_online, "online"))
+        if len(vla_success_replay) > 0 and r_vla > 0:
+            buffers.append((vla_success_replay, r_vla, "vla_success"))
+        if offline_replay is not None and len(offline_replay) > 0 and r_expert > 0:
+            buffers.append((offline_replay, r_expert, "expert"))
+        if buffers:
+            return sample_mixed_batch_multi(buffers, settings.batch_size)
+
+    return sample_mixed_batch_with_sources(
+        online_replay,
+        offline_replay,
+        settings.batch_size,
+        settings.online_sample_ratio,
+    )
 
 
 @torch.no_grad()
@@ -269,7 +330,10 @@ async def _run_online_training(args) -> None:
     offline_replay = _load_offline_replay_cache(
         settings.replay_cache_path,
         settings.offline_replay_capacity,
-        settings.online_sample_ratio,
+    )
+    vla_success_replay = _load_vla_success_replay_cache(
+        settings.vla_success_cache_path,
+        settings.vla_success_capacity,
     )
     chunk_size = int(td3_agent.actor.chunk_size)
     gamma = float(td3_agent.cfg.gamma)
@@ -305,8 +369,9 @@ async def _run_online_training(args) -> None:
         f"(base actor_lr={td3_agent.cfg.actor_lr}, critic_lr={td3_agent.cfg.critic_lr})"
     )
     print(
-        f"[online_ws_td3] batch mix: online_sample_ratio={settings.online_sample_ratio:.2f} "
-        f"(offline={1.0 - settings.online_sample_ratio:.2f})"
+        f"[online_ws_td3] batch mix: online={settings.online_sample_ratio:.2f} "
+        f"vla_success={settings.vla_success_sample_ratio:.2f} "
+        f"expert={max(0.0, 1.0 - settings.online_sample_ratio - settings.vla_success_sample_ratio):.2f}"
     )
     print(f"[online_ws_td3] align_online_rewards={settings.align_online_rewards}")
     if settings.replay_cache_path is not None:
@@ -416,11 +481,11 @@ async def _run_online_training(args) -> None:
 
                     last_metrics = {"critic_loss": 0.0, "actor_constraint_loss": 0.0, "actor_loss": 0.0}
                     for _ in range(settings.train_updates_per_step):
-                        batch, sources = sample_mixed_batch_with_sources(
+                        batch, sources = _sample_training_batch(
                             online_replay,
                             offline_replay,
-                            settings.batch_size,
-                            settings.online_sample_ratio,
+                            vla_success_replay,
+                            settings,
                         )
                         if not batch:
                             continue
@@ -428,6 +493,10 @@ async def _run_online_training(args) -> None:
                             td3_agent, batch, sources=sources, apply_ref_mask=True
                         )
                         last_metrics["global_step"] = float(global_step)
+                        if sources:
+                            last_metrics["batch_vla_success_frac"] = float(
+                                sum(1 for s in sources if s == "vla_success") / len(sources)
+                            )
                         logs.append(last_metrics)
 
                     if settings.save_every_steps > 0 and global_step % settings.save_every_steps == 0:
@@ -486,6 +555,8 @@ async def _run_online_training(args) -> None:
     audit_payload = {"online_end": online_audit}
     if offline_replay is not None:
         audit_payload["offline"] = summarize_replay_buffer(offline_replay, label="offline_cache")
+    if vla_success_replay is not None:
+        audit_payload["vla_success"] = summarize_replay_buffer(vla_success_replay, label="vla_success_cache")
     if audit_path.is_file():
         with open(audit_path, encoding="utf-8") as f:
             audit_payload = {**json.load(f), **audit_payload}
@@ -508,8 +579,11 @@ async def _run_online_training(args) -> None:
         "final_checkpoint": str(final_path),
         "buffer_dir": str(settings.buffer_dir),
         "online_sample_ratio": settings.online_sample_ratio,
+        "vla_success_sample_ratio": settings.vla_success_sample_ratio,
         "replay_cache_path": str(settings.replay_cache_path) if settings.replay_cache_path else None,
+        "vla_success_cache_path": str(settings.vla_success_cache_path) if settings.vla_success_cache_path else None,
         "offline_replay_size": len(offline_replay) if offline_replay is not None else 0,
+        "vla_success_replay_size": len(vla_success_replay) if vla_success_replay is not None else 0,
         "curves_dir": str(curves_dir),
         "replay_audit": str(audit_path),
     }
@@ -559,6 +633,24 @@ def main() -> None:
         type=int,
         default=None,
         help="Capacity when loading offline replay cache (default: train_rl_td3.replay.capacity)",
+    )
+    parser.add_argument(
+        "--vla-success-cache-path",
+        type=str,
+        default=None,
+        help="VLA success replay_cache.pt path",
+    )
+    parser.add_argument(
+        "--vla-success-sample-ratio",
+        type=float,
+        default=None,
+        help="Batch slot probability for VLA success cache (3-way mix with expert/online)",
+    )
+    parser.add_argument(
+        "--vla-success-capacity",
+        type=int,
+        default=None,
+        help="Capacity when loading VLA success replay cache",
     )
     parser.add_argument(
         "--rollout-deterministic",

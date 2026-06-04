@@ -8,6 +8,10 @@ Edit ``train_rl_td3`` in libero/config_libero_object.yaml, then::
     python train_rl_td3.py --replay-cache-dir ./data/replay_buffers/task6
     python train_rl_td3.py --config libero/config_libero_object.yaml
 
+进行vla rollout采集之后，进行离线训练td3
+python train_rl_td3.py --config libero/config_libero_object.yaml \
+  --vla-success-sample-ratio 0.7
+
 author: Benny Lu
 license: MIT
 """
@@ -36,10 +40,12 @@ from libero.rl_td3_replay import (
     load_replay_buffer,
     replay_cache_matches,
     resolve_rl_token_dim_for_meta,
+    sample_mixed_batch_multi,
     save_replay_buffer,
     save_td3_agent,
     set_seed,
     train_from_batch,
+    vla_success_cache_compatible,
 )
 from src.ScriptedVLA.model import TD3ChunkAgent, TD3ChunkConfig
 from src.ScriptedVLA.utils import ScriptConfig, ensure_offline_mode_if_needed, load_script_config
@@ -63,6 +69,9 @@ class TrainRLTD3ReplaySettings:
     cache_path: Optional[Path]
     rebuild_cache: bool
     feature_batch_size: int
+    vla_success_cache_path: Optional[Path]
+    vla_success_sample_ratio: float
+    vla_success_capacity: int
 
 
 @dataclass
@@ -182,6 +191,13 @@ def load_train_rl_td3_settings(raw: Dict[str, Any], cfg: ScriptConfig) -> TrainR
             ),
             rebuild_cache=bool(replay_cfg.get("rebuild_cache", False)),
             feature_batch_size=int(replay_cfg.get("feature_batch_size", 8)),
+            vla_success_cache_path=(
+                Path(replay_cfg["vla_success_cache_path"]).expanduser().resolve()
+                if replay_cfg.get("vla_success_cache_path")
+                else None
+            ),
+            vla_success_sample_ratio=float(replay_cfg.get("vla_success_sample_ratio", 0.0)),
+            vla_success_capacity=int(replay_cfg.get("vla_success_capacity", 500000)),
         ),
         checkpoint=TrainRLTD3CheckpointSettings(
             save_dir=checkpoint_save_dir,
@@ -432,6 +448,35 @@ def train_rl_td3(
     )
     print(f"  using replay cache: {cache_path}")
 
+    vla_success_replay: Optional[ReplayBuffer] = None
+    vla_ratio = float(settings.replay.vla_success_sample_ratio)
+    if vla_ratio > 0 and settings.replay.vla_success_cache_path is not None:
+        vla_path = settings.replay.vla_success_cache_path
+        if vla_path.is_file():
+            vla_success_replay, vla_meta = load_replay_buffer(
+                vla_path, capacity=settings.replay.vla_success_capacity
+            )
+            expected_meta = {
+                "chunk_len": settings.rl_chunk_size,
+                "stride": settings.replay.stride,
+                "gamma": settings.td3_cfg.gamma,
+                "state_dim": int(cfg.state_dim),
+                "rl_token_dim": rl_token_dim,
+                "vla_checkpoint": str(settings.vla_checkpoint),
+                "rl_token_checkpoint": str(settings.rl_token_checkpoint),
+            }
+            ok, reason = vla_success_cache_compatible(vla_meta, expected_meta)
+            if not ok:
+                print(f"  warn: VLA success cache incompatible ({reason}), skipping mix")
+                vla_success_replay = None
+            else:
+                print(
+                    f"  VLA success replay: {vla_path} (size={len(vla_success_replay)}, "
+                    f"mix_ratio={vla_ratio:.2f})"
+                )
+        else:
+            print(f"  warn: VLA success cache not found: {vla_path}")
+
     agent = TD3ChunkAgent(
         rl_token_dim=rl_token_dim,
         state_dim=int(cfg.state_dim),
@@ -449,8 +494,21 @@ def train_rl_td3(
 
     logs: List[Dict[str, float]] = []
     pbar = tqdm(range(num_updates), desc="rl_td3", total=num_updates)
+    use_vla_mix = vla_success_replay is not None and vla_ratio > 0
+    expert_ratio = max(0.0, 1.0 - vla_ratio)
     for step in pbar:
-        batch = replay.sample(tr.batch_size)
+        if use_vla_mix:
+            batch, _ = sample_mixed_batch_multi(
+                [
+                    (replay, expert_ratio, "expert"),
+                    (vla_success_replay, vla_ratio, "vla_success"),
+                ],
+                tr.batch_size,
+            )
+            if not batch:
+                batch = replay.sample(tr.batch_size)
+        else:
+            batch = replay.sample(tr.batch_size)
         metrics = train_from_batch(agent, batch, apply_ref_mask=True)
         metrics["step"] = float(step + 1)
         logs.append(metrics)
@@ -528,12 +586,29 @@ def main() -> None:
         action="store_true",
         help="强制重建 replay 缓存（忽略已有文件）",
     )
+    parser.add_argument(
+        "--vla-success-cache",
+        type=str,
+        default=None,
+        help="VLA 成功 rollout replay 缓存路径（覆盖 config）",
+    )
+    parser.add_argument(
+        "--vla-success-sample-ratio",
+        type=float,
+        default=None,
+        help="batch 中来自 VLA 成功 cache 的采样概率（覆盖 config）",
+    )
     args = parser.parse_args()
 
     cfg = load_script_config(args.config, dataset_path=None)
     settings = load_train_rl_td3_settings(cfg.raw_config, cfg)
     cfg.dataset_path = settings.dataset.local_path
     cfg.seed = settings.seed
+
+    if args.vla_success_cache is not None:
+        settings.replay.vla_success_cache_path = Path(args.vla_success_cache).expanduser().resolve()
+    if args.vla_success_sample_ratio is not None:
+        settings.replay.vla_success_sample_ratio = float(args.vla_success_sample_ratio)
 
     replay_cache_dir = Path(args.replay_cache_dir).expanduser() if args.replay_cache_dir else None
     replay_cache_file = Path(args.replay_cache).expanduser() if args.replay_cache else None

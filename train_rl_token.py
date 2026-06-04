@@ -434,7 +434,7 @@ def train_rl_token(cfg: ScriptConfig, settings: TrainRLTokenSettings) -> None:
         torch.save(payload, path)
 
     it = iter(loader)
-    pbar = tqdm(range(tr.max_steps), total=tr.max_steps, desc="RLToken Pretrain")
+    pbar = tqdm(range(tr.max_steps), total=tr.max_steps, desc="RLToken Training")
     for step in pbar:
         try:
             batch = next(it)
