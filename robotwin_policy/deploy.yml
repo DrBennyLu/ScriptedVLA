@@ -1,0 +1,10 @@
+port: 8000
+host: 127.0.0.1
+protocol: ws
+bench_name: RoboTwin
+task_name: adjust_bottle
+ckpt_name: random_init
+env_cfg_type: arx_x5
+action_type: joint
+seed: 0
+policy_name: scripted_vla

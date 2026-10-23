@@ -34,7 +34,8 @@ ensure_offline_mode_if_needed()
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import argparse
@@ -51,6 +52,7 @@ from src.ScriptedVLA.utils import (
     load_script_config,
     create_normalizer_from_dataset,
     create_normalizer_from_lerobot_meta,
+    create_normalizer_from_meta_stats,
     Normalizer,
 )
 from libero.libero_dataset_replay import resolve_training_episodes, get_task_description
@@ -78,6 +80,57 @@ except ImportError:
     LeRobotDataset = None
     LeRobotDatasetSubset = None
 
+
+
+def _ddp_enabled() -> bool:
+    return "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+
+
+def setup_distributed():
+    """Initialize torch.distributed when launched via torchrun."""
+    if not _ddp_enabled():
+        return {
+            "enabled": False,
+            "rank": 0,
+            "local_rank": 0,
+            "world_size": 1,
+            "is_main": True,
+        }
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend=backend)
+    return {
+        "enabled": True,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "is_main": rank == 0,
+    }
+
+
+def cleanup_distributed():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def dist_print(is_main: bool, *args, **kwargs):
+    if is_main:
+        print(*args, **kwargs)
+
+
+def dist_barrier(enabled: bool):
+    if enabled and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 def set_seed(seed: int):
     """
@@ -594,7 +647,7 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer, scheduler, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # 加载模型状态
-    model.load_state_dict(checkpoint["model_state_dict"])
+    unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
     print(f"  ✓ 模型状态已加载")
     
     # 加载优化器状态
@@ -639,7 +692,7 @@ def load_init_checkpoint(
     if "model_state_dict" not in checkpoint:
         raise KeyError(f"init_checkpoint 缺少 model_state_dict: {checkpoint_path}")
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
     print("  ✓ 模型权重已加载（init_checkpoint，不含 optimizer/scheduler）")
 
     normalizer = None
@@ -672,9 +725,15 @@ def train_with_lerobot_dataset(cfg):
     """
     使用 LeRobot 数据集进行训练。配置由 load_script_config 提供。
     """
-    print("=" * 60)
-    print("LeRobot数据集训练")
-    print("=" * 60)
+    dist_info = setup_distributed()
+    is_main = dist_info["is_main"]
+    local_rank = dist_info["local_rank"]
+    world_size = dist_info["world_size"]
+
+    dist_print(is_main, "=" * 60)
+    dist_print(is_main, "LeRobot数据集训练")
+    dist_print(is_main, f"DDP enabled={dist_info['enabled']} world_size={world_size} local_rank={local_rank}")
+    dist_print(is_main, "=" * 60)
 
     if not HAS_LEROBOT:
         raise ImportError(
@@ -777,10 +836,13 @@ def train_with_lerobot_dataset(cfg):
 
     try:
         # 使用 LeRobotDatasetSubset 以修复 episodes=subset 时 episode_data_index 索引越界
+        video_backend = dataset_config.get("video_backend", "pyav")
+        print(f"  video_backend: {video_backend}")
         lerobot_dataset = LeRobotDatasetSubset(
             repo_id=dataset_name,
             root=root_path_str,
             delta_timestamps=delta_timestamps,
+            video_backend=video_backend,
             **episodes_kw
         )
         print(f"  ✓ LeRobotDataset 创建成功: repo_id={dataset_name}, root={root_path_str}")
@@ -803,14 +865,27 @@ def train_with_lerobot_dataset(cfg):
         if normalizer.state_min is not None:
             print(f"  State 范围（用于传入动作头前归一化）: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
     except Exception as e:
-        print(f"  从 meta.episodes_stats 创建归一化器失败: {e}，尝试从 meta/episodes_stats.jsonl 创建")
+        print(f" 从 meta.episodes_stats 创建归一化器失败: {e}，尝试 meta.stats / episodes_stats.jsonl")
         try:
-            normalizer = create_normalizer_from_dataset(dataset_path_obj)
-            print(f"  ✓ 归一化器已从 episodes_stats.jsonl 创建")
-        except Exception as e2:
-            print(f"  ✗ 归一化器创建失败: {e2}")
-            print(f"  警告: 将不使用归一化，训练可能不稳定")
-            normalizer = None
+            normalizer = create_normalizer_from_meta_stats(
+                lerobot_dataset.meta,
+                state_key=state_key,
+                action_key="action",
+            )
+            print(f" ✓ 归一化器已从 meta.stats 创建")
+            if normalizer.action_min is not None:
+                print(f"  Action 范围: [{normalizer.action_min.min():.4f}, {normalizer.action_max.max():.4f}]")
+            if normalizer.state_min is not None:
+                print(f"  State 范围: [{normalizer.state_min.min():.4f}, {normalizer.state_max.max():.4f}]")
+        except Exception as e_stats:
+            print(f" 从 meta.stats 创建失败: {e_stats}，尝试 episodes_stats.jsonl")
+            try:
+                normalizer = create_normalizer_from_dataset(dataset_path_obj)
+                print(f" ✓ 归一化器已从 episodes_stats.jsonl 创建")
+            except Exception as e2:
+                print(f" ✗ 归一化器创建失败: {e2}")
+                print(f" 警告: 将不使用归一化，训练可能不稳定")
+                normalizer = None
     
     # 3. 创建数据加载器
     print(f"\n步骤3: 创建数据加载器")
@@ -849,7 +924,19 @@ def train_with_lerobot_dataset(cfg):
         dataloader_kwargs["persistent_workers"] = True
         dataloader_kwargs["prefetch_factor"] = dataloader_config.get("prefetch_factor", 2)
     
+    train_sampler = None
+    if dist_info["enabled"]:
+        train_sampler = DistributedSampler(
+            lerobot_dataset,
+            num_replicas=world_size,
+            rank=dist_info["rank"],
+            shuffle=dataloader_kwargs.get("shuffle", True),
+            drop_last=False,
+        )
+        dataloader_kwargs["shuffle"] = False
+        dataloader_kwargs["sampler"] = train_sampler
     train_loader = DataLoader(lerobot_dataset, **dataloader_kwargs)
+    dist_print(is_main, f"  per-GPU batch_size={batch_size}, global_batch≈{batch_size * world_size}")
     
     print(f"  数据加载器长度: {len(train_loader)} batches")
     if num_workers == 0:
@@ -877,9 +964,19 @@ def train_with_lerobot_dataset(cfg):
         future_action_window_size=action_horizon - 1
     )
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if dist_info["enabled"]:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    print(f"  模型已移动到设备: {device}")
+    if dist_info["enabled"]:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+    dist_print(is_main, f"  模型已移动到设备: {device} (ddp={dist_info['enabled']})")
     print(f"  Action horizon: {action_horizon}")
     print(f"  Action dimension: {action_dim}")
     print(f"  State dimension: {state_dim}")
@@ -890,15 +987,15 @@ def train_with_lerobot_dataset(cfg):
     print(f"  总参数量: {total_params:,} ({total_params / 1e6:.2f}M)")
     print(f"  可训练参数量: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
 
-    vlm_stats = model.qwen_vl_interface.summarize_backbone_trainability()
+    vlm_stats = unwrap_model(model).qwen_vl_interface.summarize_backbone_trainability()
     print("  VLM 主干可训练参数 (trainable / total):")
     for part, (trainable, total) in vlm_stats.items():
         if total == 0:
             continue
         status = "trainable" if trainable == total else ("frozen" if trainable == 0 else "partial")
         print(f"    {part}: {trainable:,} / {total:,} ({status})")
-    action_head_trainable = sum(p.numel() for p in model.action_model.parameters() if p.requires_grad)
-    action_head_total = sum(p.numel() for p in model.action_model.parameters())
+    action_head_trainable = sum(p.numel() for p in unwrap_model(model).action_model.parameters() if p.requires_grad)
+    action_head_total = sum(p.numel() for p in unwrap_model(model).action_model.parameters())
     print(
         f"  DiT action head: {action_head_trainable:,} / {action_head_total:,} "
         f"({'trainable' if action_head_trainable == action_head_total else 'partial/frozen'})"
@@ -1018,12 +1115,20 @@ def train_with_lerobot_dataset(cfg):
         except Exception as e:
             print(f"  ⚠️  无法检查第一个batch: {e}")
 
-    progress_bar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc="Training")
+    progress_bar = tqdm(
+        range(start_step, max_steps),
+        initial=start_step,
+        total=max_steps,
+        desc="Training",
+        disable=not is_main,
+    )
     
     for step in progress_bar:
         try:
             batch = next(loader_iter)
         except StopIteration:
+            if train_sampler is not None:
+                train_sampler.set_epoch(step + 1)
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
         
@@ -1095,11 +1200,14 @@ def train_with_lerobot_dataset(cfg):
         
         # 保存检查点（只在save_steps的倍数时保存，避免重复保存）
         if (step + 1) % save_steps == 0:
-            checkpoint_path = save_dir / f"checkpoint_step_{step + 1}.pt"
-            save_checkpoint(
-                model, optimizer, scheduler, 0, loss_value, checkpoint_path, 
-                global_step=step + 1, normalizer=normalizer
-            )
+            # DDP_SAVE_GATE
+            if is_main:
+                checkpoint_path = save_dir / f"checkpoint_step_{step + 1}.pt"
+                save_checkpoint(
+                    unwrap_model(model), optimizer, scheduler, 0, loss_value, checkpoint_path,
+                    global_step=step + 1, normalizer=normalizer
+                )
+            dist_barrier(dist_info["enabled"])
     
     # 8. 打印训练总结
     print("\n" + "=" * 60)

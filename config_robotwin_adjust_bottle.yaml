@@ -1,0 +1,274 @@
+# VLA模型配置文件
+
+# 模型配置
+model:
+  # VLM配置（Qwen）
+  vlm:
+    model_name: "Qwen/Qwen2-VL-2B-Instruct"  # 推荐使用Qwen2-VL-2B-Instruct，或 "Qwen/Qwen-VL-Chat"
+    image_size: 224  # 推荐使用448以获得更好的视觉理解效果
+    max_seq_length: 512
+    freeze_vlm: true  # 是否冻结VLM参数
+    cache_dir: "./cache/models"  # VLM模型本地缓存路径，若指定则优先从缓存加载（完全离线）
+    # local_model_path: null  # 可选：直接指定本地模型目录路径，用于完全离线（如 ./cache/models/models--Qwen--Qwen2-VL-2B-Instruct/snapshots/xxx）
+    use_state: false  # VLM是否使用机器人状态（可选，未设置时使用 model.vla.use_state_vlm）
+  
+  # 动作头配置（Flow Matching）
+  action_head:
+    type: "flow_matching"  # Flow Matching动作头
+    use_state: true  # 动作头是否使用机器人状态（可选，未设置时使用 model.vla.use_state_action_head）
+    hidden_dim: 1536  # 与VLM输出维度匹配
+    num_layers: 6
+    num_heads: 12
+    mlp_ratio: 4.0
+    action_dim: 14  # Aloha-AgileX 双臂 qpos：6+1+6+1
+    # action_horizon: 动作序列长度（action chunk大小），即从当前时间步开始的未来N步动作
+    # 注意：action_horizon = future_action_window_size + 1（包含当前动作）
+    # 例如：future_action_window_size=10 时，action_horizon=11（当前动作+未来10步）
+    action_horizon: 8
+    num_inference_timesteps: 10  # Flow Matching推理步数
+    patch_size: 8
+    num_patches: 196  # 14x14 patches for 224x224 image
+    norm_type: "ada_norm"
+    # 第一步动作辅助损失权重；>0 时加强 action[0] 与当前动作一致，减轻在线 chunk 边界突变
+    first_step_loss_weight: 0.0  # 可选 1.0~2.0
+
+  # 完整VLA模型
+  vla:
+    use_cross_attention: true
+    cross_attention_layers: 3
+    # 是否使用状态信息（VLM 与动作头独立配置）
+    use_state_vlm: false          # VLM 是否使用机器人状态（如关节角等）作为输入
+    use_state_action_head: true  # 动作头是否使用机器人状态
+    # future_action_window_size: 未来动作窗口大小
+    # 注意：action_horizon = future_action_window_size + 1
+    # 如果action_horizon=11，则future_action_window_size=10
+    future_action_window_size: 7
+
+  # RL token 压缩模块（用于在线 RL 状态）
+  rl_token:
+    model_dim: 768
+    num_encoder_layers: 2
+    num_decoder_layers: 2
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    rl_token_dim: 256
+    checkpoint: null  # 例如 "./checkpoints/rl_token/rl_token_final.pt"
+
+# 随机种子配置（用于保证训练和推理的可重复性）
+seed: 42
+
+# 训练配置
+training:
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"
+    betas: [0.9, 0.999]
+    eps: 1e-8
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"
+    warmup_ratio: 0.1
+    min_lr_ratio: 0.01
+  
+  # 保存配置
+  save_dir: "./checkpoints/robotwin_adjust_bottle"
+  save_steps: 4000
+  eval_steps: 4000
+  max_eval_batches: 1
+  logging_steps: 20
+  
+  # 最大训练步数（如果通过命令行指定，则优先使用命令行参数）
+  # 100 步远远不足，建议至少 5000–20000 步才能学到合理策略
+  max_steps: 4000
+  
+  # 混合精度训练
+  fp16: false
+  bf16: false
+  
+  # LoRA 微调配置（用于 lora_train.py）
+  lora:
+    enabled: true
+    r: 8                    # LoRA 秩（rank），越大可训练参数越多
+    lora_alpha: 16          # LoRA 缩放因子，通常设为 r 的 2 倍
+    lora_dropout: 0.05      # LoRA 层的 dropout
+    target_modules:        # 应用 LoRA 的目标模块（Qwen2-VL 的 attention 层）
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+    bias: "none"            # 偏置训练方式: "none" | "all" | "lora_only"
+    # modules_to_save: []   # 额外需要保存为可训练的模块（可选）
+    # layers_to_transform: null  # 指定应用 LoRA 的层索引，null 表示全部层
+
+  # RL token 预训练（train_rl_token.py）
+  rl_token_pretrain:
+    batch_size: 8
+    learning_rate: 1e-4
+    weight_decay: 0.0
+    max_steps: 10000
+    save_steps: 5000
+    logging_steps: 50
+    save_dir: "./checkpoints/rl_token"
+    # 冻结 VLA 的 checkpoint：填目录则在该目录下自动选最新的 checkpoint_step_*.pt；填具体 .pt 则直接加载
+    # 未设置时回退到 inference.checkpoint_path 的父目录或 training.save_dir（见 load_script_config）
+    vla_checkpoint: "./checkpoints"
+
+  # 在线 RL（online_rl_td3.py）
+  online_rl:
+    td3:
+      # 兼容 online_rl_td3.py
+      episodes: 400
+      start_steps: 1000
+      batch_size: 32
+      buffer_size: 200000
+      gamma: 0.99
+      tau: 0.005
+      actor_lr: 1e-4
+      critic_lr: 1e-3
+      hidden_dim: 256
+      policy_noise: 0.2
+      noise_clip: 0.5
+      policy_delay: 2
+      explore_noise: 0.1
+      max_action: 1.0
+
+      # test/test_online_td3_sim.py 默认参数
+      chunk_len: 10
+      stride: 2
+      replay_capacity: 200000
+      warmup_updates: 0              # 0 表示自动按 ceil(len(replay)/batch_size)
+      warmup_update_ratio: 3
+      online_train_episodes: 400
+      max_eval_samples: 256
+
+      vla_checkpoint: "./checkpoints/checkpoint_step_100000.pt"
+      rl_checkpoint: "./checkpoints/rl_token/rl_token_step_10000.pt"
+      output_dir: "./checkpoints/td3_agent"
+
+      actor_std: 0.1
+      ref_mask_prob: 0.5
+      policy_constraint_beta: 0.1
+      use_chunk_return_target: true
+
+# 数据集配置（LeRobot格式）
+dataset:
+  # 本地数据集路径（可以直接指定，也可以通过命令行参数 --dataset_path 覆盖）
+  local_path: "./datasets/robotwin_lerobot/adjust_bottle"
+  
+  # 数据集相关参数
+  action_horizon: 8
+  # image_size 统一使用 model.vlm.image_size
+
+  # 相机配置（从数据集中读取的图像键名）
+  # 单相机示例: ["observation.images.wrist_image"]
+  # 多相机示例: ["observation.images.wrist_image", "observation.images.base_image"]
+  image_keys:
+    - "observation.images.cam_high"
+    - "observation.images.cam_left_wrist"
+    - "observation.images.cam_right_wrist"
+  
+  # 状态键名（从数据集中读取的状态键名）
+  state_key: "observation.state"
+  
+  # 动作维度（从配置中直接指定，不再从数据集自动获取）
+  action_dim: 14
+  
+  # 数据加载器配置
+  dataloader:
+    num_workers: 2
+    pin_memory: false
+    shuffle: true
+  
+  # 任务描述获取方式
+  task_description:
+    # 方式1: 直接从batch["task"]获取（推荐，如果数据集包含此字段）
+    use_batch_task: true
+    # 方式2: 从tasks.jsonl文件查询（如果use_batch_task为false或batch中没有task字段）
+    use_tasks_jsonl: true  # 作为备选方案
+
+  # episode_slice: 指定使用的 episode 索引列表；null 表示使用全部 episode
+  episode_slice: null
+
+# 数据配置（用于获取默认状态维度等）
+data:
+  # 归一化器总开关：关闭后不使用 normalizer，normalize_action / normalize_state 不生效
+  use_normalizer: true
+  # 是否对 action/state 进行归一化（需 use_normalizer=true 才生效）
+  # 重要：Flow Matching 应在归一化空间 [-1,1] 训练，否则各维度尺度差异大、符号易错、难以收敛
+  normalize_action: true   # 训练时对 action 归一化，推理时对模型输出反归一化
+  normalize_state: true   # 训练时对 state 归一化；推理时对输入 state 归一化后再送入模型
+  
+  # 图像数据增强（抓取泛化）
+  augmentation:
+    enabled: false
+    color_jitter_brightness: 0.1
+    color_jitter_contrast: 0.1
+    color_jitter_saturation: 0.1
+    random_affine_translate: 0.05
+    random_affine_scale: [0.95, 1.05]
+    random_apply_p: 0.5
+
+  # 机器人状态配置
+  robot_state:
+    # 状态维度（从配置中直接指定，与仿真器关节+夹爪一致）
+    state_dim: 14
+    # 是否使用状态信息（VLM 与动作头独立配置，若未设置则从 model.vla 读取）
+    use_state_vlm: false          # VLM 是否使用状态
+    use_state_action_head: true  # 动作头是否使用状态
+
+# 推理配置（checkpoint/device 由 CLI 或 load_script_config 管理）
+inference:
+  batch_size: 1
+  max_new_tokens: 50
+
+# 日志配置
+logging:
+  use_wandb: false
+  wandb_project: "vla-training"
+  use_tensorboard: true
+  log_dir: "./logs"
+
+# 测试配置（仅保留与主配置不同的覆盖项，其余继承主配置）
+test:
+  model:
+    vlm:
+      model_name: "Qwen/Qwen2-VL-2B-Instruct"
+      cache_dir: "./cache/models"
+    vla:
+      future_action_window_size: 49
+  training:
+    batch_size: 2
+    max_steps: 100
+    save_steps: 50
+    eval_steps: 50
+    logging_steps: 10
+    save_dir: ./test_temp
+  dataloader:
+    num_workers: 0
+  dataset:
+    num_episodes: 15
+    steps_per_episode: 50
+    num_tasks: 1
+    pad_action_chunk: true
+  temp_dir: ./test_temp
+
+# LeRobot 测试配置（仅覆盖项）
+lerobot_test:
+  dataset:
+    repo_id: "k1000dai/libero-object-smolvla"
+    local_path: "./dataset/libero_object/"
+  training:
+    max_steps: 100
+    batch_size: 2
+  dataloader:
+    num_workers: 0

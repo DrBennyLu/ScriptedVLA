@@ -444,6 +444,36 @@ def _episodes_stats_items_for_dataset(
     return episodes_stats.items()
 
 
+
+def create_normalizer_from_meta_stats(
+    meta: Any,
+    state_key: str = "observation.state",
+    action_key: str = "action",
+) -> Normalizer:
+    """Build Normalizer from LeRobot v3 global meta.stats (no episodes_stats)."""
+    if not hasattr(meta, "stats") or meta.stats is None:
+        raise AttributeError("meta.stats is missing; cannot build normalizer from global stats")
+    stats = meta.stats
+    if action_key not in stats:
+        raise KeyError(f"action key {action_key!r} not in meta.stats")
+    a = stats[action_key]
+    if "min" not in a or "max" not in a:
+        raise KeyError(f"meta.stats[{action_key}] missing min/max")
+    action_min = np.asarray(a["min"], dtype=np.float64).flatten()
+    action_max = np.asarray(a["max"], dtype=np.float64).flatten()
+    state_min = state_max = None
+    if state_key in stats and "min" in stats[state_key] and "max" in stats[state_key]:
+        state_min = np.asarray(stats[state_key]["min"], dtype=np.float64).flatten()
+        state_max = np.asarray(stats[state_key]["max"], dtype=np.float64).flatten()
+    # Do NOT clamp to [-1,1] for real-robot eef/joint stats.
+    return Normalizer(
+        action_min=action_min,
+        action_max=action_max,
+        state_min=state_min,
+        state_max=state_max,
+    )
+
+
 def create_normalizer_from_lerobot_meta(
     lerobot_dataset: Any,
     state_key: str = "observation.state",
